@@ -1,0 +1,9 @@
+{
+    "dependencies": {
+        "netconf": {
+            "url": "https://github.com/orchestron-orchestrator/netconf/archive/b79ab30b7ca566a96fe5c22ecba598b533dc6c0b.zip",
+            "hash": "122072e980ad13c28deaa0ec5c9873bd28a97fa0ffa498c8e1b2091d88045faf9ecc"
+        }
+    },
+    "zig_dependencies": {}
+}
