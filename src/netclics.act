@@ -1,11 +1,19 @@
 import http
 import json
+import logging
 import net
+import netconf
 import time
 import process
+import xml
 
-actor ContainerManager(proc_cap: process.ProcessCap):
+actor ContainerManager(proc_cap: process.ProcessCap, log_handler: logging.Handler):
     """Manages Docker containers for network devices"""
+    
+    # Set up logging
+    logh = logging.Handler("ContainerManager")
+    logh.set_handler(log_handler)
+    _log = logging.Logger(logh)
 
     def start_container(platform: PlatformConfig, instance_id: str) -> str:
         """Start a Docker container for the given platform"""
@@ -27,11 +35,11 @@ actor ContainerManager(proc_cap: process.ProcessCap):
             "placeholder-image"  # Temporary placeholder - not actually used since we don't run containers
         ]
 
-        print("Starting container: docker %s" % " ".join(docker_args))
+        _log.info("Starting container", {"container_name": container_name, "platform": platform.name, "instance_id": instance_id})
+        _log.debug("Docker command would be", {"command": "docker " + " ".join(docker_args)})
 
-        # For now, just print the command we would run
+        # For now, just log the command we would run
         # In production, would execute: process.Process(proc_cap, "docker", docker_args, {})
-        print("Would execute: docker %s" % " ".join(docker_args))
 
         # Schedule health check
         after 2: _check_container_health(container_name, platform)
@@ -48,13 +56,14 @@ actor ContainerManager(proc_cap: process.ProcessCap):
         # - IP address from NetworkSettings.IPAddress
         # - Port mappings from NetworkSettings.Ports
 
-        print("Checking health of container %s" % container_name)
+        _log.debug("Checking container health", {"container_name": container_name, "platform": platform.name})
         # Would parse actual docker inspect output here
 
     def get_container_info(container_name: str) -> dict[str, str]:
         """Get container network information"""
         # In reality: docker inspect <container_name>
         # Returns mock data for now
+        _log.debug("Getting container info", {"container_name": container_name})
         return {
             "ip": "172.17.0.10",
             "netconf_port": "32830",
@@ -64,58 +73,505 @@ actor ContainerManager(proc_cap: process.ProcessCap):
     def stop_container(container_name: str):
         """Stop a Docker container"""
         # In reality, would run: docker stop <container_name>
-        print("Stopping container: %s" % container_name)
+        _log.info("Stopping container", {"container_name": container_name})
         # Since we use --rm, container will be removed automatically
 
-class DeviceInstance(object):
-    def __init__(self, platform_name: str, platform: str,
-                 container_id: str, ip_address: str,
-                 netconf_port: int, ssh_port: int, instance_spec: ?InstanceSpec = None):
-        self.platform_name = platform_name
-        self.platform = platform
-        self.container_id = container_id
-        self.ip_address = ip_address
-        self.netconf_port = netconf_port
-        self.ssh_port = ssh_port
-        self.instance_spec = instance_spec  # Set if this is a static instance
-        self.state = "starting"  # starting, ready, busy, stopping, error
-        self.current_request = None  # Currently processing request
-        self.started_at = 0  # Timestamp when started
-        self.last_used_at = 0  # Timestamp of last use
-        
-    def is_static_instance(self) -> bool:
-        """Returns True if this is a static instance (not a dynamic container)"""
-        instance_spec = self.instance_spec
+actor DeviceInstance(auth: WorldCap, log_handler: logging.Handler, platform_name: str, platform: str,
+                     container_id: str, ip_address: str,
+                     netconf_port: int, ssh_port: int, instance_spec: ?InstanceSpec = None):
+    """Actor representing a device instance that can process conversion requests"""
+    var state = "starting"  # starting, ready, busy, stopping, error
+    var current_request: ?ConvertRequest = None  # Currently processing request
+    var started_at = 0  # Timestamp when started
+    var last_used_at = 0  # Timestamp of last use
+
+    # Set up logging
+    logh = logging.Handler("DeviceInstance")
+    logh.set_handler(log_handler)
+    _log = logging.Logger(logh)
+
+    def is_static_instance() -> bool:
+        """Check if this is a static instance (vs dynamically created container)"""
         if instance_spec is not None:
             return True
         return False
 
-class DeviceManager(object):
-    """Manages device lifecycle and state transitions"""
-    def __init__(self, config: SystemConfig, container_mgr: ContainerManager):
-        self.config = config
-        self.container_mgr = container_mgr
-        self.instances = []
-        self.pending_requests = []  # Requests waiting for a device
-        self.next_instance_id = 1
+    def get_state() -> str:
+        return state
 
-    def initialize_min_instances(self):
-        """Initialize specified instances and start minimum number of container instances for each platform"""
-        for platform in self.config.platforms:
-            # First, initialize any static instances
-            self.initialize_static_instances(platform)
-            
-            # Then start minimum container instances if needed
-            if not platform.uses_static_instances() and platform.min_instances > 0:
-                current_count = self.count_instances(platform.name)
-                to_start = platform.min_instances - current_count
-                for i in range(to_start):
-                    self.start_device(platform)
-                    
-    def initialize_static_instances(self, platform: PlatformConfig):
+    def set_state(new_state: str):
+        state = new_state
+
+    def get_info() -> dict[str, ?value]:
+        """Get device information for API responses"""
+        instance_data = {
+            "platform_name": platform_name,
+            "platform": platform,
+            "instance_id": container_id,
+            "ip_address": ip_address,
+            "state": state,
+            "netconf_port": netconf_port,
+            "ssh_port": ssh_port,
+            "instance_type": "static" if is_static_instance() else "container"
+        }
+        if instance_spec is not None:
+            desc = instance_spec.description
+            if desc is not None:
+                instance_data["description"] = desc
+        return instance_data
+
+    def _rollback_to_config(target_config: str, result_callback: action(str, bool) -> None):
+        """Rollback device configuration to a previous state"""
+        _log.info("DeviceInstance.rollback called", {"device": container_id})
+        _log.debug("Target config length", {"device": container_id, "config_length": len(target_config)})
+
+        state = "busy"
+
+        # Get credentials
+        creds = _get_credentials()
+        if creds is not None:
+            username, password = creds
+        else:
+            state = "ready"
+            result_callback("No credentials available", False)
+            return
+
+        _log.info("Starting NETCONF rollback", {"username": username, "host": ip_address, "port": netconf_port})
+
+        def on_connect(client: netconf.Client):
+            _log.info("NETCONF client connected successfully")
+            _log.debug("Client capabilities", {"capabilities": str(client.get_capabilities())})
+
+            def on_edit_config_done(client: netconf.Client, response: ?xml.Node):
+                _log.debug("Rollback edit-config response received")
+                if response is not None:
+                    response_xml = xml.encode(response)
+                    _log.debug("Rollback edit-config response", {"response_xml": response_xml})
+
+                    # Check for NETCONF errors in the response
+                    if "<rpc-error>" in response_xml:
+                        _log.error("Rollback edit-config failed with NETCONF error", {"response_xml": response_xml})
+                        client.close()
+                        state = "ready"
+                        result_callback(f"NETCONF rollback edit-config error: {response_xml}", False)
+                    elif "<ok/>" in response_xml or "<ok>" in response_xml:
+                        _log.info("Rollback edit-config completed successfully")
+
+                        # Now commit the rollback
+                        def on_commit_done(client: netconf.Client, commit_response: ?xml.Node):
+                            _log.debug("Rollback commit response received")
+                            if commit_response is not None:
+                                commit_xml = xml.encode(commit_response)
+                                _log.debug("Rollback commit response", {"commit_xml": commit_xml})
+
+                                if "<rpc-error>" in commit_xml:
+                                    _log.error("Rollback commit failed with NETCONF error", {"commit_xml": commit_xml})
+                                    client.close()
+                                    state = "ready"
+                                    result_callback(f"NETCONF rollback commit error: {commit_xml}", False)
+                                elif "<ok/>" in commit_xml or "<ok>" in commit_xml:
+                                    _log.info("Rollback commit completed successfully")
+                                    client.close()
+                                    state = "ready"
+                                    result_callback("Configuration successfully rolled back", True)
+                                else:
+                                    _log.warning("Rollback commit response format unexpected", {"commit_xml": commit_xml})
+                                    client.close()
+                                    state = "ready"
+                                    result_callback("Configuration rollback completed", True)
+                            else:
+                                _log.error("Rollback commit failed - received None response")
+                                client.close()
+                                state = "ready"
+                                result_callback("Rollback commit operation failed", False)
+
+                        _log.debug("Sending rollback commit request")
+                        client.commit(on_commit_done)
+                    else:
+                        _log.warning("Rollback edit-config response format unexpected", {"response_xml": response_xml})
+                        client.close()
+                        state = "ready"
+                        result_callback("Configuration rollback completed", True)
+                else:
+                    _log.error("Rollback edit-config failed - received None response")
+                    client.close()
+                    state = "ready"
+                    result_callback("Rollback edit-config operation failed", False)
+
+            # Apply the rollback configuration with default-operation=replace
+            _log.debug("Sending rollback edit-config with default-operation=replace")
+            # Use the rpc method directly to include default-operation=replace
+            nc_nsdefs = [(None, "urn:ietf:params:xml:ns:netconf:base:1.0")]
+            children = [
+                xml.Node("target", children=[xml.Node("candidate")]),
+                xml.Node("default-operation", text="replace"),
+                xml.Node("config", [("xc", "urn:ietf:params:xml:ns:netconf:base:1.0")], text=target_config)
+            ]
+            client.rpc(xml.Node("edit-config", nc_nsdefs, children=children), on_edit_config_done)
+
+        def on_error(client: netconf.Client, error: str):
+            _log.error("NETCONF rollback connection error", {"error": error})
+            state = "ready"
+            result_callback(f"NETCONF rollback connection error: {error}", False)
+
+        # Create NETCONF client for rollback
+        _log.info("Creating NETCONF client connection for rollback")
+        netconf_client = netconf.Client(
+            auth=auth,
+            address=ip_address,
+            port=netconf_port,
+            username=username,
+            password=password,
+            key=None,
+            on_connect=on_connect,
+            on_error=on_error,
+            on_notif=None,
+            log_handler=log_handler
+        )
+        _log.info("NETCONF rollback client created, attempting connection")
+
+    def convert(request: ConvertRequest, result_callback: action(str, bool) -> None):
+        """Process a conversion request on this device"""
+        _log.info("DeviceInstance.convert called", {"device": container_id, "input_format": request.format, "output_format": request.target_format})
+        _log.debug("Input data", {"device": container_id, "input_data": request.input})
+
+        state = "busy"
+        current_request = request
+
+        # Step 1: Get base configuration before applying changes
+        def on_base_config_retrieved(base_config: str, base_success: bool):
+            if base_success:
+                _log.info("Base configuration retrieved successfully")
+
+                # Step 2: Apply input using appropriate input handler
+                def on_input_applied(success: bool, error_msg: ?str):
+                    if success:
+                        _log.info("Input applied successfully")
+
+                        # Step 3: Retrieve final configuration using appropriate output handler
+                        def on_final_config_retrieved(final_config: str, final_success: bool):
+                            if final_success:
+                                _log.info("Final configuration retrieved successfully")
+
+                                # Step 4: Rollback to base configuration to clean up the device
+                                def on_rollback_complete(rollback_result: str, rollback_success: bool):
+                                    if rollback_success:
+                                        _log.info("Device successfully rolled back to clean state")
+                                    else:
+                                        _log.warning("Rollback failed but conversion succeeded", {"rollback_result": rollback_result})
+
+                                    # Return both base and final configurations regardless of rollback status
+                                    result_dict = {
+                                        "base_config": base_config,
+                                        "config": final_config
+                                    }
+                                    combined_result = json.encode(result_dict)
+                                    state = "ready"
+                                    current_request = None
+                                    result_callback(combined_result, True)
+
+                                # Extract just the configuration from the base_config and add replace operation
+                                def extract_config_from_response(rpc_response: str) -> str:
+                                    # Find the <configuration> element within the response
+                                    config_start = rpc_response.find("<configuration")
+                                    config_end = rpc_response.find("</configuration>") + len("</configuration>")
+                                    if config_start != -1 and config_end != -1:
+                                        config_xml = rpc_response[config_start:config_end]
+                                        config_preview = config_xml[:300] if len(config_xml) > 300 else config_xml
+                                        _log.debug("Original extracted config", {"config_preview": config_preview})
+
+                                        # No need to add operation="replace" since we use default-operation=replace
+                                        _log.debug("Using configuration as-is with default-operation=replace")
+                                        return config_xml
+                                    else:
+                                        _log.warning("Could not extract configuration from response, using full response")
+                                        return rpc_response
+
+                                extracted_config = extract_config_from_response(base_config)
+                                _log.info("Starting automatic rollback to clean device state")
+                                config_preview = extracted_config[:200] if len(extracted_config) > 200 else extracted_config
+                                _log.debug("Extracted config for rollback", {"config_preview": config_preview})
+                                _log.debug("About to call _rollback_to_config() method")
+                                _rollback_to_config(extracted_config, on_rollback_complete)
+                            else:
+                                _log.error("Failed to retrieve final configuration", {"final_config": final_config})
+                                state = "ready"
+                                current_request = None
+                                result_callback(final_config, False)
+
+                        _handle_output(request.target_format, on_final_config_retrieved)
+                    else:
+                        err_str: str = "Input application failed"
+                        if error_msg is not None:
+                            err_str = error_msg
+                        _log.error("Input application failed", {"error": err_str})
+                        state = "ready"
+                        current_request = None
+                        result_callback(err_str, False)
+
+                _handle_input(request.format, request.input, on_input_applied)
+            else:
+                _log.error("Failed to retrieve base configuration", {"base_config": base_config})
+                state = "ready"
+                current_request = None
+                result_callback(base_config, False)
+
+        # Start by getting the base configuration
+        _handle_output(request.target_format, on_base_config_retrieved)
+
+    def _handle_input(input_format: str, input_data: str, callback: action(bool, ?str) -> None):
+        """Apply input data using the appropriate input handler"""
+        _log.info("Handling input format", {"input_format": input_format})
+
+        if input_format == "netconf":
+            _netconf_input(input_data, callback)
+        elif input_format == "cli":
+            # TODO: Implement CLI input handler
+            _log.error("CLI input handler not yet implemented")
+            callback(False, "CLI input handler not implemented")
+        elif input_format == "restconf":
+            # TODO: Implement RESTCONF input handler
+            _log.error("RESTCONF input handler not yet implemented")
+            callback(False, "RESTCONF input handler not implemented")
+        else:
+            _log.error("Unsupported input format", {"input_format": input_format})
+            callback(False, f"Unsupported input format: {input_format}")
+
+    def _handle_output(output_format: str, result_callback: action(str, bool) -> None):
+        """Retrieve output data using the appropriate output handler"""
+        _log.info("Handling output format", {"output_format": output_format})
+
+        if output_format == "netconf":
+            _netconf_output(result_callback)
+        elif output_format == "cli":
+            # TODO: Implement CLI output handler
+            _log.error("CLI output handler not yet implemented")
+            state = "ready"
+            current_request = None
+            result_callback("CLI output handler not implemented", False)
+        elif output_format == "restconf":
+            # TODO: Implement RESTCONF output handler
+            _log.error("RESTCONF output handler not yet implemented")
+            state = "ready"
+            current_request = None
+            result_callback("RESTCONF output handler not implemented", False)
+        else:
+            _log.error("Unsupported output format", {"output_format": output_format})
+            state = "ready"
+            current_request = None
+            result_callback(f"Unsupported output format: {output_format}", False)
+
+    def _netconf_input(input_data: str, callback: action(bool, ?str) -> None):
+        """Apply configuration via NETCONF edit-config"""
+        _log.info("NETCONF input handler: applying configuration")
+
+        # Get credentials
+        creds = _get_credentials()
+        if creds is not None:
+            username, password = creds
+        else:
+            callback(False, "No credentials available")
+            return
+        _log.info("Starting NETCONF input", {"username": username, "host": ip_address, "port": netconf_port})
+
+        def on_connect(client: netconf.Client):
+            _log.info("NETCONF client connected successfully")
+            _log.debug("Client capabilities", {"capabilities": str(client.get_capabilities())})
+
+            def on_edit_config_done(client: netconf.Client, response: ?xml.Node):
+                _log.debug("Edit-config response received")
+                if response is not None:
+                    response_xml = xml.encode(response)
+                    _log.debug("Edit-config response", {"response_xml": response_xml})
+
+                    # Check for NETCONF errors in the response
+                    if "<rpc-error>" in response_xml:
+                        _log.error("Edit-config failed with NETCONF error", {"response_xml": response_xml})
+                        client.close()
+                        callback(False, f"NETCONF edit-config error: {response_xml}")
+                    elif "<ok/>" in response_xml or "<ok>" in response_xml:
+                        _log.info("Edit-config completed successfully")
+
+                        # Now commit the candidate configuration
+                        def on_commit_done(client: netconf.Client, commit_response: ?xml.Node):
+                            _log.debug("Commit response received")
+                            if commit_response is not None:
+                                commit_xml = xml.encode(commit_response)
+                                _log.debug("Commit response", {"commit_xml": commit_xml})
+
+                                if "<rpc-error>" in commit_xml:
+                                    _log.error("Commit failed with NETCONF error", {"commit_xml": commit_xml})
+                                    client.close()
+                                    callback(False, f"NETCONF commit error: {commit_xml}")
+                                elif "<ok/>" in commit_xml or "<ok>" in commit_xml:
+                                    _log.info("Commit completed successfully")
+                                    client.close()
+                                    callback(True, None)
+                                else:
+                                    _log.warning("Commit response format unexpected", {"commit_xml": commit_xml})
+                                    client.close()
+                                    callback(True, None)
+                            else:
+                                _log.error("Commit failed - received None response")
+                                client.close()
+                                callback(False, "Commit operation failed")
+
+                        _log.debug("Sending commit request")
+                        client.commit(on_commit_done)
+                    else:
+                        _log.warning("Edit-config response format unexpected", {"response_xml": response_xml})
+                        # Assume success if no explicit error
+                        client.close()
+                        callback(True, None)
+                else:
+                    _log.error("Edit-config failed - received None response")
+                    client.close()
+                    callback(False, "Edit-config operation failed")
+
+            # Apply the input configuration
+            _log.debug("Sending edit-config with input", {"input_data": input_data})
+            # Try candidate datastore instead of running
+            client.edit_config(input_data, on_edit_config_done, "candidate")
+
+        def on_error(client: netconf.Client, error: str):
+            _log.error("NETCONF connection error", {"error": error})
+            callback(False, f"NETCONF connection error: {error}")
+
+        # Create NETCONF client
+        _log.info("Creating NETCONF client connection", {"host": ip_address, "port": netconf_port, "username": username})
+        _log.debug("Password masked", {"password_length": len(password)})
+
+        netconf_client = netconf.Client(
+            auth=auth,
+            address=ip_address,
+            port=netconf_port,
+            username=username,
+            password=password,
+            key=None,
+            on_connect=on_connect,
+            on_error=on_error,
+            on_notif=None,
+            log_handler=log_handler
+        )
+        _log.info("NETCONF client created, attempting connection")
+
+    def _netconf_output(result_callback: action(str, bool) -> None):
+        """Retrieve configuration via NETCONF get-config"""
+        _log.info("NETCONF output handler: retrieving configuration")
+
+        # Get credentials
+        creds = _get_credentials()
+        if creds is not None:
+            username, password = creds
+        else:
+            state = "ready"
+            current_request = None
+            result_callback("No credentials available", False)
+            return
+        _log.info("Starting NETCONF output", {"username": username, "host": ip_address, "port": netconf_port})
+
+        def on_connect(client: netconf.Client):
+            _log.info("NETCONF client connected successfully")
+            _log.debug("Client capabilities", {"capabilities": str(client.get_capabilities())})
+
+            def on_get_config_done(client: netconf.Client, response: ?xml.Node):
+                _log.debug("Get-config response received")
+                if response is not None:
+                    config_xml = xml.encode(response)
+                    _log.debug("Get-config response", {"config_xml": config_xml})
+
+                    # Check for NETCONF errors in the response
+                    if "<rpc-error>" in config_xml:
+                        _log.error("Get-config failed with NETCONF error", {"config_xml": config_xml})
+                        client.close()
+                        state = "ready"
+                        current_request = None
+                        result_callback(f"NETCONF get-config error: {config_xml}", False)
+                    else:
+                        _log.info("Get-config completed successfully")
+                        _log.info("Retrieved configuration", {"config_length": len(config_xml)})
+                        _log.info("Conversion completed successfully")
+
+                        _log.debug("Closing NETCONF connection")
+                        client.close()
+                        _log.debug("Releasing device")
+                        state = "ready"
+                        current_request = None
+                        result_callback(config_xml, True)
+                else:
+                    _log.error("Get-config failed - received None response")
+                    client.close()
+                    state = "ready"
+                    current_request = None
+                    result_callback("Get-config operation failed", False)
+
+            # Get the configuration
+            _log.debug("Sending get-config request")
+            client.get_config(on_get_config_done)
+
+        def on_error(client: netconf.Client, error: str):
+            _log.error("NETCONF connection error", {"error": error})
+            _log.debug("Releasing device due to error")
+            state = "ready"
+            current_request = None
+            result_callback(f"NETCONF connection error: {error}", False)
+
+        # Create NETCONF client
+        _log.info("Creating NETCONF client connection", {"host": ip_address, "port": netconf_port, "username": username})
+        _log.debug("Password masked", {"password_length": len(password)})
+
+        netconf_client = netconf.Client(
+            auth=auth,
+            address=ip_address,
+            port=netconf_port,
+            username=username,
+            password=password,
+            key=None,
+            on_connect=on_connect,
+            on_error=on_error,
+            on_notif=None,
+            log_handler=log_handler
+        )
+        _log.info("NETCONF client created, attempting connection")
+
+    def _get_credentials() -> ?(str, str):
+        """Get device credentials, returns (username, password) tuple or None"""
+        _log.debug("Checking device credentials")
+        if instance_spec is not None:
+            _log.debug("InstanceSpec found")
+            _username = instance_spec.username
+            _password = instance_spec.password
+            _log.debug("Checking username and password")
+            if _username is not None and _password is not None:
+                username = _username
+                password = _password
+                _log.info("Credentials found", {"username": username})
+                return (username, password)
+            else:
+                _log.error("Missing username or password for device", {"device": container_id, "username": str(_username), "password_set": str(True if _password is not None else False)})
+                return None
+        else:
+            _log.error("No InstanceSpec available for device", {"device": container_id})
+            return None
+
+actor DeviceManager(config: SystemConfig, container_mgr: ContainerManager, auth: WorldCap, log_handler: logging.Handler):
+    """Manages device lifecycle and state transitions"""
+    var instances = []  # DeviceInstance actors
+    var instance_info = []  # Cached info for API responses
+    var pending_requests = []  # Requests waiting for a device
+    var next_instance_id = 1
+
+    def count_instances(platform_name: str, state: ?str = None) -> int:
+        """Count instances for a platform, optionally filtered by state"""
+        # Simplified for now - just return length of instance_info
+        return len(instance_info)
+
+    def initialize_static_instances(platform: PlatformConfig):
         """Initialize static instances for a platform"""
         for spec in platform.instances:
             device = DeviceInstance(
+                auth=auth,
+                log_handler=log_handler,
                 platform_name=platform.name,
                 platform=platform.platform,
                 container_id=spec.id,
@@ -124,120 +580,114 @@ class DeviceManager(object):
                 ssh_port=spec.ssh_port,
                 instance_spec=spec
             )
-            device.state = "ready"  # Specified instances are assumed to be ready
-            self.instances.append(device)
-            print("Initialized static instance: %s at %s:%d" % (spec.id, spec.host, spec.netconf_port))
+            device.set_state("ready")  # Specified instances are assumed to be ready
+            instances.append(device)
 
-    def count_instances(self, platform_name: str, state: ?str = None) -> int:
-        """Count instances for a platform, optionally filtered by state"""
-        count = 0
-        for instance in self.instances:
-            if instance.platform_name == platform_name:
-                if state is None or instance.state == state:
-                    count += 1
-        return count
+            # Add to instance_info for API responses
+            instance_data = {
+                "platform_name": platform.name,
+                "platform": platform.platform,
+                "instance_id": spec.id,
+                "ip_address": spec.host,
+                "state": "ready",
+                "netconf_port": spec.netconf_port,
+                "ssh_port": spec.ssh_port,
+                "instance_type": "static"
+            }
+            desc = spec.description
+            if desc is not None:
+                instance_data["description"] = desc
+            instance_info.append(instance_data)
 
-    def get_device_for_request(self, platform_name: str) -> ?DeviceInstance:
+    def get_device_for_request(platform_name: str) -> ?DeviceInstance:
         """Get or create a device for a request"""
-        # First, try to find a ready device (static instances or containers)
-        for instance in self.instances:
-            if instance.state == "ready" and instance.platform_name == platform_name:
-                instance.state = "busy"
-                return instance
+        # Simplified for now - just return first ready device
+        for i in range(len(instances)):
+            device = instances[i]
+            if device.get_state() == "ready":
+                return device
+        return None
 
-        # Find the platform config
-        platform_config = self.config.get_platform(platform_name)
-        if platform_config is not None:
-            # For platforms with static instances, we can't create new instances
-            if platform_config.uses_static_instances():
-                # All static instances are busy, return None to queue the request
-                return None
-                
-            # For container platforms, check if we can start a new instance
-            # Check if we have devices starting up
-            starting_count = 0
-            for instance in self.instances:
-                if instance.state == "starting" and instance.platform_name == platform_name:
-                    starting_count += 1
-
-            # Check if we can start a new container instance
-            total_count = self.count_instances(platform_config.name)
-            if total_count < platform_config.max_instances:
-                # Start a new device
-                return self.start_device(platform_config)
-            elif starting_count > 0:
-                # We have devices starting, queue this request
-                return None  # Caller should queue the request
-            else:
-                # All devices are busy and we're at max capacity
-                return None
-        else:
-            return None
-
-    def start_device(self, platform: PlatformConfig) -> ?DeviceInstance:
+    def start_device(platform: PlatformConfig) -> ?DeviceInstance:
         """Start a new device instance (only for dynamically managed platforms)"""
         if platform.uses_static_instances():
-            print("Error: Cannot start new instances for platform with static instances: %s" % platform.name)
             return None
-            
-        instance_id = str(self.next_instance_id)
-        self.next_instance_id += 1
+
+        instance_id = str(next_instance_id)
+        next_instance_id += 1
 
         # Create a placeholder device in starting state
         device = DeviceInstance(
+            auth=auth,
+            log_handler=log_handler,
             platform_name="dynamic-platform",  # Hardcoded for now
             platform="dynamic",  # Hardcoded for now
-            container_id="starting-%s" % instance_id,
+            container_id=f"starting-{instance_id}",
             ip_address="pending",
             netconf_port=830,  # Use default for now
             ssh_port=22  # Use default for now
         )
-        device.state = "starting"
-        self.instances.append(device)
-
-        # Call the container manager to start the container
-        container_name = self.container_mgr.start_container(platform, instance_id)
-
-        # Update device with container info
-        device.state = "ready"
-        device.container_id = container_name
-        device.ip_address = "172.17.0.%d" % (10 + int(instance_id))
+        device.set_state("starting")
+        instances.append(device)
 
         return device
 
-    def release_device(self, device: DeviceInstance):
-        """Release a device after use"""
-        device.state = "ready"
-        device.current_request = None
+    def initialize_min_instances():
+        """Initialize specified instances and start minimum number of container instances for each platform"""
+        for platform in config.platforms:
+            # First, initialize any static instances
+            initialize_static_instances(platform)
 
-        # Check if we should shut down this device
-        platform = self.config.get_platform(device.platform_name)
-        if platform is not None:
-            current_count = self.count_instances(device.platform_name)
-            if current_count > platform.min_instances:
-                # We have more than minimum, consider shutting down
-                # For now, keep it running
-                pass
+            # Then start minimum container instances if needed
+            if not platform.uses_static_instances() and platform.min_instances > 0:
+                current_count = count_instances(platform.name)
+                to_start = platform.min_instances - current_count
+                for i in range(to_start):
+                    start_device(platform)
+
+    def get_instance_info() -> list[dict[str, ?value]]:
+        """Get instance info for API responses"""
+        return instance_info
+
+    def get_config() -> SystemConfig:
+        """Get system configuration"""
+        return config
+
 
 class InstanceSpec(object):
     """Specification for a static instance (physical device, VM, or pre-existing container)"""
-    def __init__(self, id: str, host: str, netconf_port: int = 830, 
-                 ssh_port: int = 22, username: ?str = None, password: ?str = None, 
+    def __init__(self, id: str, host: str, netconf_port: int = 830,
+                 ssh_port: int = 22, restconf_port: int = 443, username: ?str = None, password: ?str = None,
                  private_key_path: ?str = None, description: ?str = None):
         self.id = id
         self.host = host  # IP address or hostname
         self.netconf_port = netconf_port
         self.ssh_port = ssh_port
+        self.restconf_port = restconf_port
         self.username = username
         self.password = password
         self.private_key_path = private_key_path
         self.description = description
 
 class PlatformConfig(object):
+    name: str
+    platform: str
+    container_image: ?str
+    min_instances: int
+    max_instances: int
+    startup_time_seconds: int
+    idle_timeout_seconds: int
+    netconf_port: int
+    ssh_port: int
+    restconf_port: int
+    instances: list[InstanceSpec]
+    active_instances: int
+    available_instances: int
+
     def __init__(self, name: str, platform: str, container_image: ?str = None,
                  min_instances: int = 0, max_instances: int = 10,
                  startup_time_seconds: int = 60, idle_timeout_seconds: int = 300,
-                 netconf_port: int = 830, ssh_port: int = 22, 
+                 netconf_port: int = 830, ssh_port: int = 22, restconf_port: int = 443,
                  instances: ?list[InstanceSpec] = None):
         self.name = name
         self.platform = platform
@@ -248,11 +698,15 @@ class PlatformConfig(object):
         self.idle_timeout_seconds = idle_timeout_seconds  # When to shut down idle containers
         self.netconf_port = netconf_port  # NETCONF port inside container
         self.ssh_port = ssh_port  # SSH/CLI port inside container
-        self.instances = instances if instances is not None and len(instances) > 0 else []  # Static instances
+        self.restconf_port = restconf_port  # RESTCONF port inside container
+        if instances is not None and len(instances) > 0:
+            self.instances = instances
+        else:
+            self.instances = []
         # Runtime state (managed by Director)
         self.active_instances = 0
         self.available_instances = 0
-        
+
     def uses_static_instances(self) -> bool:
         """Returns True if this platform uses static instances rather than dynamic scaling"""
         return len(self.instances) > 0
@@ -299,87 +753,67 @@ class ConvertRequest(object):
         else:
             raise ValueError("All fields must be strings")
 
-actor Director(proc_cap: process.ProcessCap):
+actor Director(auth: WorldCap, proc_cap: process.ProcessCap, log_handler: logging.Handler):
     var device_manager: ?DeviceManager = None
+    logh = logging.Handler("Director")
+    logh.set_handler(log_handler)
+    _log = logging.Logger(logh)
 
     def set_config(conf: SystemConfig):
-        container_mgr = ContainerManager(proc_cap)
-        dm = DeviceManager(conf, container_mgr)
+        container_mgr = ContainerManager(proc_cap, log_handler)
+        dm = DeviceManager(conf, container_mgr, auth, log_handler)
         dm.initialize_min_instances()
         device_manager = dm
-        print("Director initialized, starting %d device instances" % len(dm.instances))
+        _log.info("Director initialized")
 
-    def process_request(request: ConvertRequest):
+
+    def convert(request: ConvertRequest, callback: action(str, bool) -> None):
         """Process a conversion request"""
+        _log.info("Director.convert called", {"input_format": request.format, "output_format": request.target_format, "platform": request.platform, "input_length": len(request.input)})
+
         dm = device_manager
         if dm is not None:
+            _log.info("DeviceManager found, requesting device")
             device = dm.get_device_for_request(request.platform)
             if device is not None:
-                print("Processing request on device %s at %s" % (device.container_id, device.ip_address))
-                device.current_request = request
+                _log.info("Device acquired successfully")
 
-                # Mock processing
-                # In reality, this would connect to the device and run the conversion
-                if request.format == "cli" and request.target_format == "netconf":
-                    output = "<rpc-reply><configuration><!-- Converted from CLI --></configuration></rpc-reply>"
-                else:
-                    output = "! Converted from NETCONF\nconfigure\n! Configuration here\ncommit"
-
-                # Release the device
-                dm.release_device(device)
+                # Dispatch conversion request to the device
+                _log.info("Dispatching conversion request to device")
+                device.convert(request, callback)
             else:
-                print("No device available for %s" % request.platform)
-                # In real implementation, queue the request
-
-            # Store result for now
-            # In real implementation, would call callback or respond to HTTP
+                _log.error("No device available for platform", {"platform": request.platform})
+                callback("No device available for %s" % request.platform, False)
         else:
-            print("Error: Director not initialized")
+            _log.error("Director not initialized - no DeviceManager")
+            callback("Director not initialized", False)
+
 
     def cli2xml(conf: str, cb):
         raise NotImplementedError()
 
     def xml2cli(conf: str):
         raise NotImplementedError()
-        
+
     def get_instances() -> list[dict[str, ?value]]:
         """Get list of all instances for API response"""
-        instances_data: list[dict[str, ?value]] = []
         dm = device_manager
         if dm is not None:
-            for instance in dm.instances:
-                instance_data = {
-                    "platform_name": instance.platform_name,
-                    "platform": instance.platform,
-                    "instance_id": instance.container_id,
-                    "ip_address": instance.ip_address,
-                    "state": instance.state,
-                    "netconf_port": instance.netconf_port,
-                    "ssh_port": instance.ssh_port,
-                    "instance_type": "static" if instance.is_static_instance() else "container"
-                }
-                instance_spec = instance.instance_spec
-                if instance_spec is not None:
-                    desc = instance_spec.description
-                    if desc is not None:
-                        instance_data["description"] = desc
-                instances_data.append(instance_data)
-        return instances_data
+            return dm.get_instance_info()
+        else:
+            return []
 
     def get_platforms() -> list[dict[str, ?value]]:
         """Get list of all configured platforms for API response"""
         platforms_data: list[dict[str, ?value]] = []
         dm = device_manager
         if dm is not None:
-            for platform in dm.config.platforms:
-                # Count current instances
-                total_instances = 0
-                available_instances = 0
-                for instance in dm.instances:
-                    if instance.platform_name == platform.name:
-                        total_instances += 1
-                        if instance.state == "ready":
-                            available_instances += 1
+            config = dm.get_config()
+            instance_info = dm.get_instance_info()
+            for platform in config.platforms:
+                # Count current instances - simplified for now
+                total_instances = len(platform.instances) if platform.uses_static_instances() else 0
+                available_instances = total_instances  # Simplified - assume all static instances are ready
 
                 platform_data = {
                     "name": platform.name,
@@ -393,7 +827,7 @@ actor Director(proc_cap: process.ProcessCap):
                 if platform.uses_static_instances():
                     instances_info = []
                     for spec in platform.instances:
-                        instance_info = {
+                        spec_info = {
                             "id": spec.id,
                             "host": spec.host,
                             "netconf_port": spec.netconf_port,
@@ -401,8 +835,8 @@ actor Director(proc_cap: process.ProcessCap):
                         }
                         desc = spec.description
                         if desc is not None:
-                            instance_info["description"] = desc
-                        instances_info.append(instance_info)
+                            spec_info["description"] = desc
+                        instances_info.append(spec_info)
                     platform_data["instances"] = instances_info
                 else:
                     # For dynamic platforms, show scaling configuration
@@ -412,34 +846,76 @@ actor Director(proc_cap: process.ProcessCap):
                 platforms_data.append(platform_data)
         return platforms_data
 
-actor WebServ(listen_cap: net.TCPListenCap, port, director):
+actor WebServ(listen_cap: net.TCPListenCap, port, director, log_handler: logging.Handler):
+    logh = logging.Handler("WebServ")
+    logh.set_handler(log_handler)
+    _log = logging.Logger(logh)
 
     def _on_http_accept(server):
         server.cb_install(_on_http_server_request, _on_http_server_error)
 
     def _on_http_server_request(server, request, respond):
+        _log.info("HTTP request received", {"method": request.method, "path": request.path})
         if request.path == "/api/v1/convert" and request.method == "POST":
+            _log.info("Processing conversion request")
             try:
                 body_str = request.body.decode()
+                _log.debug("Request body", {"body": body_str})
                 body_dict = json.decode(body_str)
+                _log.debug("Parsed JSON", {"body_dict": str(body_dict)})
 
                 # Parse the request using the from_json method
                 convert_req = ConvertRequest.from_json(body_dict)
+                _log.info("ConvertRequest created", {"input_format": convert_req.format, "output_format": convert_req.target_format, "platform": convert_req.platform})
 
-                # Mock conversion based on format
-                if convert_req.format == "cli" and convert_req.target_format == "netconf":
-                    output = "<rpc-reply><configuration><!-- Converted from CLI --></configuration></rpc-reply>"
-                else:
-                    output = "! Converted from NETCONF\nconfigure\n! Configuration here\ncommit"
+                # Define callback for when conversion completes
+                def on_conversion_done(result: str, success: bool):
+                    _log.debug("Conversion completed, preparing HTTP response")
+                    if success:
+                        _log.info("Conversion successful", {"result_length": len(result)})
 
-                response = {
-                    "success": True,
-                    "output": output,
-                    "platform": convert_req.platform,
-                    "platform_version": "mock-1.0"
-                }
-                response_str = json.encode(response)
-                respond(200, {"Content-Type": "application/json"}, response_str)
+                        # Try to parse the result as JSON (base_config + config format)
+                        try:
+                            result_dict = json.decode(result)
+                            if isinstance(result_dict, dict) and "base_config" in result_dict and "config" in result_dict:
+                                # New format with before/after configs
+                                response = {
+                                    "success": True,
+                                    "base_config": result_dict["base_config"],
+                                    "config": result_dict["config"],
+                                    "platform": convert_req.platform,
+                                    "platform_version": "1.0"
+                                }
+                            else:
+                                # Fallback to old format
+                                response = {
+                                    "success": True,
+                                    "output": result,
+                                    "platform": convert_req.platform,
+                                    "platform_version": "1.0"
+                                }
+                        except Exception:
+                            # If JSON parsing fails, use old format
+                            response = {
+                                "success": True,
+                                "output": result,
+                                "platform": convert_req.platform,
+                                "platform_version": "1.0"
+                            }
+                    else:
+                        _log.error("Conversion failed", {"result": result})
+                        response = {
+                            "success": False,
+                            "error": result,
+                            "platform": convert_req.platform
+                        }
+                    response_str = json.encode(response)
+                    _log.debug("Sending HTTP response", {"response_length": len(response_str)})
+                    respond(200, {"Content-Type": "application/json"}, response_str)
+
+                # Use Director's conversion logic with callback
+                _log.debug("Calling Director.convert")
+                director.convert(convert_req, on_conversion_done)
             except Exception as e:
                 error_dict = {"success": False, "error": str(e)}
                 error_str = json.encode(error_dict)
@@ -448,7 +924,7 @@ actor WebServ(listen_cap: net.TCPListenCap, port, director):
         elif request.path == "/api/v1/instances" and request.method == "GET":
             # Get actual instances from director
             instances_data = director.get_instances()
-            
+
             response = {
                 "instances": instances_data,
                 "total": len(instances_data)
@@ -459,7 +935,7 @@ actor WebServ(listen_cap: net.TCPListenCap, port, director):
         elif request.path == "/api/v1/platforms" and request.method == "GET":
             # Get actual platforms from director
             platforms_data = director.get_platforms()
-            
+
             response = {
                 "platforms": platforms_data,
                 "total": len(platforms_data)
@@ -493,10 +969,11 @@ def get_default_config() -> SystemConfig:
                 InstanceSpec(
                     id="local-crpd",
                     host="127.0.0.1",
-                    netconf_port=32773,
-                    ssh_port=32772,
-                    username="admin",
-                    password="admin",
+                    netconf_port=32779,
+                    ssh_port=32778,
+                    restconf_port=32774,
+                    username="clab",
+                    password="clab@123",
                     description="Local cRPD instance"
                 )
             ]
@@ -533,9 +1010,19 @@ actor main(env: Env):
 
     # Load configuration
     config = get_default_config()
-    print("Loaded %d platform configurations" % len(config.platforms))
+    # Create logging handler
+    log_handler = logging.Handler(None)
+    log_handler.add_sink(logging.StdoutSink())
+    log_handler.set_output_level(logging.TRACE)  # Set maximum debugging for SSH/NETCONF
 
-    director = Director(proc_cap)
+    # Create logger for main
+    logh = logging.Handler("main")
+    logh.set_handler(log_handler)
+    _log = logging.Logger(logh)
+
+    _log.info("Loaded platform configurations", {"platform_count": len(config.platforms)})
+
+    director = Director(env.cap, proc_cap, log_handler)
     director.set_config(config)
-    webs = WebServ(listen_cap, port, director)
-    print("NETCLICS started on port %d" % port)
+    webs = WebServ(listen_cap, port, director, log_handler)
+    _log.info("NETCLICS started", {"port": port})
