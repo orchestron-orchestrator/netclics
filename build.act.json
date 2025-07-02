@@ -4,6 +4,11 @@
             "repo_url": "https://github.com/orchestron-orchestrator/netconf.git",
             "url": "https://github.com/orchestron-orchestrator/netconf/archive/97fdf4a643b10f2da2f9ca1b2678735fea643b32.zip",
             "hash": "12203f4291b96a1ce2a8ba313eb39bc2a29991314a4a1e9ce518fe20676b0d6fd428"
+        },
+        "netcli": {
+            "repo_url": "https://github.com/orchestron-orchestrator/netcli.git",
+            "url": "https://github.com/orchestron-orchestrator/netcli/archive/8fedc5a8bac8ead87f44cea8551811d3e9bf0757.zip",
+            "hash": "122033567242fa0898b5450508cf93cd970538da0a11f0e9c246ce58586fdd44f374"
         }
     },
     "zig_dependencies": {}

@@ -3,13 +3,14 @@ import json
 import logging
 import net
 import netconf
+import router_client
 import time
 import process
 import xml
 
 actor ContainerManager(proc_cap: process.ProcessCap, log_handler: logging.Handler):
     """Manages Docker containers for network devices"""
-    
+
     # Set up logging
     logh = logging.Handler("ContainerManager")
     logh.set_handler(log_handler)
@@ -239,85 +240,131 @@ actor DeviceInstance(auth: WorldCap, log_handler: logging.Handler, platform_name
         current_request = request
 
         # Step 1: Get base configuration before applying changes
-        def on_base_config_retrieved(base_config: str, base_success: bool):
-            if base_success:
-                _log.info("Base configuration retrieved successfully")
+        # Always get NETCONF base config for rollback purposes
+        def on_netconf_base_config_retrieved(netconf_base_config: str, netconf_base_success: bool):
+            if netconf_base_success:
+                _log.info("NETCONF base configuration retrieved successfully for rollback")
 
-                # Step 2: Apply input using appropriate input handler
-                def on_input_applied(success: bool, error_msg: ?str):
-                    if success:
-                        _log.info("Input applied successfully")
+                # Step 1b: If target format is CLI, also get CLI base config for response
+                def on_target_base_config_retrieved(target_base_config: str, target_base_success: bool):
+                    if target_base_success:
+                        _log.info("Target format base configuration retrieved successfully")
 
-                        # Step 3: Retrieve final configuration using appropriate output handler
-                        def on_final_config_retrieved(final_config: str, final_success: bool):
-                            if final_success:
-                                _log.info("Final configuration retrieved successfully")
+                        # Step 2: Apply input using appropriate input handler
+                        def on_input_applied(success: bool, error_msg: ?str):
+                            if success:
+                                _log.info("Input applied successfully")
 
-                                # Step 4: Rollback to base configuration to clean up the device
-                                def on_rollback_complete(rollback_result: str, rollback_success: bool):
-                                    if rollback_success:
-                                        _log.info("Device successfully rolled back to clean state")
+                                # Step 3: Retrieve final configuration using appropriate output handler
+                                def on_final_config_retrieved(final_config: str, final_success: bool):
+                                    if final_success:
+                                        _log.info("Final configuration retrieved successfully")
+
+                                        # Step 3.5: Get diff if target format is CLI
+                                        def on_diff_retrieved(diff_text: str, diff_success: bool):
+                                            # Step 4: Rollback to base configuration to clean up the device
+                                            # Always use NETCONF base config for rollback
+                                            def on_rollback_complete(rollback_result: str, rollback_success: bool):
+                                                if rollback_success:
+                                                    _log.info("Device successfully rolled back to clean state")
+                                                else:
+                                                    _log.warning("Rollback failed but conversion succeeded", {"rollback_result": rollback_result})
+
+                                                # Return base, final configurations and diff
+                                                # Use target format base config for response
+                                                result_dict = {
+                                                    "base_config": target_base_config,
+                                                    "config": final_config,
+                                                    "diff": diff_text if diff_success else ""
+                                                }
+                                                combined_result = json.encode(result_dict)
+                                                state = "ready"
+                                                current_request = None
+                                                result_callback(combined_result, True)
+
+                                            # Start rollback process
+                                            extracted_config = extract_config_from_response(netconf_base_config)
+                                            _log.info("Starting automatic rollback to clean device state using NETCONF")
+                                            config_preview = extracted_config[:200] if len(extracted_config) > 200 else extracted_config
+                                            _log.debug("Extracted config for rollback", {"config_preview": config_preview})
+                                            _log.debug("About to call _rollback_to_config() method")
+                                            _rollback_to_config(extracted_config, on_rollback_complete)
+
+                                        # Extract just the configuration from the NETCONF base_config for rollback
+                                        def extract_config_from_response(rpc_response: str) -> str:
+                                            # Find the <configuration> element within the response
+                                            config_start = rpc_response.find("<configuration")
+                                            config_end = rpc_response.find("</configuration>") + len("</configuration>")
+                                            if config_start != -1 and config_end != -1:
+                                                config_xml = rpc_response[config_start:config_end]
+                                                config_preview = config_xml[:300] if len(config_xml) > 300 else config_xml
+                                                _log.debug("Original extracted config", {"config_preview": config_preview})
+
+                                                # No need to add operation="replace" since we use default-operation=replace
+                                                _log.debug("Using configuration as-is with default-operation=replace")
+                                                return config_xml
+                                            else:
+                                                _log.warning("Could not extract configuration from response, using full response")
+                                                return rpc_response
+
+                                        # Get diff based on target format
+                                        if request.target_format == "cli":
+                                            _log.info("Getting CLI diff using compare rollback")
+                                            _get_cli_diff(on_diff_retrieved)
+                                        else:
+                                            _log.info("NETCONF target format - skipping diff (not supported)")
+                                            on_diff_retrieved("", True)  # Empty diff for NETCONF
                                     else:
-                                        _log.warning("Rollback failed but conversion succeeded", {"rollback_result": rollback_result})
+                                        _log.error("Failed to retrieve final configuration", {"final_config": final_config})
+                                        state = "ready"
+                                        current_request = None
+                                        result_callback(final_config, False)
 
-                                    # Return both base and final configurations regardless of rollback status
-                                    result_dict = {
-                                        "base_config": base_config,
-                                        "config": final_config
-                                    }
-                                    combined_result = json.encode(result_dict)
-                                    state = "ready"
-                                    current_request = None
-                                    result_callback(combined_result, True)
-
-                                # Extract just the configuration from the base_config and add replace operation
-                                def extract_config_from_response(rpc_response: str) -> str:
-                                    # Find the <configuration> element within the response
-                                    config_start = rpc_response.find("<configuration")
-                                    config_end = rpc_response.find("</configuration>") + len("</configuration>")
-                                    if config_start != -1 and config_end != -1:
-                                        config_xml = rpc_response[config_start:config_end]
-                                        config_preview = config_xml[:300] if len(config_xml) > 300 else config_xml
-                                        _log.debug("Original extracted config", {"config_preview": config_preview})
-
-                                        # No need to add operation="replace" since we use default-operation=replace
-                                        _log.debug("Using configuration as-is with default-operation=replace")
-                                        return config_xml
-                                    else:
-                                        _log.warning("Could not extract configuration from response, using full response")
-                                        return rpc_response
-
-                                extracted_config = extract_config_from_response(base_config)
-                                _log.info("Starting automatic rollback to clean device state")
-                                config_preview = extracted_config[:200] if len(extracted_config) > 200 else extracted_config
-                                _log.debug("Extracted config for rollback", {"config_preview": config_preview})
-                                _log.debug("About to call _rollback_to_config() method")
-                                _rollback_to_config(extracted_config, on_rollback_complete)
+                                # Get final configuration using utility functions (don't manage state)
+                                if request.target_format == "cli":
+                                    _get_cli_config(on_final_config_retrieved)
+                                elif request.target_format == "netconf":
+                                    _get_netconf_config(on_final_config_retrieved)
+                                else:
+                                    # For other formats, use the general handler
+                                    _handle_output(request.target_format, on_final_config_retrieved)
                             else:
-                                _log.error("Failed to retrieve final configuration", {"final_config": final_config})
+                                err_str: str = "Input application failed"
+                                if error_msg is not None:
+                                    err_str = error_msg
+                                _log.error("Input application failed", {"error": err_str})
                                 state = "ready"
                                 current_request = None
-                                result_callback(final_config, False)
+                                result_callback(err_str, False)
 
-                        _handle_output(request.target_format, on_final_config_retrieved)
+                        _handle_input(request.format, request.input, on_input_applied)
                     else:
-                        err_str: str = "Input application failed"
-                        if error_msg is not None:
-                            err_str = error_msg
-                        _log.error("Input application failed", {"error": err_str})
+                        _log.error("Failed to retrieve target format base configuration", {"target_base_config": target_base_config})
                         state = "ready"
                         current_request = None
-                        result_callback(err_str, False)
+                        result_callback(target_base_config, False)
 
-                _handle_input(request.format, request.input, on_input_applied)
+                # Get base config in target format for response (if different from NETCONF)
+                if request.target_format == "netconf":
+                    # Target format is NETCONF, so use the same config for both purposes
+                    on_target_base_config_retrieved(netconf_base_config, netconf_base_success)
+                else:
+                    # Target format is different (CLI), so get it separately for response
+                    _log.info("Getting base configuration in target format for response", {"target_format": request.target_format})
+                    if request.target_format == "cli":
+                        _get_cli_config(on_target_base_config_retrieved)
+                    else:
+                        # For other formats, use the general handler (this shouldn't happen currently)
+                        _handle_output(request.target_format, on_target_base_config_retrieved)
             else:
-                _log.error("Failed to retrieve base configuration", {"base_config": base_config})
+                _log.error("Failed to retrieve NETCONF base configuration", {"netconf_base_config": netconf_base_config})
                 state = "ready"
                 current_request = None
-                result_callback(base_config, False)
+                result_callback(netconf_base_config, False)
 
-        # Start by getting the base configuration
-        _handle_output(request.target_format, on_base_config_retrieved)
+        # Start by always getting the NETCONF base configuration for rollback
+        _log.info("Getting base configuration in NETCONF format for rollback")
+        _get_netconf_config(on_netconf_base_config_retrieved)
 
     def _handle_input(input_format: str, input_data: str, callback: action(bool, ?str) -> None):
         """Apply input data using the appropriate input handler"""
@@ -326,9 +373,7 @@ actor DeviceInstance(auth: WorldCap, log_handler: logging.Handler, platform_name
         if input_format == "netconf":
             _netconf_input(input_data, callback)
         elif input_format == "cli":
-            # TODO: Implement CLI input handler
-            _log.error("CLI input handler not yet implemented")
-            callback(False, "CLI input handler not implemented")
+            _cli_input(input_data, callback)
         elif input_format == "restconf":
             # TODO: Implement RESTCONF input handler
             _log.error("RESTCONF input handler not yet implemented")
@@ -344,11 +389,7 @@ actor DeviceInstance(auth: WorldCap, log_handler: logging.Handler, platform_name
         if output_format == "netconf":
             _netconf_output(result_callback)
         elif output_format == "cli":
-            # TODO: Implement CLI output handler
-            _log.error("CLI output handler not yet implemented")
-            state = "ready"
-            current_request = None
-            result_callback("CLI output handler not implemented", False)
+            _cli_output(result_callback)
         elif output_format == "restconf":
             # TODO: Implement RESTCONF output handler
             _log.error("RESTCONF output handler not yet implemented")
@@ -455,6 +496,190 @@ actor DeviceInstance(auth: WorldCap, log_handler: logging.Handler, platform_name
         )
         _log.info("NETCONF client created, attempting connection")
 
+    def _cli_input(input_data: str, callback: action(bool, ?str) -> None):
+        """Apply CLI configuration via router_client"""
+        _log.info("CLI input handler: applying CLI configuration")
+
+        # Get credentials
+        creds = _get_credentials()
+        if creds is not None:
+            username, password = creds
+        else:
+            callback(False, "No credentials available")
+            return
+        _log.info("Starting CLI input", {"username": username, "host": ip_address, "port": ssh_port})
+
+        # Parse CLI commands from input data (split by newlines)
+        cli_commands = []
+        for line in input_data.split("\n"):
+            line = line.strip()
+            if line != "" and not line.startswith("#"):  # Skip empty lines and comments
+                cli_commands.append(line)
+
+        if not cli_commands:
+            callback(False, "No valid CLI commands found in input")
+            return
+
+        _log.debug("Parsed CLI commands", {"commands": cli_commands, "count": len(cli_commands)})
+
+        def on_success(response: str):
+            _log.info("CLI configuration applied successfully")
+            _log.debug("CLI success response", {"response": response})
+            callback(True, None)
+
+        def on_error(err: Exception, response: str):
+            _log.error("CLI configuration failed", {"error": str(err), "response": response})
+            callback(False, "CLI configuration error: " + str(err))
+
+        # Create router client
+        _log.info("Creating CLI client connection", {"host": ip_address, "port": ssh_port, "username": username})
+        _log.debug("Password masked", {"password_length": len(password) if password is not None else 0})
+
+        client = router_client.Client(
+            auth=auth,
+            address=ip_address,
+            username=username,
+            password=password,
+            port=ssh_port,
+            device_type="juniper_junos",  # Specify JUNOS device type
+            log_handler=log_handler
+        )
+
+        # Wait for connection and apply configuration
+        def try_configure(attempt: int):
+            if client.is_connected():
+                _log.debug("CLI client connected, sending configuration commands")
+                client.configure_and_commit(on_success, on_error, cli_commands)
+            elif attempt < 10:  # Retry for up to 5 seconds (10 attempts * 500ms)
+                _log.debug("CLI client not ready, retrying", {"attempt": attempt + 1})
+                after 0.5: try_configure(attempt + 1)
+            else:
+                _log.error("CLI client failed to connect after retries")
+                callback(False, "CLI client failed to connect within timeout")
+
+        _log.debug("Waiting for CLI client to connect")
+        after 0.1: try_configure(0)  # Start checking after 100ms
+
+    def _get_netconf_config(callback: action(str, bool) -> None):
+        """Utility function to get NETCONF config without managing conversion state"""
+        _log.info("NETCONF config utility: retrieving configuration")
+
+        # Get credentials
+        creds = _get_credentials()
+        if creds is not None:
+            username, password = creds
+        else:
+            callback("No credentials available", False)
+            return
+        _log.info("Starting NETCONF config retrieval", {"username": username, "host": ip_address, "port": netconf_port})
+
+        def on_connect(client: netconf.Client):
+            _log.info("NETCONF utility client connected successfully")
+            _log.debug("Client capabilities", {"capabilities": str(client.get_capabilities())})
+
+            def on_get_config_done(client: netconf.Client, response: ?xml.Node):
+                _log.debug("Get-config response received")
+                if response is not None:
+                    config_xml = xml.encode(response)
+                    _log.debug("Get-config response", {"config_xml": config_xml})
+
+                    # Check for NETCONF errors in the response
+                    if "<rpc-error>" in config_xml:
+                        _log.error("Get-config failed with NETCONF error", {"config_xml": config_xml})
+                        client.close()
+                        callback(f"NETCONF get-config error: {config_xml}", False)
+                    else:
+                        _log.info("Get-config completed successfully")
+                        _log.info("Retrieved configuration", {"config_length": len(config_xml)})
+                        _log.debug("Closing NETCONF connection")
+                        client.close()
+                        callback(config_xml, True)
+                else:
+                    _log.error("Get-config failed - received None response")
+                    client.close()
+                    callback("Get-config operation failed", False)
+
+            # Get the configuration
+            _log.debug("Sending get-config request")
+            client.get_config(on_get_config_done)
+
+        def on_error(client: netconf.Client, error: str):
+            _log.error("NETCONF connection error", {"error": error})
+            callback(f"NETCONF connection error: {error}", False)
+
+        # Create NETCONF client
+        _log.info("Creating NETCONF utility client", {"host": ip_address, "port": netconf_port, "username": username})
+        _log.debug("Password masked", {"password_length": len(password)})
+
+        netconf_client = netconf.Client(
+            auth=auth,
+            address=ip_address,
+            port=netconf_port,
+            username=username,
+            password=password,
+            key=None,
+            on_connect=on_connect,
+            on_error=on_error,
+            on_notif=None,
+            log_handler=log_handler
+        )
+        _log.info("NETCONF utility client created, attempting connection")
+
+    def _get_cli_config(callback: action(str, bool) -> None):
+        """Utility function to get CLI config without managing conversion state"""
+        _log.info("CLI config utility: retrieving configuration")
+
+        # Get credentials
+        creds = _get_credentials()
+        if creds is not None:
+            username, password = creds
+        else:
+            callback("No credentials available for CLI config", False)
+            return
+
+        _log.info("Starting CLI config retrieval", {"username": username, "host": ip_address, "port": ssh_port})
+
+        def on_cmd_complete(err: ?Exception, response: ?str):
+            if err is not None:
+                _log.error("CLI config retrieval failed", {"error": str(err)})
+                callback("CLI config error: " + str(err), False)
+            elif response is not None:
+                _log.info("CLI config retrieved successfully")
+                _log.debug("CLI config response", {"response_length": len(response)})
+                callback(response, True)
+            else:
+                _log.error("CLI config failed - received None response")
+                callback("CLI config failed", False)
+
+        # Create router client
+        _log.info("Creating CLI utility client", {"host": ip_address, "port": ssh_port, "username": username})
+        _log.debug("Password masked", {"password_length": len(password) if password is not None else 0})
+
+        client = router_client.Client(
+            auth=auth,
+            address=ip_address,
+            username=username,
+            password=password,
+            port=ssh_port,
+            device_type="juniper_junos",  # Specify JUNOS device type
+            log_handler=log_handler
+        )
+
+        # Wait for connection and get config
+        def try_get_config(attempt: int):
+            if client.is_connected():
+                _log.debug("CLI utility client connected, sending show config command")
+                client.cmd(on_cmd_complete, "show configuration")
+            elif attempt < 10:  # Retry for up to 5 seconds (10 attempts * 500ms)
+                _log.debug("CLI utility client not ready, retrying", {"attempt": attempt + 1})
+                after 0.5: try_get_config(attempt + 1)
+            else:
+                _log.error("CLI utility client failed to connect after retries")
+                callback("CLI utility client failed to connect within timeout", False)
+
+        _log.debug("Waiting for CLI utility client to connect")
+        after 0.1: try_get_config(0)  # Start checking after 100ms
+
     def _netconf_output(result_callback: action(str, bool) -> None):
         """Retrieve configuration via NETCONF get-config"""
         _log.info("NETCONF output handler: retrieving configuration")
@@ -533,6 +758,140 @@ actor DeviceInstance(auth: WorldCap, log_handler: logging.Handler, platform_name
             log_handler=log_handler
         )
         _log.info("NETCONF client created, attempting connection")
+
+    def _cli_output(result_callback: action(str, bool) -> None):
+        """Retrieve configuration via CLI commands"""
+        _log.info("CLI output handler: retrieving configuration")
+
+        # Get credentials
+        creds = _get_credentials()
+        if creds is not None:
+            username, password = creds
+        else:
+            state = "ready"
+            current_request = None
+            result_callback("No credentials available", False)
+            return
+
+        _log.info("Starting CLI output", {"username": username, "host": ip_address, "port": ssh_port})
+
+        def on_success(response: str):
+            _log.info("CLI show configuration completed successfully")
+            _log.debug("CLI response", {"response_length": len(response)})
+            state = "ready"
+            current_request = None
+            result_callback(response, True)
+
+        def on_error(error: Exception, response: str):
+            _log.error("CLI show configuration failed", {"error": str(error), "response": response})
+            state = "ready"
+            current_request = None
+            result_callback("CLI show configuration error: " + str(error), False)
+
+        # Create router client
+        _log.info("Creating CLI client connection", {"host": ip_address, "port": ssh_port, "username": username})
+        _log.debug("Password masked", {"password_length": len(password) if password is not None else 0})
+
+        client = router_client.Client(
+            auth=auth,
+            address=ip_address,
+            username=username,
+            password=password,
+            port=ssh_port,
+            device_type="juniper_junos",  # Specify JUNOS device type
+            log_handler=log_handler
+        )
+
+        # Use cmd method for show commands instead of configure_and_commit
+        def on_cmd_complete(err: ?Exception, response: ?str):
+            if err is not None:
+                _log.error("CLI show configuration failed", {"error": str(err)})
+                state = "ready"
+                current_request = None
+                result_callback("CLI show configuration error: " + str(err), False)
+            elif response is not None:
+                _log.info("CLI show configuration completed successfully")
+                _log.debug("CLI response", {"response_length": len(response)})
+                state = "ready"
+                current_request = None
+                result_callback(response, True)
+            else:
+                _log.error("CLI show configuration failed - received None response")
+                state = "ready"
+                current_request = None
+                result_callback("CLI show configuration failed", False)
+
+        # Wait for connection and get configuration
+        def try_show_config(attempt: int):
+            if client.is_connected():
+                _log.debug("CLI client connected, sending show configuration command")
+                client.cmd(on_cmd_complete, "show configuration")
+            elif attempt < 10:  # Retry for up to 5 seconds (10 attempts * 500ms)
+                _log.debug("CLI client not ready, retrying", {"attempt": attempt + 1})
+                after 0.5: try_show_config(attempt + 1)
+            else:
+                _log.error("CLI client failed to connect after retries")
+                state = "ready"
+                current_request = None
+                result_callback("CLI client failed to connect within timeout", False)
+
+        _log.debug("Waiting for CLI client to connect")
+        after 0.1: try_show_config(0)  # Start checking after 100ms
+
+    def _get_cli_diff(result_callback: action(str, bool) -> None):
+        """Get CLI diff using 'show configuration | compare rollback 1'"""
+        _log.info("CLI diff handler: getting configuration differences")
+
+        # Get credentials
+        creds = _get_credentials()
+        if creds is not None:
+            username, password = creds
+        else:
+            result_callback("No credentials available for CLI diff", False)
+            return
+
+        _log.info("Starting CLI diff retrieval", {"username": username, "host": ip_address, "port": ssh_port})
+
+        def on_cmd_complete(err: ?Exception, response: ?str):
+            if err is not None:
+                _log.error("CLI diff command failed", {"error": str(err)})
+                result_callback("CLI diff error: " + str(err), False)
+            elif response is not None:
+                _log.info("CLI diff retrieved successfully")
+                _log.debug("CLI diff response", {"response_length": len(response)})
+                result_callback(response, True)
+            else:
+                _log.error("CLI diff failed - received None response")
+                result_callback("CLI diff failed", False)
+
+        # Create router client
+        _log.info("Creating CLI client for diff", {"host": ip_address, "port": ssh_port, "username": username})
+        _log.debug("Password masked", {"password_length": len(password) if password is not None else 0})
+
+        client = router_client.Client(
+            auth=auth,
+            address=ip_address,
+            username=username,
+            password=password,
+            port=ssh_port,
+            device_type="juniper_junos",  # Specify JUNOS device type
+            log_handler=log_handler
+        )
+
+        # Wait for connection and get diff
+        def try_get_diff(attempt: int):
+            if client.is_connected():
+                _log.debug("CLI client connected, sending diff command")
+                client.cmd(on_cmd_complete, "show configuration | compare rollback 1")
+            elif attempt < 10:  # Retry for up to 5 seconds (10 attempts * 500ms)
+                _log.debug("CLI client not ready for diff, retrying", {"attempt": attempt + 1})
+                after 0.5: try_get_diff(attempt + 1)
+            else:
+                _log.error("CLI client failed to connect for diff after retries")
+                result_callback("CLI client failed to connect for diff within timeout", False)
+
+        _log.debug("Waiting for CLI client to connect for diff")
+        after 0.1: try_get_diff(0)  # Start checking after 100ms
 
     def _get_credentials() -> ?(str, str):
         """Get device credentials, returns (username, password) tuple or None"""
@@ -878,7 +1237,7 @@ actor WebServ(listen_cap: net.TCPListenCap, port, director, log_handler: logging
                         try:
                             result_dict = json.decode(result)
                             if isinstance(result_dict, dict) and "base_config" in result_dict and "config" in result_dict:
-                                # New format with before/after configs
+                                # New format with before/after configs and diff
                                 response = {
                                     "success": True,
                                     "base_config": result_dict["base_config"],
@@ -886,6 +1245,11 @@ actor WebServ(listen_cap: net.TCPListenCap, port, director, log_handler: logging
                                     "platform": convert_req.platform,
                                     "platform_version": "1.0"
                                 }
+                                # Add diff field if it exists in result_dict
+                                if "diff" in result_dict:
+                                    response["diff"] = result_dict["diff"]
+                                else:
+                                    response["diff"] = ""
                             else:
                                 # Fallback to old format
                                 response = {
@@ -969,8 +1333,8 @@ def get_default_config() -> SystemConfig:
                 InstanceSpec(
                     id="local-crpd",
                     host="127.0.0.1",
-                    netconf_port=32779,
-                    ssh_port=32778,
+                    netconf_port=32781,
+                    ssh_port=32780,
                     restconf_port=32774,
                     username="clab",
                     password="clab@123",
