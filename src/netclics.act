@@ -139,9 +139,12 @@ actor DeviceInstance(auth: WorldCap, log_handler: logging.Handler, platform_name
 
         _log.info("Starting NETCONF rollback", {"username": username, "host": ip_address, "port": netconf_port})
 
-        def on_connect(client: netconf.Client):
-            _log.info("NETCONF client connected successfully")
-            _log.debug("Client capabilities", {"capabilities": str(client.get_capabilities())})
+        def on_connect(client: ?netconf.Client, error: ?Exception):
+            if error is not None:
+                _log.error("NETCONF rollback connection error", {"error": error})
+                state = "ready"
+                result_callback(f"NETCONF rollback connection error: {error}", False)
+                return
 
             def on_edit_config_done(client: netconf.Client, response: ?xml.Node):
                 _log.debug("Rollback edit-config response received")
@@ -199,34 +202,38 @@ actor DeviceInstance(auth: WorldCap, log_handler: logging.Handler, platform_name
                     state = "ready"
                     result_callback("Rollback edit-config operation failed", False)
 
-            # Apply the rollback configuration with default-operation=replace
-            _log.debug("Sending rollback edit-config with default-operation=replace")
-            # Use the rpc method directly to include default-operation=replace
-            nc_nsdefs = [(None, "urn:ietf:params:xml:ns:netconf:base:1.0")]
-            children = [
-                xml.Node("target", children=[xml.Node("candidate")]),
-                xml.Node("default-operation", text="replace"),
-                xml.Node("config", [("xc", "urn:ietf:params:xml:ns:netconf:base:1.0")], text=target_config)
-            ]
-            client.rpc(xml.Node("edit-config", nc_nsdefs, children=children), on_edit_config_done)
+            if client is not None:
+                # Client is guaranteed to be non-None here
+                _log.info("NETCONF client connected successfully")
+                _log.debug("Client capabilities", {"capabilities": str(client.get_capabilities())})
 
-        def on_error(client: netconf.Client, error: str):
-            _log.error("NETCONF rollback connection error", {"error": error})
-            state = "ready"
-            result_callback(f"NETCONF rollback connection error: {error}", False)
+                # Apply the rollback configuration with default-operation=replace
+                _log.debug("Sending rollback edit-config with default-operation=replace")
+                # Use the rpc method directly to include default-operation=replace
+                nc_nsdefs = [(None, "urn:ietf:params:xml:ns:netconf:base:1.0")]
+                children = [
+                    xml.Node("target", children=[xml.Node("candidate")]),
+                    xml.Node("default-operation", text="replace"),
+                    xml.Node("config", [("xc", "urn:ietf:params:xml:ns:netconf:base:1.0")], text=target_config)
+                ]
+                client.rpc(xml.Node("edit-config", nc_nsdefs, children=children), on_edit_config_done)
+            else:
+                _log.error("NETCONF rollback connection failed - no client")
+                state = "ready"
+                result_callback("NETCONF rollback connection failed", False)
+                return
 
         # Create NETCONF client for rollback
         _log.info("Creating NETCONF client connection for rollback")
         netconf_client = netconf.Client(
             auth=auth,
-            address=ip_address,
-            port=netconf_port,
-            username=username,
-            password=password,
-            key=None,
             on_connect=on_connect,
-            on_error=on_error,
             on_notif=None,
+            address=ip_address,
+            username=username,
+            key=None,
+            password=password,
+            port=netconf_port,
             log_handler=log_handler
         )
         _log.info("NETCONF rollback client created, attempting connection")
@@ -415,9 +422,11 @@ actor DeviceInstance(auth: WorldCap, log_handler: logging.Handler, platform_name
             return
         _log.info("Starting NETCONF input", {"username": username, "host": ip_address, "port": netconf_port})
 
-        def on_connect(client: netconf.Client):
-            _log.info("NETCONF client connected successfully")
-            _log.debug("Client capabilities", {"capabilities": str(client.get_capabilities())})
+        def on_connect(client: ?netconf.Client, error: ?Exception):
+            if error is not None:
+                _log.error("NETCONF connection error", {"error": error})
+                callback(False, f"NETCONF connection error: {error}")
+                return
 
             def on_edit_config_done(client: netconf.Client, response: ?xml.Node):
                 _log.debug("Edit-config response received")
@@ -469,14 +478,18 @@ actor DeviceInstance(auth: WorldCap, log_handler: logging.Handler, platform_name
                     client.close()
                     callback(False, "Edit-config operation failed")
 
-            # Apply the input configuration
-            _log.debug("Sending edit-config with input", {"input_data": input_data})
-            # Try candidate datastore instead of running
-            client.edit_config(input_data, on_edit_config_done, "candidate")
+            if client is not None:
+                _log.info("NETCONF client connected successfully")
+                _log.debug("Client capabilities", {"capabilities": str(client.get_capabilities())})
 
-        def on_error(client: netconf.Client, error: str):
-            _log.error("NETCONF connection error", {"error": error})
-            callback(False, f"NETCONF connection error: {error}")
+                # Apply the input configuration
+                _log.debug("Sending edit-config with input", {"input_data": input_data})
+                # Try candidate datastore instead of running
+                client.edit_config(input_data, on_edit_config_done, "candidate")
+            else:
+                _log.error("NETCONF connection failed - no client")
+                callback(False, "NETCONF connection failed")
+                return
 
         # Create NETCONF client
         _log.info("Creating NETCONF client connection", {"host": ip_address, "port": netconf_port, "username": username})
@@ -484,14 +497,13 @@ actor DeviceInstance(auth: WorldCap, log_handler: logging.Handler, platform_name
 
         netconf_client = netconf.Client(
             auth=auth,
-            address=ip_address,
-            port=netconf_port,
-            username=username,
-            password=password,
-            key=None,
             on_connect=on_connect,
-            on_error=on_error,
             on_notif=None,
+            address=ip_address,
+            username=username,
+            key=None,
+            password=password,
+            port=netconf_port,
             log_handler=log_handler
         )
         _log.info("NETCONF client created, attempting connection")
@@ -573,9 +585,11 @@ actor DeviceInstance(auth: WorldCap, log_handler: logging.Handler, platform_name
             return
         _log.info("Starting NETCONF config retrieval", {"username": username, "host": ip_address, "port": netconf_port})
 
-        def on_connect(client: netconf.Client):
-            _log.info("NETCONF utility client connected successfully")
-            _log.debug("Client capabilities", {"capabilities": str(client.get_capabilities())})
+        def on_connect(client: ?netconf.Client, error: ?Exception):
+            if error is not None:
+                _log.error("NETCONF connection error", {"error": error})
+                callback(f"NETCONF connection error: {error}", False)
+                return
 
             def on_get_config_done(client: netconf.Client, response: ?xml.Node):
                 _log.debug("Get-config response received")
@@ -599,13 +613,17 @@ actor DeviceInstance(auth: WorldCap, log_handler: logging.Handler, platform_name
                     client.close()
                     callback("Get-config operation failed", False)
 
-            # Get the configuration
-            _log.debug("Sending get-config request")
-            client.get_config(on_get_config_done)
+            if client is not None:
+                _log.info("NETCONF utility client connected successfully")
+                _log.debug("Client capabilities", {"capabilities": str(client.get_capabilities())})
 
-        def on_error(client: netconf.Client, error: str):
-            _log.error("NETCONF connection error", {"error": error})
-            callback(f"NETCONF connection error: {error}", False)
+                # Get the configuration
+                _log.debug("Sending get-config request")
+                client.get_config(on_get_config_done)
+            else:
+                _log.error("NETCONF connection failed - no client")
+                callback("NETCONF connection failed", False)
+                return
 
         # Create NETCONF client
         _log.info("Creating NETCONF utility client", {"host": ip_address, "port": netconf_port, "username": username})
@@ -613,14 +631,13 @@ actor DeviceInstance(auth: WorldCap, log_handler: logging.Handler, platform_name
 
         netconf_client = netconf.Client(
             auth=auth,
-            address=ip_address,
-            port=netconf_port,
-            username=username,
-            password=password,
-            key=None,
             on_connect=on_connect,
-            on_error=on_error,
             on_notif=None,
+            address=ip_address,
+            username=username,
+            key=None,
+            password=password,
+            port=netconf_port,
             log_handler=log_handler
         )
         _log.info("NETCONF utility client created, attempting connection")
@@ -695,9 +712,14 @@ actor DeviceInstance(auth: WorldCap, log_handler: logging.Handler, platform_name
             return
         _log.info("Starting NETCONF output", {"username": username, "host": ip_address, "port": netconf_port})
 
-        def on_connect(client: netconf.Client):
-            _log.info("NETCONF client connected successfully")
-            _log.debug("Client capabilities", {"capabilities": str(client.get_capabilities())})
+        def on_connect(client: ?netconf.Client, error: ?Exception):
+            if error is not None:
+                _log.error("NETCONF connection error", {"error": error})
+                _log.debug("Releasing device due to error")
+                state = "ready"
+                current_request = None
+                result_callback(f"NETCONF connection error: {error}", False)
+                return
 
             def on_get_config_done(client: netconf.Client, response: ?xml.Node):
                 _log.debug("Get-config response received")
@@ -730,16 +752,19 @@ actor DeviceInstance(auth: WorldCap, log_handler: logging.Handler, platform_name
                     current_request = None
                     result_callback("Get-config operation failed", False)
 
-            # Get the configuration
-            _log.debug("Sending get-config request")
-            client.get_config(on_get_config_done)
+            if client is not None:
+                _log.info("NETCONF client connected successfully")
+                _log.debug("Client capabilities", {"capabilities": str(client.get_capabilities())})
 
-        def on_error(client: netconf.Client, error: str):
-            _log.error("NETCONF connection error", {"error": error})
-            _log.debug("Releasing device due to error")
-            state = "ready"
-            current_request = None
-            result_callback(f"NETCONF connection error: {error}", False)
+                # Get the configuration
+                _log.debug("Sending get-config request")
+                client.get_config(on_get_config_done)
+            else:
+                _log.error("NETCONF connection failed - no client")
+                state = "ready"
+                current_request = None
+                result_callback("NETCONF connection failed", False)
+                return
 
         # Create NETCONF client
         _log.info("Creating NETCONF client connection", {"host": ip_address, "port": netconf_port, "username": username})
@@ -747,14 +772,13 @@ actor DeviceInstance(auth: WorldCap, log_handler: logging.Handler, platform_name
 
         netconf_client = netconf.Client(
             auth=auth,
-            address=ip_address,
-            port=netconf_port,
-            username=username,
-            password=password,
-            key=None,
             on_connect=on_connect,
-            on_error=on_error,
             on_notif=None,
+            address=ip_address,
+            username=username,
+            key=None,
+            password=password,
+            port=netconf_port,
             log_handler=log_handler
         )
         _log.info("NETCONF client created, attempting connection")
