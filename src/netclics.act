@@ -234,7 +234,8 @@ actor DeviceInstance(auth: WorldCap, log_handler: logging.Handler, platform_name
             key=None,
             password=password,
             port=netconf_port,
-            log_handler=log_handler
+            log_handler=log_handler,
+            skip_host_key_check=True
         )
         _log.info("NETCONF rollback client created, attempting connection")
 
@@ -504,7 +505,8 @@ actor DeviceInstance(auth: WorldCap, log_handler: logging.Handler, platform_name
             key=None,
             password=password,
             port=netconf_port,
-            log_handler=log_handler
+            log_handler=log_handler,
+            skip_host_key_check=True
         )
         _log.info("NETCONF client created, attempting connection")
 
@@ -638,7 +640,8 @@ actor DeviceInstance(auth: WorldCap, log_handler: logging.Handler, platform_name
             key=None,
             password=password,
             port=netconf_port,
-            log_handler=log_handler
+            log_handler=log_handler,
+            skip_host_key_check=True
         )
         _log.info("NETCONF utility client created, attempting connection")
 
@@ -779,7 +782,8 @@ actor DeviceInstance(auth: WorldCap, log_handler: logging.Handler, platform_name
             key=None,
             password=password,
             port=netconf_port,
-            log_handler=log_handler
+            log_handler=log_handler,
+            skip_host_key_check=True
         )
         _log.info("NETCONF client created, attempting connection")
 
