@@ -13,6 +13,9 @@ run:
 build:
     acton build
 
+build-ldep:
+    acton build --dep yang=../acton-yang --dep netconf=../netconf --dep netcli=../netcli
+
 # Show available platforms
 platforms:
     curl -s http://localhost:8080/api/v1/platforms | jq .
