@@ -7,7 +7,7 @@ default:
 
 # Start the NETCLICS server
 run:
-    acton run src/netclics.act
+    out/bin/netclics
 
 # Build the project
 build:
