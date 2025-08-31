@@ -7,6 +7,8 @@ import router_client
 import time
 import process
 import xml
+import yang.schema
+import schema_getter
 
 actor ContainerManager(proc_cap: process.ProcessCap, log_handler: logging.Handler):
     """Manages Docker containers for network devices"""
@@ -85,6 +87,11 @@ actor DeviceInstance(auth: WorldCap, log_handler: logging.Handler, platform_name
     var current_request: ?ConvertRequest = None  # Currently processing request
     var started_at = 0  # Timestamp when started
     var last_used_at = 0  # Timestamp of last use
+
+    # Schema storage
+    var compiled_schema: ?yang.schema.DRoot = None  # Compiled YANG schema
+    var schema_list: list[str] = []  # Raw YANG schema strings
+    var schema_ready = False  # Flag indicating schemas are ready
 
     # Set up logging
     logh = logging.Handler("DeviceInstance")
@@ -880,6 +887,86 @@ actor DeviceInstance(auth: WorldCap, log_handler: logging.Handler, platform_name
             _log.error("No InstanceSpec available for device", {"device": container_id})
             return None
 
+    def initialize_schemas():
+        """Initialize schemas by downloading them from the device and compiling them"""
+        _log.info("Initializing YANG schemas for device", {"device": container_id})
+
+        # Get credentials
+        creds = _get_credentials()
+        if creds is not None:
+            username, password = creds
+        else:
+            _log.error("No credentials available for schema initialization")
+            state = "error"
+            return
+
+        def on_connect(client: netconf.Client, error: ?Exception):
+            if error is not None:
+                _log.error("Failed to connect for schema initialization", {"error": error})
+                state = "error"
+                return
+
+            _log.info("Connected to device for schema initialization")
+
+            # Create SchemaGetter actor
+            sg = schema_getter.SchemaGetter(client, log_handler)
+
+            # Callback for each schema download
+            def on_schema_download(current_index: int, total_schemas: int, schema: (identifier: ?str, namespace: ?str, version: ?str, format: ?str), schema_data: ?str):
+                if schema_data is not None:
+                    schema_identifier = schema.identifier
+                    if schema_identifier is not None:
+                        # Skip junos-rpc schemas as they're not needed, and also don't compile :/
+                        if schema_identifier.startswith("junos-rpc"):
+                            return
+                        _log.debug("Downloaded schema", {"identifier": schema_identifier, "index": current_index + 1, "total": total_schemas})
+                        schema_list.append(schema_data)
+
+            # Callback when all schemas are complete
+            def on_schemas_complete(error: ?netconf.NetconfError):
+                if error is not None:
+                    _log.error("Error during schema download", {"error": error})
+                    # Continue anyway - device can work without schemas
+
+                _log.info("All schemas downloaded", {"count": len(schema_list)})
+
+                # Compile the schemas
+                try:
+                    compiled_schema = yang.compile(schema_list)
+                    _log.info("Successfully compiled YANG schemas")
+                    schema_ready = True
+                except Exception as e:
+                    _log.error("Failed to compile schemas", {"error": e})
+                    compiled_schema = None
+                    schema_ready = False
+
+                # Close the NETCONF connection
+                client.close()
+
+                # Set state to ready regardless of schema compilation result
+                # (device can still work without schemas for basic operations)
+                state = "ready"
+                _log.info("Device initialization complete", {"device": container_id, "schemas_compiled": schema_ready})
+
+            # Start downloading all schemas
+            sg.download(on_schema_download, on_schemas_complete, "all")
+
+        # Create NETCONF client
+        _log.info("Creating NETCONF client for schema initialization", {"host": ip_address, "port": netconf_port})
+
+        netconf_client = netconf.Client(
+            auth=auth,
+            on_connect=on_connect,
+            on_notif=None,
+            address=ip_address,
+            username=username,
+            key=None,
+            password=password,
+            port=netconf_port,
+            log_handler=log_handler,
+            skip_host_key_check=True
+        )
+
 actor DeviceManager(config: SystemConfig, container_mgr: ContainerManager, auth: WorldCap, log_handler: logging.Handler):
     """Manages device lifecycle and state transitions"""
     var instances = []  # DeviceInstance actors
@@ -906,7 +993,8 @@ actor DeviceManager(config: SystemConfig, container_mgr: ContainerManager, auth:
                 ssh_port=spec.ssh_port,
                 instance_spec=spec
             )
-            device.set_state("ready")  # Specified instances are assumed to be ready
+            # Initialize schemas on device startup
+            device.initialize_schemas()
             instances.append(device)
 
             # Add to instance_info for API responses
