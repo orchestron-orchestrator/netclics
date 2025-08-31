@@ -581,13 +581,26 @@ actor DeviceInstance(auth: WorldCap, log_handler: logging.Handler, platform_name
                     client.close()
                     callback("NETCONF get-config error: {error}", False)
                 elif response is not None:
-                    config_xml = xml.encode(response)
-                    _log.debug("Get-config response", {"config_xml": config_xml})
-                    _log.info("Get-config completed successfully")
-                    _log.info("Retrieved configuration", {"config_length": len(config_xml)})
-                    _log.debug("Closing NETCONF connection")
-                    client.close()
-                    callback(config_xml, True)
+                    # Extract the <data> element from the RPC reply
+                    data_node: ?xml.Node = None
+                    for child in response.children:
+                        if child.tag == "data":
+                            data_node = child
+                            break
+
+                    if data_node is not None:
+                        # Encode just the data element's content
+                        config_xml = xml.encode(data_node)
+                        _log.debug("Get-config response (data element)", {"config_xml": config_xml})
+                        _log.info("Get-config completed successfully")
+                        _log.info("Retrieved configuration", {"config_length": len(config_xml)})
+                        _log.debug("Closing NETCONF connection")
+                        client.close()
+                        callback(config_xml, True)
+                    else:
+                        _log.error("No data element in get-config response")
+                        client.close()
+                        callback("No data element in get-config response", False)
                 else:
                     _log.error("Get-config failed - received None response")
                     client.close()
@@ -717,63 +730,77 @@ actor DeviceInstance(auth: WorldCap, log_handler: logging.Handler, platform_name
                     current_request = None
                     result_callback("NETCONF get-config error: {error}", False)
                 elif response is not None:
-                    config_xml = xml.encode(response)
-                    _log.debug("Get-config response", {"config_xml": config_xml})
-                    _log.info("Get-config completed successfully")
-                    _log.info("Retrieved configuration", {"config_length": len(config_xml)})
+                    # Extract the <data> element from the RPC reply
+                    data_node: ?xml.Node = None
+                    for child in response.children:
+                        if child.tag == "data":
+                            data_node = child
+                            break
+                    
+                    if data_node is not None:
+                        config_xml = xml.encode(data_node)
+                        _log.debug("Get-config response (data element)", {"config_xml": config_xml})
+                        _log.info("Get-config completed successfully")
+                        _log.info("Retrieved configuration", {"config_length": len(config_xml)})
 
-                    # Parse with gen3 if we have schemas
-                    output_str = config_xml  # default to raw XML
-                    gdata: ?yang.gdata.Node = None
+                        # Parse with gen3 if we have schemas
+                        output_str = config_xml  # default to raw XML
+                        gdata: ?yang.gdata.Node = None
 
-                    if compiled_schema is not None:
-                        try:
-                            # Always parse the XML with schemas if available
-                            _log.info("Parsing XML with gen3 schemas")
-                            gdata = yang.gen3.from_xml(compiled_schema, response, loose=True)
-
-                            # Store gdata based on context (base or final)
-                            # We'll determine this based on whether base_gdata is already set
-                            if base_gdata is None:
-                                base_gdata = gdata
-                                _log.debug("Stored base_gdata")
-                            else:
-                                final_gdata = gdata
-                                _log.debug("Stored final_gdata")
-
-                            # Format based on target format
-                            if gdata is not None:
-                                if target_format == "json":
-                                    output_str = gdata.to_json()
-                                    _log.info("Converted to JSON format")
-                                elif target_format == "acton-gdata":
-                                    output_str = gdata.prsrc()
-                                    _log.info("Converted to Acton gdata format")
-                                elif target_format == "acton-adata":
-                                    output_str = yang.gen3.pradata(compiled_schema, gdata, loose=True)
-                                    _log.info("Converted to Acton adata format")
-                                elif target_format in ["netconf", "xml"]:
-                                    # Keep as XML for netconf/xml formats
-                                    output_str = config_xml
-                                else:
-                                    # Unknown format, keep as XML
-                                    _log.warning("Unknown target format, returning XML", {"target_format": target_format})
-                            else:
-                                _log.error("Failed to parse gdata")
+                        if compiled_schema is not None:
+                            try:
+                                # Always parse the XML with schemas if available
+                                _log.info("Parsing XML with gen3 schemas")
+                                gdata = yang.gen3.from_xml(compiled_schema, data_node, loose=True)
+                            except Exception as e:
+                                _log.error("Failed to parse or convert with gen3", {"error": str(e)})
+                                # Fall back to raw XML on error
                                 output_str = config_xml
-                        except Exception as e:
-                            _log.error("Failed to parse or convert with gen3", {"error": str(e)})
-                            # Fall back to raw XML on error
-                            output_str = config_xml
-                    elif compiled_schema is None and target_format not in ["netconf", "xml"]:
-                        _log.warning("No compiled schema available, returning raw XML")
+                            else:
+                                # Store gdata based on context (base or final)
+                                # We'll determine this based on whether base_gdata is already set
+                                if base_gdata is None:
+                                    base_gdata = gdata
+                                    _log.debug("Stored base_gdata")
+                                else:
+                                    final_gdata = gdata
+                                    _log.debug("Stored final_gdata")
 
-                    _log.debug("Closing NETCONF connection")
-                    client.close()
-                    _log.debug("Releasing device")
-                    state = "ready"
-                    current_request = None
-                    result_callback(output_str, True)
+                                # Format based on target format
+                                if gdata is not None:
+                                    if target_format == "json":
+                                        output_str = gdata.to_json()
+                                        _log.info("Converted to JSON format")
+                                    elif target_format == "acton-gdata":
+                                        output_str = gdata.prsrc()
+                                        _log.info("Converted to Acton gdata format")
+                                    elif target_format == "acton-adata":
+                                        output_str = yang.gen3.pradata(compiled_schema, gdata, loose=True)
+                                        _log.info("Converted to Acton adata format")
+                                    elif target_format in ["netconf", "xml"]:
+                                        # Keep as XML for netconf/xml formats
+                                        output_str = config_xml
+                                    else:
+                                        # Unknown format, keep as XML
+                                        _log.warning("Unknown target format, returning XML", {"target_format": target_format})
+                                else:
+                                    _log.error("Failed to parse gdata")
+                                    output_str = config_xml
+                        elif target_format not in ["netconf", "xml"]:
+                            # No schema but non-XML format requested
+                            _log.warning("No compiled schema available for format conversion, returning raw XML", {"target_format": target_format})
+
+                        # Success - close connection and return result
+                        _log.debug("Closing NETCONF connection")
+                        client.close()
+                        # Don't clear state or current_request here - let the main convert() function manage that
+                        result_callback(output_str, True)
+                    else:
+                        _log.error("No data element in get-config response")
+                        client.close()
+                        state = "ready"
+                        current_request = None
+                        result_callback("No data element in get-config response", False)
                 else:
                     _log.error("Get-config failed - received None response")
                     client.close()
