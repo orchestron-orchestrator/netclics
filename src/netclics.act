@@ -7,6 +7,9 @@ import router_client
 import time
 import process
 import xml
+import yang
+import yang.gen3
+import yang.gdata
 import yang.schema
 import schema_getter
 
@@ -92,6 +95,10 @@ actor DeviceInstance(auth: WorldCap, log_handler: logging.Handler, platform_name
     var compiled_schema: ?yang.schema.DRoot = None  # Compiled YANG schema
     var schema_list: list[str] = []  # Raw YANG schema strings
     var schema_ready = False  # Flag indicating schemas are ready
+
+    # Storage for parsed configs during conversion
+    var base_gdata: ?yang.gdata.Node = None
+    var final_gdata: ?yang.gdata.Node = None
 
     # Set up logging
     logh = logging.Handler("DeviceInstance")
@@ -225,6 +232,10 @@ actor DeviceInstance(auth: WorldCap, log_handler: logging.Handler, platform_name
         state = "busy"
         current_request = request
 
+        # Reset gdata storage for new conversion
+        base_gdata = None
+        final_gdata = None
+
         # Step 1: Get base configuration before applying changes
         # Always get NETCONF base config for rollback purposes
         def on_netconf_base_config_retrieved(netconf_base_config: str, netconf_base_success: bool):
@@ -266,6 +277,9 @@ actor DeviceInstance(auth: WorldCap, log_handler: logging.Handler, platform_name
                                                 combined_result = json.encode(result_dict)
                                                 state = "ready"
                                                 current_request = None
+                                                # Clean up gdata storage
+                                                base_gdata = None
+                                                final_gdata = None
                                                 result_callback(combined_result, True)
 
                                             # Start rollback process
@@ -297,9 +311,14 @@ actor DeviceInstance(auth: WorldCap, log_handler: logging.Handler, platform_name
                                         if request.target_format == "cli":
                                             _log.info("Getting CLI diff using compare rollback")
                                             _get_cli_diff(on_diff_retrieved)
+                                        elif compiled_schema is not None and base_gdata is not None and final_gdata is not None:
+                                            # Use gdata diff for schema-aware formats
+                                            _log.info("Computing gdata-based diff")
+                                            diff_text = _compute_gdata_diff()
+                                            on_diff_retrieved(diff_text, True)
                                         else:
-                                            _log.info("NETCONF target format - skipping diff (not supported)")
-                                            on_diff_retrieved("", True)  # Empty diff for NETCONF
+                                            _log.info("Diff not available for this format")
+                                            on_diff_retrieved("", True)  # Empty diff
                                     else:
                                         _log.error("Failed to retrieve final configuration", {"final_config": final_config})
                                         state = "ready"
@@ -309,10 +328,8 @@ actor DeviceInstance(auth: WorldCap, log_handler: logging.Handler, platform_name
                                 # Get final configuration using utility functions (don't manage state)
                                 if request.target_format == "cli":
                                     _get_cli_config(on_final_config_retrieved)
-                                elif request.target_format == "netconf":
-                                    _get_netconf_config(on_final_config_retrieved)
                                 else:
-                                    # For other formats, use the general handler
+                                    # For all other formats including netconf, use the general handler
                                     _handle_output(request.target_format, on_final_config_retrieved)
                             else:
                                 err_str: str = "Input application failed"
@@ -331,17 +348,17 @@ actor DeviceInstance(auth: WorldCap, log_handler: logging.Handler, platform_name
                         result_callback(target_base_config, False)
 
                 # Get base config in target format for response (if different from NETCONF)
-                if request.target_format == "netconf":
-                    # Target format is NETCONF, so use the same config for both purposes
+                if request.target_format in ["netconf", "xml"]:
+                    # Target format is NETCONF/XML, so use the same raw config for both purposes
                     on_target_base_config_retrieved(netconf_base_config, netconf_base_success)
+                elif request.target_format == "cli":
+                    # CLI needs its own format
+                    _log.info("Getting base configuration in CLI format for response")
+                    _get_cli_config(on_target_base_config_retrieved)
                 else:
-                    # Target format is different (CLI), so get it separately for response
+                    # For other formats (json, acton-gdata, etc), use the general handler
                     _log.info("Getting base configuration in target format for response", {"target_format": request.target_format})
-                    if request.target_format == "cli":
-                        _get_cli_config(on_target_base_config_retrieved)
-                    else:
-                        # For other formats, use the general handler (this shouldn't happen currently)
-                        _handle_output(request.target_format, on_target_base_config_retrieved)
+                    _handle_output(request.target_format, on_target_base_config_retrieved)
             else:
                 _log.error("Failed to retrieve NETCONF base configuration", {"netconf_base_config": netconf_base_config})
                 state = "ready"
@@ -372,10 +389,12 @@ actor DeviceInstance(auth: WorldCap, log_handler: logging.Handler, platform_name
         """Retrieve output data using the appropriate output handler"""
         _log.info("Handling output format", {"output_format": output_format})
 
-        if output_format == "netconf":
-            _netconf_output(result_callback)
-        elif output_format == "cli":
+        if output_format == "cli":
+            # CLI still uses its own handler
             _cli_output(result_callback)
+        elif output_format in ["netconf", "xml", "json", "acton-gdata", "acton-adata"]:
+            # All schema-parseable formats go through _get_config_parsed
+            _get_config_parsed(result_callback)
         elif output_format == "restconf":
             # TODO: Implement RESTCONF output handler
             _log.error("RESTCONF output handler not yet implemented")
@@ -649,9 +668,15 @@ actor DeviceInstance(auth: WorldCap, log_handler: logging.Handler, platform_name
         _log.debug("Waiting for CLI utility client to connect")
         after 0.1: try_get_config(0)  # Start checking after 100ms
 
-    def _netconf_output(result_callback: action(str, bool) -> None):
-        """Retrieve configuration via NETCONF get-config"""
-        _log.info("NETCONF output handler: retrieving configuration")
+    def _get_config_parsed(result_callback: action(str, bool) -> None):
+        """Retrieve configuration via NETCONF get-config and parse with schemas"""
+        _log.info("Getting config with parsing")
+
+        # Get target format from current request
+        target_format = "netconf"  # default
+        if current_request is not None:
+            target_format = current_request.target_format
+            _log.debug("Target format from request", {"target_format": target_format})
 
         # Get credentials
         creds = _get_credentials()
@@ -662,7 +687,7 @@ actor DeviceInstance(auth: WorldCap, log_handler: logging.Handler, platform_name
             current_request = None
             result_callback("No credentials available", False)
             return
-        _log.info("Starting NETCONF output", {"username": username, "host": ip_address, "port": netconf_port})
+        _log.info("Starting NETCONF retrieval for parsing", {"username": username, "host": ip_address, "port": netconf_port})
 
         def on_connect(client: ?netconf.Client, error: ?Exception):
             if error is not None:
@@ -686,14 +711,59 @@ actor DeviceInstance(auth: WorldCap, log_handler: logging.Handler, platform_name
                     _log.debug("Get-config response", {"config_xml": config_xml})
                     _log.info("Get-config completed successfully")
                     _log.info("Retrieved configuration", {"config_length": len(config_xml)})
-                    _log.info("Conversion completed successfully")
+
+                    # Parse with gen3 if we have schemas
+                    output_str = config_xml  # default to raw XML
+                    gdata: ?yang.gdata.Node = None
+
+                    if compiled_schema is not None:
+                        try:
+                            # Always parse the XML with schemas if available
+                            _log.info("Parsing XML with gen3 schemas")
+                            gdata = yang.gen3.from_xml(compiled_schema, response, loose=True)
+
+                            # Store gdata based on context (base or final)
+                            # We'll determine this based on whether base_gdata is already set
+                            if base_gdata is None:
+                                base_gdata = gdata
+                                _log.debug("Stored base_gdata")
+                            else:
+                                final_gdata = gdata
+                                _log.debug("Stored final_gdata")
+
+                            # Format based on target format
+                            if gdata is not None:
+                                if target_format == "json":
+                                    output_str = gdata.to_json()
+                                    _log.info("Converted to JSON format")
+                                elif target_format == "acton-gdata":
+                                    output_str = gdata.prsrc()
+                                    _log.info("Converted to Acton gdata format")
+                                elif target_format == "acton-adata":
+                                    output_str = yang.gen3.pradata(compiled_schema, gdata, loose=True)
+                                    _log.info("Converted to Acton adata format")
+                                elif target_format in ["netconf", "xml"]:
+                                    # Keep as XML for netconf/xml formats
+                                    output_str = config_xml
+                                else:
+                                    # Unknown format, keep as XML
+                                    _log.warning("Unknown target format, returning XML", {"target_format": target_format})
+                            else:
+                                _log.error("Failed to parse gdata")
+                                output_str = config_xml
+                        except Exception as e:
+                            _log.error("Failed to parse or convert with gen3", {"error": str(e)})
+                            # Fall back to raw XML on error
+                            output_str = config_xml
+                    elif compiled_schema is None and target_format not in ["netconf", "xml"]:
+                        _log.warning("No compiled schema available, returning raw XML")
 
                     _log.debug("Closing NETCONF connection")
                     client.close()
                     _log.debug("Releasing device")
                     state = "ready"
                     current_request = None
-                    result_callback(config_xml, True)
+                    result_callback(output_str, True)
                 else:
                     _log.error("Get-config failed - received None response")
                     client.close()
@@ -866,6 +936,36 @@ actor DeviceInstance(auth: WorldCap, log_handler: logging.Handler, platform_name
 
         _log.debug("Waiting for CLI client to connect for diff")
         after 0.1: try_get_diff(0)  # Start checking after 100ms
+
+    def _compute_gdata_diff() -> str:
+        """Compute diff between base_gdata and final_gdata"""
+        if base_gdata is not None and final_gdata is not None:
+            try:
+                # Use yang.gdata.diff for semantic diff
+                diff_result = yang.gdata.diff(base_gdata, final_gdata)
+
+                if diff_result is not None:
+                    # Convert diff to appropriate format based on target_format
+                    if current_request is not None:
+                        target_format = current_request.target_format
+                        if target_format == "json":
+                            return diff_result.to_json()
+                        elif target_format == "acton-gdata":
+                            return diff_result.prsrc()
+                        else:
+                            # Default to prsrc format for other formats
+                            return diff_result.prsrc()
+                    else:
+                        return diff_result.prsrc()
+                else:
+                    _log.info("No differences found between base and final configs")
+                    return "No configuration changes"
+            except Exception as e:
+                _log.error("Failed to compute gdata diff", {"error": str(e)})
+                return ""
+        else:
+            _log.warning("Cannot compute gdata diff - missing base or final gdata")
+            return ""
 
     def _get_credentials() -> ?(str, str):
         """Get device credentials, returns (username, password) tuple or None"""
@@ -1388,8 +1488,8 @@ def get_default_config() -> SystemConfig:
                 InstanceSpec(
                     id="local-crpd",
                     host="127.0.0.1",
-                    netconf_port=32781,
-                    ssh_port=32780,
+                    netconf_port=42830,
+                    ssh_port=42022,
                     restconf_port=32774,
                     username="clab",
                     password="clab@123",
