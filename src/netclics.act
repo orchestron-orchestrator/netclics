@@ -357,16 +357,14 @@ actor DeviceInstance(auth: WorldCap, log_handler: logging.Handler, platform_name
                         current_request = None
                         result_callback(target_base_config, False)
 
-                # Get base config in target format for response (if different from NETCONF)
-                if request.target_format in ["netconf", "xml"]:
-                    # Target format is NETCONF/XML, so use the same raw config for both purposes
-                    on_target_base_config_retrieved(netconf_base_config, netconf_base_success)
-                elif request.target_format == "cli":
+                # Get base config in target format for response
+                if request.target_format == "cli":
                     # CLI needs its own format
                     _log.info("Getting base configuration in CLI format for response")
                     _get_cli_config(on_target_base_config_retrieved)
                 else:
-                    # For other formats (json, acton-gdata, etc), use the general handler
+                    # For all other formats (including netconf/xml), use the general handler
+                    # This ensures gdata is populated for diff computation
                     _log.info("Getting base configuration in target format for response", {"target_format": request.target_format})
                     _handle_output(request.target_format, on_target_base_config_retrieved)
             else:
@@ -706,8 +704,6 @@ actor DeviceInstance(auth: WorldCap, log_handler: logging.Handler, platform_name
         if creds is not None:
             username, password = creds
         else:
-            state = "ready"
-            current_request = None
             result_callback("No credentials available", False)
             return
         _log.info("Starting NETCONF retrieval for parsing", {"username": username, "host": ip_address, "port": netconf_port})
@@ -715,9 +711,6 @@ actor DeviceInstance(auth: WorldCap, log_handler: logging.Handler, platform_name
         def on_connect(client: ?netconf.Client, error: ?Exception):
             if error is not None:
                 _log.error("NETCONF connection error", {"error": error})
-                _log.debug("Releasing device due to error")
-                state = "ready"
-                current_request = None
                 result_callback(f"NETCONF connection error: {error}", False)
                 return
 
@@ -726,8 +719,6 @@ actor DeviceInstance(auth: WorldCap, log_handler: logging.Handler, platform_name
                 if error is not None:
                     _log.error("Get-config failed with NETCONF error", {"error": error})
                     client.close()
-                    state = "ready"
-                    current_request = None
                     result_callback("NETCONF get-config error: {error}", False)
                 elif response is not None:
                     # Extract the <data> element from the RPC reply
@@ -736,7 +727,7 @@ actor DeviceInstance(auth: WorldCap, log_handler: logging.Handler, platform_name
                         if child.tag == "data":
                             data_node = child
                             break
-                    
+
                     if data_node is not None:
                         config_xml = xml.encode(data_node)
                         _log.debug("Get-config response (data element)", {"config_xml": config_xml})
@@ -798,14 +789,10 @@ actor DeviceInstance(auth: WorldCap, log_handler: logging.Handler, platform_name
                     else:
                         _log.error("No data element in get-config response")
                         client.close()
-                        state = "ready"
-                        current_request = None
                         result_callback("No data element in get-config response", False)
                 else:
                     _log.error("Get-config failed - received None response")
                     client.close()
-                    state = "ready"
-                    current_request = None
                     result_callback("Get-config operation failed", False)
 
             if client is not None:
@@ -817,8 +804,6 @@ actor DeviceInstance(auth: WorldCap, log_handler: logging.Handler, platform_name
                 client.get_config(on_get_config_done)
             else:
                 _log.error("NETCONF connection failed - no client")
-                state = "ready"
-                current_request = None
                 result_callback("NETCONF connection failed", False)
                 return
 
