@@ -997,6 +997,77 @@ actor DeviceInstance(auth: WorldCap, log_handler: logging.Handler, platform_name
             _log.error("No InstanceSpec available for device", {"device": container_id})
             return None
 
+    def configure_rfc_compliance():
+        """Configure the device for RFC/YANG compliant NETCONF operation (Juniper-specific)"""
+        _log.info("Configuring Juniper device for RFC/YANG compliance", {"device": container_id})
+
+        # Get credentials
+        creds = _get_credentials()
+        if creds is not None:
+            username, password = creds
+        else:
+            _log.error("No credentials available for RFC compliance configuration")
+            return
+
+        def on_connect(client: netconf.Client, error: ?Exception):
+            if error is not None:
+                _log.error("Failed to connect for RFC compliance configuration", {"error": error})
+                return
+
+            _log.info("Connected for RFC compliance configuration")
+
+            # Configuration to enable RFC-compliant and YANG-compliant modes
+            config_xml = """
+            <configuration>
+                <system>
+                    <services>
+                        <netconf>
+                            <rfc-compliant/>
+                            <yang-compliant/>
+                        </netconf>
+                    </services>
+                </system>
+            </configuration>
+            """
+
+            def on_edit_config_done(c: netconf.Client, error: ?netconf.NetconfError):
+                if error is not None:
+                    _log.error("Failed to configure RFC compliance", {"error": error.error_message})
+                    c.close()
+                else:
+                    _log.info("Successfully configured RFC/YANG compliance")
+                    # Commit the configuration
+                    c.commit(on_commit_done)
+
+            def on_commit_done(c: netconf.Client, error: ?netconf.NetconfError):
+                if error is not None:
+                    _log.error("Failed to commit RFC compliance configuration", {"error": error.error_message})
+                else:
+                    _log.info("RFC/YANG compliance configuration committed")
+                c.close()
+
+            # Parse the config XML
+            try:
+                client.edit_config(config_xml, on_edit_config_done, "candidate")
+            except Exception as e:
+                _log.error("Failed to parse RFC compliance config", {"error": str(e)})
+                client.close()
+
+        # Create NETCONF client for RFC compliance configuration
+        _log.info("Creating NETCONF client for RFC compliance configuration")
+        netconf_client = netconf.Client(
+            auth=auth,
+            on_connect=on_connect,
+            on_notif=None,
+            address=ip_address,
+            username=username,
+            key=None,
+            password=password,
+            port=netconf_port,
+            log_handler=log_handler,
+            skip_host_key_check=True
+        )
+
     def initialize_schemas():
         """Initialize schemas by downloading them from the device and compiling them"""
         _log.info("Initializing YANG schemas for device", {"device": container_id})
@@ -1103,6 +1174,11 @@ actor DeviceManager(config: SystemConfig, container_mgr: ContainerManager, auth:
                 ssh_port=spec.ssh_port,
                 instance_spec=spec
             )
+
+            # For Juniper platforms, configure RFC compliance first
+            if platform.platform == "junos":
+                device.configure_rfc_compliance()
+
             # Initialize schemas on device startup
             device.initialize_schemas()
             instances.append(device)
