@@ -146,61 +146,32 @@ actor DeviceInstance(auth: WorldCap, log_handler: logging.Handler, platform_name
                 result_callback(f"NETCONF rollback connection error: {error}", False)
                 return
 
-            def on_edit_config_done(client: netconf.Client, response: ?xml.Node):
+            def on_edit_config_done(client: netconf.Client, response: ?xml.Node, error: ?netconf.NetconfError):
                 _log.debug("Rollback edit-config response received")
-                if response is not None:
-                    response_xml = xml.encode(response)
-                    _log.debug("Rollback edit-config response", {"response_xml": response_xml})
-
-                    # Check for NETCONF errors in the response
-                    if "<rpc-error>" in response_xml:
-                        _log.error("Rollback edit-config failed with NETCONF error", {"response_xml": response_xml})
-                        client.close()
-                        state = "ready"
-                        result_callback(f"NETCONF rollback edit-config error: {response_xml}", False)
-                    elif "<ok/>" in response_xml or "<ok>" in response_xml:
-                        _log.info("Rollback edit-config completed successfully")
-
-                        # Now commit the rollback
-                        def on_commit_done(client: netconf.Client, commit_response: ?xml.Node):
-                            _log.debug("Rollback commit response received")
-                            if commit_response is not None:
-                                commit_xml = xml.encode(commit_response)
-                                _log.debug("Rollback commit response", {"commit_xml": commit_xml})
-
-                                if "<rpc-error>" in commit_xml:
-                                    _log.error("Rollback commit failed with NETCONF error", {"commit_xml": commit_xml})
-                                    client.close()
-                                    state = "ready"
-                                    result_callback(f"NETCONF rollback commit error: {commit_xml}", False)
-                                elif "<ok/>" in commit_xml or "<ok>" in commit_xml:
-                                    _log.info("Rollback commit completed successfully")
-                                    client.close()
-                                    state = "ready"
-                                    result_callback("Configuration successfully rolled back", True)
-                                else:
-                                    _log.warning("Rollback commit response format unexpected", {"commit_xml": commit_xml})
-                                    client.close()
-                                    state = "ready"
-                                    result_callback("Configuration rollback completed", True)
-                            else:
-                                _log.error("Rollback commit failed - received None response")
-                                client.close()
-                                state = "ready"
-                                result_callback("Rollback commit operation failed", False)
-
-                        _log.debug("Sending rollback commit request")
-                        client.commit(on_commit_done)
-                    else:
-                        _log.warning("Rollback edit-config response format unexpected", {"response_xml": response_xml})
-                        client.close()
-                        state = "ready"
-                        result_callback("Configuration rollback completed", True)
-                else:
-                    _log.error("Rollback edit-config failed - received None response")
+                if error is not None:
+                    _log.error("Rollback edit-config failed with NETCONF error", {"error": error})
                     client.close()
                     state = "ready"
-                    result_callback("Rollback edit-config operation failed", False)
+                    result_callback("NETCONF rollback edit-config error: {error}", False)
+                else:
+                    _log.info("Rollback edit-config completed successfully")
+
+                    # Now commit the rollback
+                    def on_commit_done(client: netconf.Client, commit_error: ?netconf.NetconfError):
+                        _log.debug("Rollback commit response received")
+                        if commit_error is not None:
+                            _log.error("Rollback commit failed with NETCONF error", {"error": commit_error})
+                            client.close()
+                            state = "ready"
+                            result_callback("NETCONF rollback commit error: {commit_error}", False)
+                        else:
+                            _log.info("Rollback commit completed successfully")
+                            client.close()
+                            state = "ready"
+                            result_callback("Configuration successfully rolled back", True)
+
+                    _log.debug("Sending rollback commit request")
+                    client.commit(on_commit_done)
 
             if client is not None:
                 # Client is guaranteed to be non-None here
@@ -234,7 +205,8 @@ actor DeviceInstance(auth: WorldCap, log_handler: logging.Handler, platform_name
             key=None,
             password=password,
             port=netconf_port,
-            log_handler=log_handler
+            log_handler=log_handler,
+            skip_host_key_check=True
         )
         _log.info("NETCONF rollback client created, attempting connection")
 
@@ -428,55 +400,29 @@ actor DeviceInstance(auth: WorldCap, log_handler: logging.Handler, platform_name
                 callback(False, f"NETCONF connection error: {error}")
                 return
 
-            def on_edit_config_done(client: netconf.Client, response: ?xml.Node):
+            def on_edit_config_done(client: netconf.Client, error: ?netconf.NetconfError):
                 _log.debug("Edit-config response received")
-                if response is not None:
-                    response_xml = xml.encode(response)
-                    _log.debug("Edit-config response", {"response_xml": response_xml})
-
-                    # Check for NETCONF errors in the response
-                    if "<rpc-error>" in response_xml:
-                        _log.error("Edit-config failed with NETCONF error", {"response_xml": response_xml})
-                        client.close()
-                        callback(False, f"NETCONF edit-config error: {response_xml}")
-                    elif "<ok/>" in response_xml or "<ok>" in response_xml:
-                        _log.info("Edit-config completed successfully")
-
-                        # Now commit the candidate configuration
-                        def on_commit_done(client: netconf.Client, commit_response: ?xml.Node):
-                            _log.debug("Commit response received")
-                            if commit_response is not None:
-                                commit_xml = xml.encode(commit_response)
-                                _log.debug("Commit response", {"commit_xml": commit_xml})
-
-                                if "<rpc-error>" in commit_xml:
-                                    _log.error("Commit failed with NETCONF error", {"commit_xml": commit_xml})
-                                    client.close()
-                                    callback(False, f"NETCONF commit error: {commit_xml}")
-                                elif "<ok/>" in commit_xml or "<ok>" in commit_xml:
-                                    _log.info("Commit completed successfully")
-                                    client.close()
-                                    callback(True, None)
-                                else:
-                                    _log.warning("Commit response format unexpected", {"commit_xml": commit_xml})
-                                    client.close()
-                                    callback(True, None)
-                            else:
-                                _log.error("Commit failed - received None response")
-                                client.close()
-                                callback(False, "Commit operation failed")
-
-                        _log.debug("Sending commit request")
-                        client.commit(on_commit_done)
-                    else:
-                        _log.warning("Edit-config response format unexpected", {"response_xml": response_xml})
-                        # Assume success if no explicit error
-                        client.close()
-                        callback(True, None)
-                else:
-                    _log.error("Edit-config failed - received None response")
+                if error is not None:
+                    _log.error("Edit-config failed with NETCONF error", {"error": error})
                     client.close()
-                    callback(False, "Edit-config operation failed")
+                    callback(False, "NETCONF edit-config error: {error}")
+                else:
+                    _log.info("Edit-config completed successfully")
+
+                    # Now commit the candidate configuration
+                    def on_commit_done(client: netconf.Client, commit_error: ?netconf.NetconfError):
+                        _log.debug("Commit response received")
+                        if commit_error is not None:
+                            _log.error("Commit failed with NETCONF error", {"error": commit_error})
+                            client.close()
+                            callback(False, "NETCONF commit error: {commit_error}")
+                        else:
+                            _log.info("Commit completed successfully")
+                            client.close()
+                            callback(True, None)
+
+                    _log.debug("Sending commit request")
+                    client.commit(on_commit_done)
 
             if client is not None:
                 _log.info("NETCONF client connected successfully")
@@ -504,7 +450,8 @@ actor DeviceInstance(auth: WorldCap, log_handler: logging.Handler, platform_name
             key=None,
             password=password,
             port=netconf_port,
-            log_handler=log_handler
+            log_handler=log_handler,
+            skip_host_key_check=True
         )
         _log.info("NETCONF client created, attempting connection")
 
@@ -591,23 +538,20 @@ actor DeviceInstance(auth: WorldCap, log_handler: logging.Handler, platform_name
                 callback(f"NETCONF connection error: {error}", False)
                 return
 
-            def on_get_config_done(client: netconf.Client, response: ?xml.Node):
+            def on_get_config_done(client: netconf.Client, response: ?xml.Node, error: ?netconf.NetconfError):
                 _log.debug("Get-config response received")
-                if response is not None:
+                if error is not None:
+                    _log.error("Get-config failed with NETCONF error", {"error": error})
+                    client.close()
+                    callback("NETCONF get-config error: {error}", False)
+                elif response is not None:
                     config_xml = xml.encode(response)
                     _log.debug("Get-config response", {"config_xml": config_xml})
-
-                    # Check for NETCONF errors in the response
-                    if "<rpc-error>" in config_xml:
-                        _log.error("Get-config failed with NETCONF error", {"config_xml": config_xml})
-                        client.close()
-                        callback(f"NETCONF get-config error: {config_xml}", False)
-                    else:
-                        _log.info("Get-config completed successfully")
-                        _log.info("Retrieved configuration", {"config_length": len(config_xml)})
-                        _log.debug("Closing NETCONF connection")
-                        client.close()
-                        callback(config_xml, True)
+                    _log.info("Get-config completed successfully")
+                    _log.info("Retrieved configuration", {"config_length": len(config_xml)})
+                    _log.debug("Closing NETCONF connection")
+                    client.close()
+                    callback(config_xml, True)
                 else:
                     _log.error("Get-config failed - received None response")
                     client.close()
@@ -638,7 +582,8 @@ actor DeviceInstance(auth: WorldCap, log_handler: logging.Handler, platform_name
             key=None,
             password=password,
             port=netconf_port,
-            log_handler=log_handler
+            log_handler=log_handler,
+            skip_host_key_check=True
         )
         _log.info("NETCONF utility client created, attempting connection")
 
@@ -721,30 +666,27 @@ actor DeviceInstance(auth: WorldCap, log_handler: logging.Handler, platform_name
                 result_callback(f"NETCONF connection error: {error}", False)
                 return
 
-            def on_get_config_done(client: netconf.Client, response: ?xml.Node):
+            def on_get_config_done(client: netconf.Client, response: ?xml.Node, error: ?netconf.NetconfError):
                 _log.debug("Get-config response received")
-                if response is not None:
+                if error is not None:
+                    _log.error("Get-config failed with NETCONF error", {"error": error})
+                    client.close()
+                    state = "ready"
+                    current_request = None
+                    result_callback("NETCONF get-config error: {error}", False)
+                elif response is not None:
                     config_xml = xml.encode(response)
                     _log.debug("Get-config response", {"config_xml": config_xml})
+                    _log.info("Get-config completed successfully")
+                    _log.info("Retrieved configuration", {"config_length": len(config_xml)})
+                    _log.info("Conversion completed successfully")
 
-                    # Check for NETCONF errors in the response
-                    if "<rpc-error>" in config_xml:
-                        _log.error("Get-config failed with NETCONF error", {"config_xml": config_xml})
-                        client.close()
-                        state = "ready"
-                        current_request = None
-                        result_callback(f"NETCONF get-config error: {config_xml}", False)
-                    else:
-                        _log.info("Get-config completed successfully")
-                        _log.info("Retrieved configuration", {"config_length": len(config_xml)})
-                        _log.info("Conversion completed successfully")
-
-                        _log.debug("Closing NETCONF connection")
-                        client.close()
-                        _log.debug("Releasing device")
-                        state = "ready"
-                        current_request = None
-                        result_callback(config_xml, True)
+                    _log.debug("Closing NETCONF connection")
+                    client.close()
+                    _log.debug("Releasing device")
+                    state = "ready"
+                    current_request = None
+                    result_callback(config_xml, True)
                 else:
                     _log.error("Get-config failed - received None response")
                     client.close()
@@ -779,7 +721,8 @@ actor DeviceInstance(auth: WorldCap, log_handler: logging.Handler, platform_name
             key=None,
             password=password,
             port=netconf_port,
-            log_handler=log_handler
+            log_handler=log_handler,
+            skip_host_key_check=True
         )
         _log.info("NETCONF client created, attempting connection")
 

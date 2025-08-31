@@ -7,11 +7,14 @@ default:
 
 # Start the NETCLICS server
 run:
-    acton run src/netclics.act
+    out/bin/netclics
 
 # Build the project
 build:
     acton build
+
+build-ldep:
+    acton build --dep yang=../acton-yang --dep netconf=../netconf --dep netcli=../netcli
 
 # Show available platforms
 platforms:
