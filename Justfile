@@ -16,6 +16,15 @@ build:
 build-ldep:
     acton build --dep yang=../acton-yang --dep netconf=../netconf --dep netcli=../netcli
 
+IMAGE_PATH := env_var_or_default("IMAGE_PATH", "ghcr.io/orchestron-orchestrator/")
+
+start-static-instances:
+    docker run -d --name crpd1 --rm --privileged --publish 42830:830 --publish 42022:22 -v ./test/crpd-startup.conf:/juniper.conf -v ./router-licenses/juniper_crpd24.lic:/config/license/juniper_crpd24.lic {{IMAGE_PATH}}crpd:24.4R1.9
+    docker exec crpd1 cli -c "configure private; load merge /juniper.conf; commit"
+
+stop-static-instances:
+    docker stop crpd1
+
 # Show available platforms
 platforms:
     curl -s http://localhost:8080/api/v1/platforms | jq .
