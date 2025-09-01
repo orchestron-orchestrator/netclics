@@ -1,0 +1,110 @@
+name: Test
+
+on:
+  push:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    env:
+      IMAGE_PATH: ${{ secrets.IMAGE_PATH || format('ghcr.io/{0}/', github.repository) }}
+    steps:
+      - uses: actonlang/setup-acton@v1
+        with:
+          channel: 'tip'
+
+      - name: "Check out repository code"
+        uses: actions/checkout@v4
+
+      - name: "Install dependencies"
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libxml2-utils jq sshpass
+          curl --proto '=https' --tlsv1.2 -sSf https://just.systems/install.sh | bash -s -- --to /usr/local/bin
+
+      - name: "Build NETCLICS"
+        run: just build
+
+      - name: "Check out licenses repo"
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ github.repository_owner }}/licenses
+          path: router-licenses
+          ssh-key: ${{ secrets.LICENSES_PRIVATE_KEY }}
+
+      - name: Login to ghcr.io
+        if: ${{ startsWith(env.IMAGE_PATH, 'ghcr.io') }}
+        run: |
+          echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
+
+      - name: "Start static instances (cRPD container)"
+        run: just start-static-instances
+
+      - name: "Wait for cRPD to be ready"
+        run: |
+          echo "Waiting for cRPD container to be ready..."
+          for i in {1..30}; do
+            docker exec crpd1 cli -c "show version" && break
+            echo "Waiting for cRPD to start... ($i/30)"
+            sleep 2
+          done
+
+      - name: "Start NETCLICS server in background"
+        run: |
+          just run > netclics.log 2>&1 &
+          echo $! > netclics.pid
+          echo "NETCLICS server started with PID $(cat netclics.pid)"
+
+      - name: "Test platforms endpoint"
+        run: just platforms
+
+      - name: "Test instances endpoint"
+        run: just instances
+
+      - name: "Wait for NETCLICS to initialize device connections"
+        run: |
+          echo "Waiting for NETCLICS to initialize device connections..."
+          sleep 30
+
+      - name: "Test XML to XML conversion"
+        run: just test-xml-to-xml-crpd
+
+      - name: "Test CLI to NETCONF conversion"
+        run: just test-cli-to-netconf
+
+      - name: "Test NETCONF to CLI conversion"
+        run: just test-netconf-to-cli
+
+      - name: "Test CLI to CLI roundtrip"
+        run: just test-cli-to-cli
+
+      - name: "Test CLI to Acton adata conversion"
+        run: just test-cli-to-acton-adata
+
+      - name: "Test CLI to Acton gdata conversion"
+        run: just test-cli-to-acton-gdata
+
+      - name: "Test CLI to JSON conversion"
+        run: just test-cli-to-json
+
+      - name: "Test NETCONF error handling"
+        run: just test-netconf-error
+
+      - name: "Stop NETCLICS server"
+        if: always()
+        run: |
+          if [ -f netclics.pid ]; then
+            kill $(cat netclics.pid) || true
+            rm netclics.pid
+          fi
+
+      - name: "Upload NETCLICS logs"
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: netclics-logs
+          path: netclics.log
+
+      - name: "Stop static instances"
+        if: always()
+        run: just stop-static-instances || true
