@@ -47,11 +47,9 @@ test-xml-to-xml-crpd:
       }')
     echo "$RESULT" | jq .
 
-    echo "Base config (before):"
-    echo "$RESULT" | jq -r '.base_config' | xmllint --format -
-
-    echo "Final config (after):"
-    echo "$RESULT" | jq -r '.config' | xmllint --format -
+    echo ""
+    echo "=== Configuration Diff ==="
+    echo "$RESULT" | jq -r '.diff'
 
 # Test with malformed NETCONF input
 test-netconf-error:
@@ -72,38 +70,53 @@ ping:
 # Test CLI input with set commands
 test-cli-to-netconf:
     #!/usr/bin/env bash
-    curl -X POST http://localhost:8080/api/v1/convert \
+    RESULT=$(curl -s -X POST http://localhost:8080/api/v1/convert \
       -H "Content-Type: application/json" \
       -d '{
         "input": "set interfaces ge-0/0/1 description \"CLI test interface\"\nset interfaces ge-0/0/1 unit 0 family inet address 10.1.1.1/24",
         "format": "cli",
         "target_format": "netconf",
         "platform": "crpd 24.4R1.9-local"
-      }' | jq .
+      }')
+    echo "$RESULT" | jq .
+
+    echo ""
+    echo "=== Configuration Diff ==="
+    echo "$RESULT" | jq -r '.diff'
 
 # Test NETCONF to CLI conversion
 test-netconf-to-cli:
     #!/usr/bin/env bash
-    curl -X POST http://localhost:8080/api/v1/convert \
+    RESULT=$(curl -s -X POST http://localhost:8080/api/v1/convert \
       -H "Content-Type: application/json" \
       -d '{
         "input": "<configuration xmlns:junos=\"http://xml.juniper.net/junos/24.4R0/junos\"><interfaces><interface><name>ge-0/0/2</name><description>XML test interface</description><unit><name>0</name><family><inet><address><name>10.2.2.1/24</name></address></inet></family></unit></interface></interfaces></configuration>",
         "format": "netconf",
         "target_format": "cli",
         "platform": "crpd 24.4R1.9-local"
-      }' | jq .
+      }')
+    echo "$RESULT" | jq .
+
+    echo ""
+    echo "=== Configuration Diff ==="
+    echo "$RESULT" | jq -r '.diff'
 
 # Test CLI to CLI roundtrip (should normalize configuration)
 test-cli-to-cli:
     #!/usr/bin/env bash
-    curl -X POST http://localhost:8080/api/v1/convert \
+    RESULT=$(curl -s -X POST http://localhost:8080/api/v1/convert \
       -H "Content-Type: application/json" \
       -d '{
         "input": "set interfaces ge-0/0/3 description \"CLI roundtrip test\"\nset interfaces ge-0/0/3 unit 0 family inet address 10.3.3.1/24",
         "format": "cli",
         "target_format": "cli",
         "platform": "crpd 24.4R1.9-local"
-      }' | jq .
+      }')
+    echo "$RESULT" | jq .
+
+    echo ""
+    echo "=== Configuration Diff ==="
+    echo "$RESULT" | jq -r '.diff'
 
 # Test CLI to Acton adata conversion
 test-cli-to-acton-adata:
@@ -116,9 +129,10 @@ test-cli-to-acton-adata:
         "target_format": "acton-adata",
         "platform": "crpd 24.4R1.9-local"
       }')
-    echo "=== Full Response ==="
     echo "$RESULT" | jq .
-    echo -e "\n=== Diff ==="
+
+    echo ""
+    echo "=== Configuration Diff ==="
     echo "$RESULT" | jq -r '.diff'
 
 # Test CLI to Acton gdata conversion
@@ -132,9 +146,10 @@ test-cli-to-acton-gdata:
         "target_format": "acton-gdata",
         "platform": "crpd 24.4R1.9-local"
       }')
-    echo "=== Full Response ==="
     echo "$RESULT" | jq .
-    echo -e "\n=== Diff ==="
+
+    echo ""
+    echo "=== Configuration Diff ==="
     echo "$RESULT" | jq -r '.diff'
 
 # Test CLI to JSON conversion
@@ -148,9 +163,10 @@ test-cli-to-json:
         "target_format": "json",
         "platform": "crpd 24.4R1.9-local"
       }')
-    echo "=== Full Response ==="
     echo "$RESULT" | jq .
-    echo -e "\n=== Diff ==="
+
+    echo ""
+    echo "=== Configuration Diff ==="
     echo "$RESULT" | jq -r '.diff' | jq .
 
 # Clean up build artifacts
