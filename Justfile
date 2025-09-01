@@ -96,6 +96,54 @@ test-cli-to-cli:
         "platform": "crpd 24.4R1.9-local"
       }' | jq .
 
+# Test CLI to Acton adata conversion
+test-cli-to-acton-adata:
+    #!/usr/bin/env bash
+    RESULT=$(curl -s -X POST http://localhost:8080/api/v1/convert \
+      -H "Content-Type: application/json" \
+      -d '{
+        "input": "set interfaces ge-0/0/4 description \"CLI to adata test\"\nset interfaces ge-0/0/4 unit 0 family inet address 10.4.4.1/24",
+        "format": "cli",
+        "target_format": "acton-adata",
+        "platform": "crpd 24.4R1.9-local"
+      }')
+    echo "=== Full Response ==="
+    echo "$RESULT" | jq .
+    echo -e "\n=== Diff ==="
+    echo "$RESULT" | jq -r '.diff'
+
+# Test CLI to Acton gdata conversion
+test-cli-to-acton-gdata:
+    #!/usr/bin/env bash
+    RESULT=$(curl -s -X POST http://localhost:8080/api/v1/convert \
+      -H "Content-Type: application/json" \
+      -d '{
+        "input": "set interfaces ge-0/0/5 description \"CLI to gdata test\"\nset interfaces ge-0/0/5 unit 0 family inet address 10.5.5.1/24",
+        "format": "cli",
+        "target_format": "acton-gdata",
+        "platform": "crpd 24.4R1.9-local"
+      }')
+    echo "=== Full Response ==="
+    echo "$RESULT" | jq .
+    echo -e "\n=== Diff ==="
+    echo "$RESULT" | jq -r '.diff'
+
+# Test CLI to JSON conversion
+test-cli-to-json:
+    #!/usr/bin/env bash
+    RESULT=$(curl -s -X POST http://localhost:8080/api/v1/convert \
+      -H "Content-Type: application/json" \
+      -d '{
+        "input": "set interfaces ge-0/0/6 description \"CLI to JSON test\"\nset interfaces ge-0/0/6 unit 0 family inet address 10.6.6.1/24",
+        "format": "cli",
+        "target_format": "json",
+        "platform": "crpd 24.4R1.9-local"
+      }')
+    echo "=== Full Response ==="
+    echo "$RESULT" | jq .
+    echo -e "\n=== Diff ==="
+    echo "$RESULT" | jq -r '.diff' | jq .
+
 # Clean up build artifacts
 clean:
     rm -rf out/ .acton.lock *.log
