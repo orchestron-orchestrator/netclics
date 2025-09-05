@@ -257,7 +257,7 @@ actor DeviceInstance(auth: WorldCap, log_handler: logging.Handler, platform_name
                 return gdata.prsrc()
             elif target_format == "acton-adata":
                 if compiled_schema is not None:
-                    return yang.gen3.pradata(compiled_schema, gdata, loose=True)
+                    return yang.gen3.pradata(compiled_schema, gdata, loose=True, self_name="dev")
                 else:
                     _log.warning("No compiled schema for adata conversion, using gdata")
                     return gdata.prsrc()
@@ -887,7 +887,7 @@ actor DeviceInstance(auth: WorldCap, log_handler: logging.Handler, platform_name
                         elif target_format == "acton-adata":
                             # Convert diff to adata format if schema is available
                             if compiled_schema is not None:
-                                return yang.gen3.pradata(compiled_schema, diff_result, loose=True)
+                                return yang.gen3.pradata(compiled_schema, diff_result, loose=True, self_name="dev")
                             else:
                                 _log.warning("No compiled schema for adata diff conversion, using prsrc")
                                 return diff_result.prsrc()
