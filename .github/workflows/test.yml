@@ -90,6 +90,22 @@ jobs:
       - name: "Test NETCONF error handling"
         run: just test-netconf-error
 
+      # MCP Protocol Tests
+      - name: "Test MCP initialize"
+        run: just test-mcp-initialize
+
+      - name: "Test MCP tools list"
+        run: just test-mcp-tools-list
+
+      - name: "Test MCP list platforms"
+        run: just test-mcp-platforms
+
+      - name: "Test MCP list instances"
+        run: just test-mcp-instances
+
+      - name: "Test MCP convert config"
+        run: just test-mcp-convert
+
       - name: "Stop NETCLICS server"
         if: always()
         run: |

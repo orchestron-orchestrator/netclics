@@ -169,6 +169,95 @@ test-cli-to-json:
     echo "=== Configuration Diff ==="
     echo "$RESULT" | jq -r '.diff' | jq .
 
+# MCP: Initialize connection
+test-mcp-initialize:
+    #!/usr/bin/env bash
+    echo "=== MCP Initialize ==="
+    curl -s -X POST http://localhost:8080/mcp \
+      -H "Content-Type: application/json" \
+      -d '{
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "initialize",
+        "params": {
+          "protocolVersion": "2025-06-18",
+          "capabilities": {},
+          "clientInfo": {
+            "name": "test-client",
+            "version": "1.0.0"
+          }
+        }
+      }' | jq .
+
+# MCP: List available tools
+test-mcp-tools-list:
+    #!/usr/bin/env bash
+    echo "=== MCP Tools List ==="
+    curl -s -X POST http://localhost:8080/mcp \
+      -H "Content-Type: application/json" \
+      -d '{
+        "jsonrpc": "2.0",
+        "id": 2,
+        "method": "tools/list",
+        "params": {}
+      }' | jq .
+
+# MCP: Call convert_config tool
+test-mcp-convert:
+    #!/usr/bin/env bash
+    echo "=== MCP Convert Config Tool ==="
+    curl -s -X POST http://localhost:8080/mcp \
+      -H "Content-Type: application/json" \
+      -d '{
+        "jsonrpc": "2.0",
+        "id": 3,
+        "method": "tools/call",
+        "params": {
+          "name": "convert_config",
+          "arguments": {
+            "input_config": "set interfaces ge-0/0/7 description \"MCP test interface\"\nset interfaces ge-0/0/7 unit 0 family inet address 10.7.7.1/24",
+            "format": "cli",
+            "target_format": "netconf",
+            "platform": "crpd 24.4R1.9-local"
+          }
+        }
+      }' | jq .
+
+# MCP: Call list_platforms tool
+test-mcp-platforms:
+    #!/usr/bin/env bash
+    echo "=== MCP List Platforms Tool ==="
+    curl -s -X POST http://localhost:8080/mcp \
+      -H "Content-Type: application/json" \
+      -d '{
+        "jsonrpc": "2.0",
+        "id": 4,
+        "method": "tools/call",
+        "params": {
+          "name": "list_platforms",
+          "arguments": {}
+        }
+      }' | jq .
+
+# MCP: Call list_instances tool
+test-mcp-instances:
+    #!/usr/bin/env bash
+    echo "=== MCP List Instances Tool ==="
+    curl -s -X POST http://localhost:8080/mcp \
+      -H "Content-Type: application/json" \
+      -d '{
+        "jsonrpc": "2.0",
+        "id": 5,
+        "method": "tools/call",
+        "params": {
+          "name": "list_instances",
+          "arguments": {}
+        }
+      }' | jq .
+
+# MCP: Test all endpoints
+test-mcp-all: test-mcp-initialize test-mcp-tools-list test-mcp-platforms test-mcp-instances test-mcp-convert
+
 # Clean up build artifacts
 clean:
     rm -rf out/ .acton.lock *.log

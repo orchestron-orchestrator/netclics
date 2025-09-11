@@ -13,6 +13,7 @@ import yang.gdata
 import yang.schema
 import schema_getter
 
+
 actor ContainerManager(proc_cap: process.ProcessCap, log_handler: logging.Handler):
     """Manages Docker containers for network devices"""
 
@@ -1264,7 +1265,7 @@ class ConvertRequest(object):
         self.cb = cb  # Optional callback for async processing
 
     @staticmethod
-    def from_json(data: dict[str, ?value]):
+    def from_json(data: dict[str, ?value]) -> ConvertRequest:
         # Get all required fields first
         if "input" not in data:
             raise ValueError("Missing required field: input")
@@ -1283,8 +1284,7 @@ class ConvertRequest(object):
         # Type check all at once
         if isinstance(input_val, str) and isinstance(format_val, str) and isinstance(target_format_val, str) and isinstance(platform_val, str):
             return ConvertRequest(input_val, format_val, target_format_val, platform_val, None)
-        else:
-            raise ValueError("All fields must be strings")
+        raise ValueError("All fields must be strings")
 
 actor Director(auth: WorldCap, proc_cap: process.ProcessCap, log_handler: logging.Handler):
     var device_manager: ?DeviceManager = None
@@ -1379,10 +1379,408 @@ actor Director(auth: WorldCap, proc_cap: process.ProcessCap, log_handler: loggin
                 platforms_data.append(platform_data)
         return platforms_data
 
+################################################################################
+# MCP (Model Context Protocol) Implementation
+################################################################################
+
+# MCP Helper Functions
+
+def _get_str(d: dict[str, ?value], k: str, dv: str = "") -> str:
+    """Safely extract a string value from a dictionary, with default"""
+    v = d.get(k)
+    if isinstance(v, str):
+        return v
+    return dv
+
+# JSON-RPC 2.0 error codes for MCP
+MCP_PARSE_ERROR = -32700
+MCP_INVALID_REQUEST = -32600
+MCP_METHOD_NOT_FOUND = -32601
+MCP_INVALID_PARAMS = -32602
+MCP_INTERNAL_ERROR = -32603
+
+class MCPError(object):
+    """JSON-RPC 2.0 error for MCP"""
+    def __init__(self, code: int, message: str, data: ?value = None):
+        self.code = code
+        self.message = message
+        self.data = data
+
+    def to_dict(self) -> dict[str, ?value]:
+        result: dict[str, ?value] = {
+            "code": self.code,
+            "message": self.message
+        }
+        if self.data is not None:
+            result["data"] = self.data
+        return result
+
+class MCPRequest(object):
+    """JSON-RPC 2.0 request for MCP"""
+    def __init__(self, id: ?value, method: str, params: dict[str, ?value]):
+        self.id = id
+        self.method = method
+        self.params = params
+
+    @staticmethod
+    def from_json(data: dict[str, ?value]) -> MCPRequest:
+        # Validate JSON-RPC 2.0 structure
+        if "jsonrpc" not in data:
+            raise ValueError("Missing jsonrpc field")
+        jsonrpc_val = data["jsonrpc"]
+        if not(isinstance(jsonrpc_val, str) and jsonrpc_val == "2.0"):
+            raise ValueError("Invalid jsonrpc version, must be '2.0'")
+
+        # id is optional for notifications
+        id_val = data.get("id")
+
+        # params is optional
+        params_val = data.get("params")
+        if params_val is not None and not isinstance(params_val, dict):
+            raise ValueError("Params must be a dict or null")
+
+        method_val = data.get("method")
+        if method_val is not None:
+            if isinstance(method_val, str):
+                return MCPRequest(id_val, method_val, params_val if isinstance(params_val, dict) else {})
+            raise ValueError("Method must be a string")
+        raise ValueError("Missing method field")
+
+
+class MCPResponse(object):
+    """JSON-RPC 2.0 response for MCP"""
+    def __init__(self, id: ?value, result: ?value = None, error: ?MCPError = None):
+        self.id = id
+        self.result = result
+        self.error = error
+
+    def to_dict(self) -> dict[str, ?value]:
+        response: dict[str, ?value] = {
+            "jsonrpc": "2.0",
+            "id": self.id
+        }
+
+        self_error = self.error
+        if self_error is not None:
+            response["error"] = self_error.to_dict()
+        else:
+            response["result"] = self.result
+
+        return response
+
+
+# MCP Server Actor
+
+actor MCPServer(convert_fn: action(ConvertRequest, action(str, bool) -> None) -> None,
+                get_platforms_fn: action() -> list[dict[str, ?value]],
+                get_instances_fn: action() -> list[dict[str, ?value]],
+                log_handler: logging.Handler):
+    """MCP Server actor that handles MCP protocol requests"""
+
+    # Set up logging
+    logh = logging.Handler("MCPServer")
+    logh.set_handler(log_handler)
+    _log = logging.Logger(logh)
+
+    # Helper Functions for Response Handling
+
+    def _send_success_response(request_id: ?value, result: ?value, respond: action(int, dict[str, str], str) -> None, context: str):
+        """Send a successful MCP response with logging"""
+        response = MCPResponse(request_id, result, None)
+        response_json = json.encode(response.to_dict())
+        _log.debug("MCP {context} response", {"context": context, "response": response_json})
+        respond(200, {"Content-Type": "application/json"}, response_json)
+
+    def _send_error_response(request_id: ?value, error_code: int, error_msg: str, respond: action(int, dict[str, str], str) -> None, context: str):
+        """Send an error MCP response with logging"""
+        error = MCPError(error_code, error_msg)
+        response = MCPResponse(request_id, None, error)
+        response_json = json.encode(response.to_dict())
+        _log.debug("MCP {context} error response", {"context": context, "response": response_json})
+        respond(200, {"Content-Type": "application/json"}, response_json)
+
+    def _format_text_content(text: str) -> dict[str, ?value]:
+        """Format text as MCP content object"""
+        return {
+            "content": [
+                {
+                    "type": "text",
+                    "text": text
+                }
+            ]
+        }
+
+    def _validate_required_param(params: dict[str, ?value], key: str) -> ?str:
+        """Validate and extract a required string parameter. Returns None if invalid."""
+        val = params.get(key)
+        if isinstance(val, str):
+            return val
+        return None
+
+    def handle_initialize(request, respond: action(int, dict[str, str], str) -> None):
+        """Handle MCP initialize request"""
+        try:
+            body_str = request.body.decode()
+            _log.debug("MCP initialize request", {"body": body_str})
+            mcp_req = MCPRequest.from_json(json.decode(body_str))
+
+            # Return server info and capabilities
+            result = {
+                "protocolVersion": "2024-11-05",
+                "serverInfo": {
+                    "name": "netclics-mcp",
+                    "version": "1.0.0"
+                },
+                "capabilities": {
+                    "tools": {
+                        "convert_config": {
+                            "description": "Convert network configuration between formats",
+                            "parameters": ["input_config", "format", "target_format", "platform"]
+                        },
+                        "list_platforms": {
+                            "description": "List all available platforms",
+                            "parameters": []
+                        },
+                        "list_instances": {
+                            "description": "List all device instances and their status",
+                            "parameters": []
+                        }
+                    }
+                }
+            }
+
+            _send_success_response(mcp_req.id, result, respond, "initialize")
+        except Exception as e:
+            _log.error("MCP initialize error", {"error": str(e)})
+            _send_error_response(None, MCP_INTERNAL_ERROR, str(e), respond, "initialize")
+
+    def handle_tools_list(request, respond: action(int, dict[str, str], str) -> None):
+        """Handle MCP tools/list request"""
+        try:
+            body_str = request.body.decode()
+            _log.debug("MCP tools/list request", {"body": body_str})
+            mcp_req = MCPRequest.from_json(json.decode(body_str))
+
+            # Return list of available tools
+            tools = [
+                {
+                    "name": "convert_config",
+                    "description": "Convert network configuration between different formats",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "input_config": {"type": "string", "description": "The configuration to convert"},
+                            "format": {"type": "string", "description": "Input format (cli, netconf, json)"},
+                            "target_format": {"type": "string", "description": "Target format (cli, netconf, json, acton-adata, acton-gdata)"},
+                            "platform": {"type": "string", "description": "Platform identifier"}
+                        },
+                        "required": ["input_config", "format", "target_format", "platform"]
+                    }
+                },
+                {
+                    "name": "list_platforms",
+                    "description": "List all available NETCLICS platforms",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {}
+                    }
+                },
+                {
+                    "name": "list_instances",
+                    "description": "List all NETCLICS device instances and their status",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {}
+                    }
+                }
+            ]
+
+            _send_success_response(mcp_req.id, {"tools": tools}, respond, "tools/list")
+        except Exception as e:
+            _log.error("MCP tools/list error", {"error": str(e)})
+            _send_error_response(None, MCP_INTERNAL_ERROR, str(e), respond, "tools/list")
+
+    def handle_tools_call(request, respond: action(int, dict[str, str], str) -> None):
+        """Handle MCP tools/call request"""
+        try:
+            body_str = request.body.decode()
+            _log.debug("MCP tools/call request", {"body": body_str})
+            mcp_req = MCPRequest.from_json(json.decode(body_str))
+
+            # Extract tool name and arguments from params
+            tool_name = _get_str(mcp_req.params, "name")
+            if tool_name == "":
+                _send_error_response(mcp_req.id, MCP_INVALID_PARAMS, "Missing tool name", respond, "tools/call-missing-tool")
+                return
+
+            args = mcp_req.params.get_def("arguments", {})
+
+            if tool_name == "convert_config" and isinstance(args, dict):
+                _handle_convert_config(mcp_req.id, args, respond)
+            elif tool_name == "list_platforms":
+                _handle_list_platforms(mcp_req.id, respond)
+            elif tool_name == "list_instances":
+                _handle_list_instances(mcp_req.id, respond)
+            else:
+                _log.warning("Unknown tool requested", {"tool": tool_name})
+                _send_error_response(mcp_req.id, MCP_METHOD_NOT_FOUND, "Unknown tool: " + tool_name, respond, "tools/call-unknown")
+
+        except Exception as e:
+            _log.error("MCP tools/call error", {"error": str(e)})
+            _send_error_response(None, MCP_INTERNAL_ERROR, str(e), respond, "tools/call")
+
+    def _handle_convert_config(request_id: ?value, args: dict[str, ?value], respond: action(int, dict[str, str], str) -> None):
+        """Handle MCP convert_config tool call"""
+
+        try:
+            # Extract and validate parameters
+            if "input_config" not in args:
+                _send_error_response(request_id, MCP_INVALID_PARAMS, "Missing input_config parameter", respond, "convert_config-validation")
+                return
+            else:
+                input_config = args["input_config"]
+            if "format" not in args:
+                _send_error_response(request_id, MCP_INVALID_PARAMS, "Missing format parameter", respond, "convert_config-validation")
+                return
+            else:
+                format_val = args["format"]
+            if "target_format" not in args:
+                _send_error_response(request_id, MCP_INVALID_PARAMS, "Missing target_format parameter", respond, "convert_config-validation")
+                return
+            else:
+                target_format = args["target_format"]
+            if "platform" not in args:
+                _send_error_response(request_id, MCP_INVALID_PARAMS, "Missing platform parameter", respond, "convert_config-validation")
+                return
+            else:
+                platform = args["platform"]
+
+
+            # Type checking
+            if isinstance(input_config, str) and isinstance(format_val, str) and isinstance(target_format, str) and isinstance(platform, str):
+                # All parameters are valid strings, create conversion request
+                convert_req = ConvertRequest(input_config, format_val, target_format, platform, None)
+            else:
+                _send_error_response(request_id, MCP_INVALID_PARAMS, "All parameters must be strings", respond, "convert_config-validation")
+                return
+
+            # Define callback for when conversion completes
+            def on_conversion_done(result: str, success: bool):
+                if success:
+                    # Format result for MCP
+                    try:
+                        result_dict = json.decode(result)
+                        if isinstance(result_dict, dict) and "base_config" in result_dict and "config" in result_dict:
+                            # Include before/after configs and diff
+                            mcp_result = {
+                                "content": [
+                                    {
+                                        "type": "text",
+                                        "text": "Conversion successful!\n\nConverted configuration:\n{result_dict['config']}"
+                                    }
+                                ]
+                            }
+                            if "diff" in result_dict and result_dict["diff"]:
+                                mcp_result["content"].append({
+                                    "type": "text",
+                                    "text": "\nConfiguration diff:\n{result_dict['diff']}"
+                                })
+                        else:
+                            mcp_result = {
+                                "content": [
+                                    {
+                                        "type": "text",
+                                        "text": "Conversion successful!\n\n{result}"
+                                    }
+                                ]
+                            }
+                    except Exception:
+                        # Fallback for non-JSON results
+                        mcp_result = {
+                            "content": [
+                                {
+                                    "type": "text",
+                                    "text": "Conversion successful!\n\n{result}"
+                                }
+                            ]
+                        }
+
+                    _send_success_response(request_id, mcp_result, respond, "convert_config-success")
+                else:
+                    _send_error_response(request_id, MCP_INTERNAL_ERROR, "Conversion failed: " + result, respond, "convert_config-failure")
+
+            # Execute conversion
+            convert_fn(convert_req, on_conversion_done)
+
+        except Exception as e:
+            _send_error_response(request_id, MCP_INTERNAL_ERROR, str(e), respond, "convert_config")
+
+    def _handle_list_platforms(request_id: ?value, respond: action(int, dict[str, str], str) -> None):
+        """Handle MCP list_platforms tool call"""
+        _log.debug("MCP list_platforms called")
+        try:
+            platforms_data = get_platforms_fn()
+
+            # Format platforms for MCP response
+            platforms_text = "Available platforms:\n"
+            for platform in platforms_data:
+                name = platform.get_def("name", "Unknown")
+                platform_type = platform.get_def("platform", "Unknown type")
+                available = platform.get_def("available_instances", 0)
+                total = platform.get_def("total_instances", 0)
+                platforms_text = platforms_text + "- {name} ({platform_type}) - {available}/{total} instances available\n"
+
+            result = {
+                "content": [
+                    {
+                        "type": "text",
+                        "text": platforms_text
+                    }
+                ]
+            }
+
+            _send_success_response(request_id, result, respond, "list_platforms")
+
+        except Exception as e:
+            _send_error_response(request_id, MCP_INTERNAL_ERROR, str(e), respond, "list_platforms")
+
+    def _handle_list_instances(request_id: ?value, respond: action(int, dict[str, str], str) -> None):
+        """Handle MCP list_instances tool call"""
+        _log.debug("MCP list_instances called")
+        try:
+            instances_data = get_instances_fn()
+
+            # Format instances for MCP response
+            instances_text = "Device instances:\n"
+            for instance in instances_data:
+                platform_name = instance.get_def("platform_name", "Unknown")
+                state = instance.get_def("state", "Unknown")
+                instance_id = instance.get_def("instance_id", "Unknown")
+                instance_type = instance.get_def("instance_type", "Unknown")
+                ip = instance.get_def("ip_address", "Unknown")
+                instances_text = instances_text + "- {instance_id} ({platform_name}) - {state} [{instance_type}] @ {ip}\n"
+
+            result = {
+                "content": [
+                    {
+                        "type": "text",
+                        "text": instances_text
+                    }
+                ]
+            }
+
+            _send_success_response(request_id, result, respond, "list_instances")
+
+        except Exception as e:
+            _send_error_response(request_id, MCP_INTERNAL_ERROR, str(e), respond, "list_instances")
+
 actor WebServ(listen_cap: net.TCPListenCap, port, director, log_handler: logging.Handler):
     logh = logging.Handler("WebServ")
     logh.set_handler(log_handler)
     _log = logging.Logger(logh)
+
+    # Create MCP server instance
+    mcp = MCPServer(director.convert, director.get_platforms, director.get_instances, log_handler)
 
     def _on_http_accept(server):
         server.cb_install(_on_http_server_request, _on_http_server_error)
@@ -1480,11 +1878,42 @@ actor WebServ(listen_cap: net.TCPListenCap, port, director, log_handler: logging
             }
             respond(200, {"Content-Type": "application/json"}, json.encode(response))
 
+        # MCP endpoint - single endpoint with JSON-RPC routing
+        elif request.path == "/mcp" and request.method == "POST":
+            try:
+                body_str = request.body.decode()
+                _log.debug("MCP request received", {"body": body_str})
+                body_dict = json.decode(body_str)
+                method = _get_str(body_dict, "method")
+                _log.debug("MCP method", {"method": method})
+
+                if method == "initialize":
+                    mcp.handle_initialize(request, respond)
+                elif method == "tools/list":
+                    mcp.handle_tools_list(request, respond)
+                elif method == "tools/call":
+                    mcp.handle_tools_call(request, respond)
+                else:
+                    # Unknown method
+                    _log.warning("Unknown MCP method", {"method": method})
+                    error = MCPError(MCP_METHOD_NOT_FOUND, "Unknown method: " + str(method))
+                    response = MCPResponse(body_dict.get("id"), None, error)
+                    response_json = json.encode(response.to_dict())
+                    _log.debug("MCP unknown method response", {"response": response_json})
+                    respond(200, {"Content-Type": "application/json"}, response_json)
+            except Exception as e:
+                _log.error("MCP routing error", {"error": str(e)})
+                error = MCPError(MCP_INTERNAL_ERROR, str(e))
+                response = MCPResponse(None, None, error)
+                response_json = json.encode(response.to_dict())
+                _log.debug("MCP routing error response", {"response": response_json})
+                respond(200, {"Content-Type": "application/json"}, response_json)
+
         else:
-            respond(404, {}, json.encode({"error": "Not found"}))
+            respond(404, {"Content-Type": "application/json"}, json.encode({"error": "Not found"}))
 
     def _on_http_server_error(server, error):
-        pass
+        _log.error("HTTP server error", {"error": error})
 
     server = http.Listener(listen_cap, "0.0.0.0", port, _on_http_accept)
 
