@@ -131,7 +131,7 @@ actor DeviceInstance(auth: WorldCap, log_handler: logging.Handler, platform_name
                 instance_data["description"] = desc
         return instance_data
 
-    def _rollback_to_config(target_config: str, result_callback: action(str, bool) -> None):
+    def _rollback_to_config(target_config: str, result_callback: action(?Exception) -> None):
         """Rollback device configuration to a previous state"""
         _log.info("DeviceInstance.rollback called", {"device": container_id})
         _log.debug("Target config length", {"device": container_id, "config_length": len(target_config)})
@@ -144,7 +144,7 @@ actor DeviceInstance(auth: WorldCap, log_handler: logging.Handler, platform_name
             username, password = creds
         else:
             state = "ready"
-            result_callback("No credentials available", False)
+            result_callback(Exception("No credentials available"))
             return
 
         _log.info("Starting NETCONF rollback", {"username": username, "host": ip_address, "port": netconf_port})
@@ -153,7 +153,7 @@ actor DeviceInstance(auth: WorldCap, log_handler: logging.Handler, platform_name
             if error is not None:
                 _log.error("NETCONF rollback connection error", {"error": error})
                 state = "ready"
-                result_callback(f"NETCONF rollback connection error: {error}", False)
+                result_callback(Exception(f"NETCONF rollback connection error: {error}"))
                 return
 
             def on_edit_config_done(client: netconf.Client, response: ?xml.Node, error: ?netconf.NetconfError):
@@ -162,7 +162,7 @@ actor DeviceInstance(auth: WorldCap, log_handler: logging.Handler, platform_name
                     _log.error("Rollback edit-config failed with NETCONF error", {"error": error})
                     client.close()
                     state = "ready"
-                    result_callback("NETCONF rollback edit-config error: {error}", False)
+                    result_callback(Exception(f"NETCONF rollback edit-config error: {error}"))
                 else:
                     _log.info("Rollback edit-config completed successfully")
 
@@ -173,12 +173,12 @@ actor DeviceInstance(auth: WorldCap, log_handler: logging.Handler, platform_name
                             _log.error("Rollback commit failed with NETCONF error", {"error": commit_error})
                             client.close()
                             state = "ready"
-                            result_callback("NETCONF rollback commit error: {commit_error}", False)
+                            result_callback(Exception(f"NETCONF rollback commit error: {commit_error}"))
                         else:
                             _log.info("Rollback commit completed successfully")
                             client.close()
                             state = "ready"
-                            result_callback("Configuration successfully rolled back", True)
+                            result_callback(None)
 
                     _log.debug("Sending rollback commit request")
                     client.commit(on_commit_done)
@@ -211,7 +211,7 @@ actor DeviceInstance(auth: WorldCap, log_handler: logging.Handler, platform_name
             else:
                 _log.error("NETCONF rollback connection failed - no client")
                 state = "ready"
-                result_callback("NETCONF rollback connection failed", False)
+                result_callback(Exception("NETCONF rollback connection failed"))
                 return
 
         # Create NETCONF client for rollback
@@ -230,7 +230,7 @@ actor DeviceInstance(auth: WorldCap, log_handler: logging.Handler, platform_name
         )
         _log.info("NETCONF rollback client created, attempting connection")
 
-    def convert(request: ConvertRequest, result_callback: action(str, bool) -> None):
+    def convert(request: ConvertRequest, result_callback: action(?str, ?Exception) -> None):
         """Process a conversion request on this device"""
         _log.info("DeviceInstance.convert called", {"device": container_id, "input_format": request.format, "output_format": request.target_format})
         _log.debug("Input data", {"device": container_id, "input_data": request.input})
@@ -308,11 +308,15 @@ actor DeviceInstance(auth: WorldCap, log_handler: logging.Handler, platform_name
                     base_config_formatted = format_gdata_output(parsed_gdata, request.target_format)
                     on_base_formatted()
 
-        def on_base_cli_retrieved(cli_config: str, cli_success: bool):
+        def on_base_cli_retrieved(cli_config: ?str, error: ?Exception):
             """Handle CLI format for base configuration"""
-            if not cli_success:
-                _log.error("Failed to get CLI base config")
-                abort("Failed to get CLI base config")
+            if error is not None:
+                _log.error("Failed to get CLI base config", {"error": str(error)})
+                abort("Failed to get CLI base config: " + str(error))
+                return
+            if cli_config is None:
+                _log.error("CLI config is None")
+                abort("CLI config is None")
                 return
             base_config_formatted = cli_config
             on_base_formatted()
@@ -322,12 +326,11 @@ actor DeviceInstance(auth: WorldCap, log_handler: logging.Handler, platform_name
             _log.info("Base configuration formatted, applying input")
             _handle_input(request.format, request.input, on_input_applied)
 
-        def on_input_applied(success: bool, error_msg: ?str):
+        def on_input_applied(error: ?Exception):
             """Step 3: Input has been applied, now get final config"""
-            if not success:
-                err_str = error_msg if error_msg is not None else "Input application failed"
-                _log.error("Input application failed", {"error": err_str})
-                abort(err_str)
+            if error is not None:
+                _log.error("Input application failed", {"error": str(error)})
+                abort(str(error))
                 return
 
             _log.info("Input applied successfully, getting final configuration")
@@ -363,11 +366,15 @@ actor DeviceInstance(auth: WorldCap, log_handler: logging.Handler, platform_name
                     final_config_formatted = format_gdata_output(final_parsed_gdata, request.target_format)
                     on_final_formatted()
 
-        def on_final_cli_retrieved(cli_config: str, cli_success: bool):
+        def on_final_cli_retrieved(cli_config: ?str, error: ?Exception):
             """Handle CLI format for final configuration"""
-            if not cli_success:
-                _log.error("Failed to get CLI final config")
-                abort("Failed to get CLI final config")
+            if error is not None:
+                _log.error("Failed to get CLI final config", {"error": str(error)})
+                abort("Failed to get CLI final config: " + str(error))
+                return
+            if cli_config is None:
+                _log.error("CLI config is None")
+                abort("CLI config is None")
                 return
             final_config_formatted = cli_config
             on_final_formatted()
@@ -384,17 +391,17 @@ actor DeviceInstance(auth: WorldCap, log_handler: logging.Handler, platform_name
                 # Use gdata diff for schema-aware formats
                 _log.info("Computing gdata-based diff")
                 diff_text = _compute_gdata_diff(base_gdata, final_gdata, request.target_format)
-                on_diff_computed(diff_text, True)
+                on_diff_computed(diff_text, None)
             else:
                 _log.info("Diff not available")
-                on_diff_computed("", True)  # Empty diff
+                on_diff_computed("", None)  # Empty diff
 
-        def on_diff_computed(diff_text: str, diff_success: bool):
+        def on_diff_computed(diff_text: ?str, error: ?Exception):
             """Step 6: Diff computed, now rollback to clean state"""
             _log.info("Diff computed, starting rollback to clean device state")
 
             # Store diff for response (use empty string if failed)
-            computed_diff = diff_text if diff_success else ""
+            computed_diff = diff_text if diff_text is not None else ""
 
             # Start rollback process using saved XML
             if rollback_xml is not None:
@@ -402,17 +409,17 @@ actor DeviceInstance(auth: WorldCap, log_handler: logging.Handler, platform_name
                 _log.info("Starting automatic rollback to clean device state using NETCONF")
                 config_preview = extracted_config[:200] if len(extracted_config) > 200 else extracted_config
                 _log.debug("Extracted config for rollback", {"config_preview": config_preview})
-                _rollback_to_config(extracted_config, lambda result, success: on_rollback_complete(computed_diff, result, success))
+                _rollback_to_config(extracted_config, lambda error: on_rollback_complete(computed_diff, error))
             else:
                 _log.error("No rollback XML available")
-                on_rollback_complete(computed_diff, "No rollback XML available", False)
+                on_rollback_complete(computed_diff, Exception("No rollback XML available"))
 
-        def on_rollback_complete(diff_text: str, rollback_result: str, rollback_success: bool):
+        def on_rollback_complete(diff_text: str, rollback_error: ?Exception):
             """Step 7: Rollback complete, finish the conversion"""
-            if rollback_success:
+            if rollback_error is None:
                 _log.info("Device successfully rolled back to clean state")
             else:
-                _log.warning("Rollback failed but conversion succeeded", {"rollback_result": rollback_result})
+                _log.warning("Rollback failed but conversion succeeded", {"error": str(rollback_error)})
 
             # Complete successfully with results
             complete(diff_text)
@@ -431,26 +438,26 @@ actor DeviceInstance(auth: WorldCap, log_handler: logging.Handler, platform_name
         def abort(error: str):
             """Abort the conversion due to error"""
             _log.error("Conversion aborted", {"error": error})
-            finish(error, None)
+            finish(Exception(error), None)
 
-        def finish(error: ?str, result: ?str):
+        def finish(error: ?Exception, result: ?str):
             """Final cleanup and callback"""
             # Reset state
             state = "ready"
 
             # Call the result callback
             if error is not None:
-                result_callback(error, False)
+                result_callback(None, error)
             elif result is not None:
-                result_callback(result, True)
+                result_callback(result, None)
             else:
-                result_callback("Unknown error", False)
+                result_callback(None, Exception("Unknown error"))
 
         # Start the conversion process
         _log.info("Getting base configuration")
         _get_netconf_config_parsed(on_base_config_retrieved)
 
-    def _handle_input(input_format: str, input_data: str, callback: action(bool, ?str) -> None):
+    def _handle_input(input_format: str, input_data: str, callback: action(?Exception) -> None):
         """Apply input data using the appropriate input handler"""
         _log.info("Handling input format", {"input_format": input_format})
 
@@ -461,12 +468,12 @@ actor DeviceInstance(auth: WorldCap, log_handler: logging.Handler, platform_name
         elif input_format == "restconf":
             # TODO: Implement RESTCONF input handler
             _log.error("RESTCONF input handler not yet implemented")
-            callback(False, "RESTCONF input handler not implemented")
+            callback(Exception("RESTCONF input handler not implemented"))
         else:
             _log.error("Unsupported input format", {"input_format": input_format})
-            callback(False, f"Unsupported input format: {input_format}")
+            callback(Exception(f"Unsupported input format: {input_format}"))
 
-    def _netconf_input(input_data: str, callback: action(bool, ?str) -> None):
+    def _netconf_input(input_data: str, callback: action(?Exception) -> None):
         """Apply configuration via NETCONF edit-config"""
         _log.info("NETCONF input handler: applying configuration")
 
@@ -475,14 +482,14 @@ actor DeviceInstance(auth: WorldCap, log_handler: logging.Handler, platform_name
         if creds is not None:
             username, password = creds
         else:
-            callback(False, "No credentials available")
+            callback(Exception("No credentials available"))
             return
         _log.info("Starting NETCONF input", {"username": username, "host": ip_address, "port": netconf_port})
 
         def on_connect(client: ?netconf.Client, error: ?Exception):
             if error is not None:
                 _log.error("NETCONF connection error", {"error": error})
-                callback(False, f"NETCONF connection error: {error}")
+                callback(Exception(f"NETCONF connection error: {error}"))
                 return
 
             def on_edit_config_done(client: netconf.Client, error: ?netconf.NetconfError):
@@ -490,7 +497,7 @@ actor DeviceInstance(auth: WorldCap, log_handler: logging.Handler, platform_name
                 if error is not None:
                     _log.error("Edit-config failed with NETCONF error", {"error": error})
                     client.close()
-                    callback(False, "NETCONF edit-config error: {error}")
+                    callback(Exception(f"NETCONF edit-config error: {error}"))
                 else:
                     _log.info("Edit-config completed successfully")
 
@@ -500,11 +507,11 @@ actor DeviceInstance(auth: WorldCap, log_handler: logging.Handler, platform_name
                         if commit_error is not None:
                             _log.error("Commit failed with NETCONF error", {"error": commit_error})
                             client.close()
-                            callback(False, "NETCONF commit error: {commit_error}")
+                            callback(Exception(f"NETCONF commit error: {commit_error}"))
                         else:
                             _log.info("Commit completed successfully")
                             client.close()
-                            callback(True, None)
+                            callback(None)
 
                     _log.debug("Sending commit request")
                     client.commit(on_commit_done)
@@ -519,7 +526,7 @@ actor DeviceInstance(auth: WorldCap, log_handler: logging.Handler, platform_name
                 client.edit_config(input_data, on_edit_config_done, "candidate")
             else:
                 _log.error("NETCONF connection failed - no client")
-                callback(False, "NETCONF connection failed")
+                callback(Exception("NETCONF connection failed"))
                 return
 
         # Create NETCONF client
@@ -540,7 +547,7 @@ actor DeviceInstance(auth: WorldCap, log_handler: logging.Handler, platform_name
         )
         _log.info("NETCONF client created, attempting connection")
 
-    def _cli_input(input_data: str, callback: action(bool, ?str) -> None):
+    def _cli_input(input_data: str, callback: action(?Exception) -> None):
         """Apply CLI configuration via router_client"""
         _log.info("CLI input handler: applying CLI configuration")
 
@@ -549,7 +556,7 @@ actor DeviceInstance(auth: WorldCap, log_handler: logging.Handler, platform_name
         if creds is not None:
             username, password = creds
         else:
-            callback(False, "No credentials available")
+            callback(Exception("No credentials available"))
             return
         _log.info("Starting CLI input", {"username": username, "host": ip_address, "port": ssh_port})
 
@@ -561,7 +568,7 @@ actor DeviceInstance(auth: WorldCap, log_handler: logging.Handler, platform_name
                 cli_commands.append(line)
 
         if not cli_commands:
-            callback(False, "No valid CLI commands found in input")
+            callback(Exception("No valid CLI commands found in input"))
             return
 
         _log.debug("Parsed CLI commands", {"commands": cli_commands, "count": len(cli_commands)})
@@ -569,11 +576,11 @@ actor DeviceInstance(auth: WorldCap, log_handler: logging.Handler, platform_name
         def on_success(response: str):
             _log.info("CLI configuration applied successfully")
             _log.debug("CLI success response", {"response": response})
-            callback(True, None)
+            callback(None)
 
         def on_error(err: Exception, response: str):
             _log.error("CLI configuration failed", {"error": str(err), "response": response})
-            callback(False, "CLI configuration error: " + str(err))
+            callback(Exception("CLI configuration error: " + str(err)))
 
         # Create router client
         _log.info("Creating CLI client connection", {"host": ip_address, "port": ssh_port, "username": username})
@@ -599,12 +606,12 @@ actor DeviceInstance(auth: WorldCap, log_handler: logging.Handler, platform_name
                 after 0.5: try_configure(attempt + 1)
             else:
                 _log.error("CLI client failed to connect after retries")
-                callback(False, "CLI client failed to connect within timeout")
+                callback(Exception("CLI client failed to connect within timeout"))
 
         _log.debug("Waiting for CLI client to connect")
         after 0.1: try_configure(0)  # Start checking after 100ms
 
-    def _get_cli_config(callback: action(str, bool) -> None):
+    def _get_cli_config(callback: action(?str, ?Exception) -> None):
         """Utility function to get CLI config without managing conversion state"""
         _log.info("CLI config utility: retrieving configuration")
 
@@ -613,7 +620,7 @@ actor DeviceInstance(auth: WorldCap, log_handler: logging.Handler, platform_name
         if creds is not None:
             username, password = creds
         else:
-            callback("No credentials available for CLI config", False)
+            callback(None, Exception("No credentials available for CLI config"))
             return
 
         _log.info("Starting CLI config retrieval", {"username": username, "host": ip_address, "port": ssh_port})
@@ -621,14 +628,14 @@ actor DeviceInstance(auth: WorldCap, log_handler: logging.Handler, platform_name
         def on_cmd_complete(err: ?Exception, response: ?str):
             if err is not None:
                 _log.error("CLI config retrieval failed", {"error": str(err)})
-                callback("CLI config error: " + str(err), False)
+                callback(None, Exception("CLI config error: " + str(err)))
             elif response is not None:
                 _log.info("CLI config retrieved successfully")
                 _log.debug("CLI config response", {"response_length": len(response)})
-                callback(response, True)
+                callback(response, None)
             else:
                 _log.error("CLI config failed - received None response")
-                callback("CLI config failed", False)
+                callback(None, Exception("CLI config failed"))
 
         # Create router client
         _log.info("Creating CLI utility client", {"host": ip_address, "port": ssh_port, "username": username})
@@ -654,7 +661,7 @@ actor DeviceInstance(auth: WorldCap, log_handler: logging.Handler, platform_name
                 after 0.5: try_get_config(attempt + 1)
             else:
                 _log.error("CLI utility client failed to connect after retries")
-                callback("CLI utility client failed to connect within timeout", False)
+                callback(None, Exception("CLI utility client failed to connect within timeout"))
 
         _log.debug("Waiting for CLI utility client to connect")
         after 0.1: try_get_config(0)  # Start checking after 100ms
@@ -753,7 +760,7 @@ actor DeviceInstance(auth: WorldCap, log_handler: logging.Handler, platform_name
             skip_host_key_check=True
         )
 
-    def _cli_output(result_callback: action(str, bool) -> None):
+    def _cli_output(result_callback: action(?str, ?Exception) -> None):
         """Retrieve configuration via CLI commands"""
         _log.info("CLI output handler: retrieving configuration")
 
@@ -763,7 +770,7 @@ actor DeviceInstance(auth: WorldCap, log_handler: logging.Handler, platform_name
             username, password = creds
         else:
             state = "ready"
-            result_callback("No credentials available", False)
+            result_callback(None, Exception("No credentials available"))
             return
 
         _log.info("Starting CLI output", {"username": username, "host": ip_address, "port": ssh_port})
@@ -772,12 +779,12 @@ actor DeviceInstance(auth: WorldCap, log_handler: logging.Handler, platform_name
             _log.info("CLI show configuration completed successfully")
             _log.debug("CLI response", {"response_length": len(response)})
             state = "ready"
-            result_callback(response, True)
+            result_callback(response, None)
 
         def on_error(error: Exception, response: str):
             _log.error("CLI show configuration failed", {"error": str(error), "response": response})
             state = "ready"
-            result_callback("CLI show configuration error: " + str(error), False)
+            result_callback(None, Exception("CLI show configuration error: " + str(error)))
 
         # Create router client
         _log.info("Creating CLI client connection", {"host": ip_address, "port": ssh_port, "username": username})
@@ -798,16 +805,16 @@ actor DeviceInstance(auth: WorldCap, log_handler: logging.Handler, platform_name
             if err is not None:
                 _log.error("CLI show configuration failed", {"error": str(err)})
                 state = "ready"
-                result_callback("CLI show configuration error: " + str(err), False)
+                result_callback(None, Exception("CLI show configuration error: " + str(err)))
             elif response is not None:
                 _log.info("CLI show configuration completed successfully")
                 _log.debug("CLI response", {"response_length": len(response)})
                 state = "ready"
-                result_callback(response, True)
+                result_callback(response, None)
             else:
                 _log.error("CLI show configuration failed - received None response")
                 state = "ready"
-                result_callback("CLI show configuration failed", False)
+                result_callback(None, Exception("CLI show configuration failed"))
 
         # Wait for connection and get configuration
         def try_show_config(attempt: int):
@@ -820,12 +827,12 @@ actor DeviceInstance(auth: WorldCap, log_handler: logging.Handler, platform_name
             else:
                 _log.error("CLI client failed to connect after retries")
                 state = "ready"
-                result_callback("CLI client failed to connect within timeout", False)
+                result_callback(None, Exception("CLI client failed to connect within timeout"))
 
         _log.debug("Waiting for CLI client to connect")
         after 0.1: try_show_config(0)  # Start checking after 100ms
 
-    def _get_cli_diff(result_callback: action(str, bool) -> None):
+    def _get_cli_diff(result_callback: action(?str, ?Exception) -> None):
         """Get CLI diff using 'show configuration | compare rollback 1'"""
         _log.info("CLI diff handler: getting configuration differences")
 
@@ -834,7 +841,7 @@ actor DeviceInstance(auth: WorldCap, log_handler: logging.Handler, platform_name
         if creds is not None:
             username, password = creds
         else:
-            result_callback("No credentials available for CLI diff", False)
+            result_callback(None, Exception("No credentials available for CLI diff"))
             return
 
         _log.info("Starting CLI diff retrieval", {"username": username, "host": ip_address, "port": ssh_port})
@@ -842,14 +849,14 @@ actor DeviceInstance(auth: WorldCap, log_handler: logging.Handler, platform_name
         def on_cmd_complete(err: ?Exception, response: ?str):
             if err is not None:
                 _log.error("CLI diff command failed", {"error": str(err)})
-                result_callback("CLI diff error: " + str(err), False)
+                result_callback(None, Exception("CLI diff error: " + str(err)))
             elif response is not None:
                 _log.info("CLI diff retrieved successfully")
                 _log.debug("CLI diff response", {"response_length": len(response)})
-                result_callback(response, True)
+                result_callback(response, None)
             else:
                 _log.error("CLI diff failed - received None response")
-                result_callback("CLI diff failed", False)
+                result_callback(None, Exception("CLI diff failed"))
 
         # Create router client
         _log.info("Creating CLI client for diff", {"host": ip_address, "port": ssh_port, "username": username})
@@ -875,7 +882,7 @@ actor DeviceInstance(auth: WorldCap, log_handler: logging.Handler, platform_name
                 after 0.5: try_get_diff(attempt + 1)
             else:
                 _log.error("CLI client failed to connect for diff after retries")
-                result_callback("CLI client failed to connect for diff within timeout", False)
+                result_callback(None, Exception("CLI client failed to connect for diff within timeout"))
 
         _log.debug("Waiting for CLI client to connect for diff")
         after 0.1: try_get_diff(0)  # Start checking after 100ms
@@ -1302,7 +1309,7 @@ actor Director(auth: WorldCap, proc_cap: process.ProcessCap, log_handler: loggin
         _log.info("Director initialized")
 
 
-    def convert(request: ConvertRequest, callback: action(str, bool) -> None):
+    def convert(request: ConvertRequest, callback: action(?str, ?Exception) -> None):
         """Process a conversion request"""
         _log.info("Director.convert called", {"input_format": request.format, "output_format": request.target_format, "platform": request.platform, "input_length": len(request.input)})
 
@@ -1318,10 +1325,10 @@ actor Director(auth: WorldCap, proc_cap: process.ProcessCap, log_handler: loggin
                 device.convert(request, callback)
             else:
                 _log.error("No device available for platform", {"platform": request.platform})
-                callback("No device available for %s" % request.platform, False)
+                callback(None, Exception("No device available for %s" % request.platform))
         else:
             _log.error("Director not initialized - no DeviceManager")
-            callback("Director not initialized", False)
+            callback(None, Exception("Director not initialized"))
 
 
     def cli2xml(conf: str, cb):
@@ -1473,7 +1480,7 @@ class MCPResponse(object):
 
 # MCP Server Actor
 
-actor MCPServer(convert_fn: action(ConvertRequest, action(str, bool) -> None) -> None,
+actor MCPServer(convert_fn: action(ConvertRequest, action(?str, ?Exception) -> None) -> None,
                 get_platforms_fn: action() -> list[dict[str, ?value]],
                 get_instances_fn: action() -> list[dict[str, ?value]],
                 log_handler: logging.Handler):
@@ -1667,8 +1674,8 @@ actor MCPServer(convert_fn: action(ConvertRequest, action(str, bool) -> None) ->
                 return
 
             # Define callback for when conversion completes
-            def on_conversion_done(result: str, success: bool):
-                if success:
+            def on_conversion_done(result: ?str, error: ?Exception):
+                if error is None and result is not None:
                     # Format result for MCP
                     try:
                         result_dict = json.decode(result)
@@ -1709,7 +1716,8 @@ actor MCPServer(convert_fn: action(ConvertRequest, action(str, bool) -> None) ->
 
                     _send_success_response(request_id, mcp_result, respond, "convert_config-success")
                 else:
-                    _send_error_response(request_id, MCP_INTERNAL_ERROR, "Conversion failed: " + result, respond, "convert_config-failure")
+                    error_msg = str(error) if error is not None else "Conversion failed"
+                    _send_error_response(request_id, MCP_INTERNAL_ERROR, "Conversion failed: " + error_msg, respond, "convert_config-failure")
 
             # Execute conversion
             convert_fn(convert_req, on_conversion_done)
@@ -1802,9 +1810,9 @@ actor WebServ(listen_cap: net.TCPListenCap, port, director, log_handler: logging
                 _log.info("ConvertRequest created", {"input_format": convert_req.format, "output_format": convert_req.target_format, "platform": convert_req.platform})
 
                 # Define callback for when conversion completes
-                def on_conversion_done(result: str, success: bool):
+                def on_conversion_done(result: ?str, error: ?Exception):
                     _log.debug("Conversion completed, preparing HTTP response")
-                    if success:
+                    if error is None and result is not None:
                         _log.info("Conversion successful", {"result_length": len(result)})
 
                         # Try to parse the result as JSON (base_config + config format)
@@ -1841,10 +1849,11 @@ actor WebServ(listen_cap: net.TCPListenCap, port, director, log_handler: logging
                                 "platform_version": "1.0"
                             }
                     else:
-                        _log.error("Conversion failed", {"result": result})
+                        error_msg = str(error) if error is not None else "Conversion failed"
+                        _log.error("Conversion failed", {"error": error_msg})
                         response = {
                             "success": False,
-                            "error": result,
+                            "error": error_msg,
                             "platform": convert_req.platform
                         }
                     response_str = json.encode(response)
