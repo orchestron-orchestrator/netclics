@@ -88,7 +88,6 @@ actor DeviceInstance(auth: WorldCap, log_handler: logging.Handler, platform_name
                      netconf_port: int, ssh_port: int, instance_spec: ?InstanceSpec = None):
     """Actor representing a device instance that can process conversion requests"""
     var state = "starting"  # starting, ready, busy, stopping, error
-    var current_request: ?ConvertRequest = None  # Currently processing request
     var started_at = 0  # Timestamp when started
     var last_used_at = 0  # Timestamp of last use
 
@@ -96,11 +95,6 @@ actor DeviceInstance(auth: WorldCap, log_handler: logging.Handler, platform_name
     var compiled_schema: ?yang.schema.DRoot = None  # Compiled YANG schema
     var schema_list: list[str] = []  # Raw YANG schema strings
     var schema_ready = False  # Flag indicating schemas are ready
-
-    # Storage for parsed configs during conversion
-    var base_gdata: ?yang.gdata.Node = None
-    var final_gdata: ?yang.gdata.Node = None
-    var rollback_xml: ?str = None  # Store raw XML for rollback
 
     # Set up logging
     logh = logging.Handler("DeviceInstance")
@@ -242,12 +236,11 @@ actor DeviceInstance(auth: WorldCap, log_handler: logging.Handler, platform_name
         _log.debug("Input data", {"device": container_id, "input_data": request.input})
 
         state = "busy"
-        current_request = request
 
-        # Reset gdata storage for new conversion
-        base_gdata = None
-        final_gdata = None
-        rollback_xml = None
+        # Local variables for this conversion only
+        base_gdata: ?yang.gdata.Node = None
+        final_gdata: ?yang.gdata.Node = None
+        rollback_xml: ?str = None
 
         # Variables to hold formatted configs
         base_config_formatted = ""
@@ -390,7 +383,7 @@ actor DeviceInstance(auth: WorldCap, log_handler: logging.Handler, platform_name
             elif base_gdata is not None and final_gdata is not None:
                 # Use gdata diff for schema-aware formats
                 _log.info("Computing gdata-based diff")
-                diff_text = _compute_gdata_diff()
+                diff_text = _compute_gdata_diff(base_gdata, final_gdata, request.target_format)
                 on_diff_computed(diff_text, True)
             else:
                 _log.info("Diff not available")
@@ -444,11 +437,6 @@ actor DeviceInstance(auth: WorldCap, log_handler: logging.Handler, platform_name
             """Final cleanup and callback"""
             # Reset state
             state = "ready"
-            current_request = None
-            # Clean up gdata storage
-            base_gdata = None
-            final_gdata = None
-            rollback_xml = None
 
             # Call the result callback
             if error is not None:
@@ -775,7 +763,6 @@ actor DeviceInstance(auth: WorldCap, log_handler: logging.Handler, platform_name
             username, password = creds
         else:
             state = "ready"
-            current_request = None
             result_callback("No credentials available", False)
             return
 
@@ -785,13 +772,11 @@ actor DeviceInstance(auth: WorldCap, log_handler: logging.Handler, platform_name
             _log.info("CLI show configuration completed successfully")
             _log.debug("CLI response", {"response_length": len(response)})
             state = "ready"
-            current_request = None
             result_callback(response, True)
 
         def on_error(error: Exception, response: str):
             _log.error("CLI show configuration failed", {"error": str(error), "response": response})
             state = "ready"
-            current_request = None
             result_callback("CLI show configuration error: " + str(error), False)
 
         # Create router client
@@ -813,18 +798,15 @@ actor DeviceInstance(auth: WorldCap, log_handler: logging.Handler, platform_name
             if err is not None:
                 _log.error("CLI show configuration failed", {"error": str(err)})
                 state = "ready"
-                current_request = None
                 result_callback("CLI show configuration error: " + str(err), False)
             elif response is not None:
                 _log.info("CLI show configuration completed successfully")
                 _log.debug("CLI response", {"response_length": len(response)})
                 state = "ready"
-                current_request = None
                 result_callback(response, True)
             else:
                 _log.error("CLI show configuration failed - received None response")
                 state = "ready"
-                current_request = None
                 result_callback("CLI show configuration failed", False)
 
         # Wait for connection and get configuration
@@ -838,7 +820,6 @@ actor DeviceInstance(auth: WorldCap, log_handler: logging.Handler, platform_name
             else:
                 _log.error("CLI client failed to connect after retries")
                 state = "ready"
-                current_request = None
                 result_callback("CLI client failed to connect within timeout", False)
 
         _log.debug("Waiting for CLI client to connect")
@@ -899,17 +880,14 @@ actor DeviceInstance(auth: WorldCap, log_handler: logging.Handler, platform_name
         _log.debug("Waiting for CLI client to connect for diff")
         after 0.1: try_get_diff(0)  # Start checking after 100ms
 
-    def _compute_gdata_diff() -> str:
-        """Compute diff between base_gdata and final_gdata"""
-        if base_gdata is not None and final_gdata is not None:
-            try:
-                # Use yang.gdata.diff for semantic diff
-                diff_result = yang.gdata.diff(base_gdata, final_gdata)
+    def _compute_gdata_diff(base_gdata: yang.gdata.Node, final_gdata: yang.gdata.Node, target_format: str) -> str:
+        """Compute diff between base and final gdata configs"""
+        try:
+            # Use yang.gdata.diff for semantic diff
+            diff_result = yang.gdata.diff(base_gdata, final_gdata)
 
-                if diff_result is not None:
-                    # Convert diff to appropriate format based on target_format
-                    if current_request is not None:
-                        target_format = current_request.target_format
+            if diff_result is not None:
+                # Convert diff to appropriate format based on target_format
                         if target_format == "json":
                             return diff_result.to_json()
                         elif target_format == "acton-gdata":
@@ -928,16 +906,11 @@ actor DeviceInstance(auth: WorldCap, log_handler: logging.Handler, platform_name
                             # Default to prsrc format for unknown formats
                             _log.warning("Unknown target format for diff, using prsrc", {"target_format": target_format})
                             return diff_result.prsrc()
-                    else:
-                        return diff_result.prsrc()
-                else:
-                    _log.info("No differences found between base and final configs")
-                    return "No configuration changes"
-            except Exception as e:
-                _log.error("Failed to compute gdata diff", {"error": str(e)})
-                return ""
-        else:
-            _log.warning("Cannot compute gdata diff - missing base or final gdata")
+            else:
+                _log.info("No differences found between base and final configs")
+                return "No configuration changes"
+        except Exception as e:
+            _log.error("Failed to compute gdata diff", {"error": str(e)})
             return ""
 
     def _get_credentials() -> ?(str, str):
