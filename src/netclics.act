@@ -249,6 +249,10 @@ actor DeviceInstance(auth: WorldCap, log_handler: logging.Handler, platform_name
         final_gdata = None
         rollback_xml = None
 
+        # Variables to hold formatted configs
+        base_config_formatted = ""
+        final_config_formatted = ""
+
         # Helper function to format gdata output based on target format
         def format_gdata_output(gdata: yang.gdata.Node, target_format: str) -> str:
             """Format parsed gdata to the requested output format"""
@@ -268,168 +272,193 @@ actor DeviceInstance(auth: WorldCap, log_handler: logging.Handler, platform_name
                 _log.warning("Unknown target format, using XML", {"target_format": target_format})
                 return gdata.to_xmlstr(name="configuration", pretty=True)
 
-        # Helper function for processing with base config
-        def process_with_base(target_base_config: str):
-                    # Step 2: Apply input using appropriate input handler
-                    def on_input_applied(success: bool, error_msg: ?str):
-                        if success:
-                            _log.info("Input applied successfully")
-
-                            # Step 3: Retrieve final configuration
-                            def process_with_final(final_config: str):
-                                    _log.info("Final configuration formatted successfully")
-
-                                    # Step 3.5: Get diff
-                                    def on_diff_retrieved(diff_text: str, diff_success: bool):
-                                        # Step 4: Rollback to base configuration to clean up the device
-                                        def on_rollback_complete(rollback_result: str, rollback_success: bool):
-                                            if rollback_success:
-                                                _log.info("Device successfully rolled back to clean state")
-                                            else:
-                                                _log.warning("Rollback failed but conversion succeeded", {"rollback_result": rollback_result})
-
-                                            # Return base, final configurations and diff
-                                            result_dict = {
-                                                "base_config": target_base_config,
-                                                "config": final_config,
-                                                "diff": diff_text if diff_success else ""
-                                            }
-                                            combined_result = json.encode(result_dict)
-                                            state = "ready"
-                                            current_request = None
-                                            # Clean up gdata storage
-                                            base_gdata = None
-                                            final_gdata = None
-                                            rollback_xml = None
-                                            result_callback(combined_result, True)
-
-                                        # Start rollback process using saved XML
-                                        if rollback_xml is not None:
-                                            extracted_config = extract_config_from_xml(rollback_xml)
-                                            _log.info("Starting automatic rollback to clean device state using NETCONF")
-                                            config_preview = extracted_config[:200] if len(extracted_config) > 200 else extracted_config
-                                            _log.debug("Extracted config for rollback", {"config_preview": config_preview})
-                                            _rollback_to_config(extracted_config, on_rollback_complete)
-                                        else:
-                                            _log.error("No rollback XML available")
-                                            on_rollback_complete("No rollback XML available", False)
-
-                                    # Extract just the configuration element from raw XML
-                                    def extract_config_from_xml(raw_xml: str) -> str:
-                                        # The raw_xml is already just the <data> element content
-                                        # Find the <configuration> element within it
-                                        config_start = raw_xml.find("<configuration")
-                                        config_end = raw_xml.find("</configuration>") + len("</configuration>")
-                                        if config_start != -1 and config_end != -1:
-                                            return raw_xml[config_start:config_end]
-                                        else:
-                                            _log.warning("Could not find configuration element, using full XML")
-                                            return raw_xml
-
-                                    # Get diff based on target format
-                                    if request.target_format == "cli":
-                                        _log.info("Getting CLI diff using compare rollback")
-                                        _get_cli_diff(on_diff_retrieved)
-                                    elif base_gdata is not None and final_gdata is not None:
-                                        # Use gdata diff for schema-aware formats
-                                        _log.info("Computing gdata-based diff")
-                                        diff_text = _compute_gdata_diff()
-                                        on_diff_retrieved(diff_text, True)
-                                    else:
-                                        _log.info("Diff not available")
-                                        on_diff_retrieved("", True)  # Empty diff
-
-
-                            def on_final_config_retrieved(config_tuple: (str, ?yang.gdata.Node), final_success: bool):
-                                if final_success:
-                                    final_raw_xml, final_parsed_gdata = config_tuple
-                                    if final_parsed_gdata is not None:
-                                        _log.info("Final configuration retrieved and parsed successfully")
-
-                                        # Store final gdata for diff
-                                        final_gdata = final_parsed_gdata
-
-                                        # Format final config for response
-                                        final_config = ""
-                                        if request.target_format == "cli":
-                                            # CLI needs special handling
-                                            def on_cli_final_retrieved(cli_config: str, cli_success: bool):
-                                                if cli_success:
-                                                    process_with_final(cli_config)
-                                                else:
-                                                    _log.error("Failed to get CLI final config")
-                                                    state = "ready"
-                                                    current_request = None
-                                                    result_callback("Failed to get CLI final config", False)
-                                            _get_cli_config(on_cli_final_retrieved)
-                                        else:
-                                            # Format gdata for response
-                                            final_config = format_gdata_output(final_parsed_gdata, request.target_format)
-                                            process_with_final(final_config)
-                                    else:
-                                        _log.error("Failed to parse final configuration")
-                                        state = "ready"
-                                        current_request = None
-                                        result_callback("Failed to parse final configuration", False)
-                                else:
-                                    _log.error("Failed to retrieve final configuration")
-                                    state = "ready"
-                                    current_request = None
-                                    result_callback("Failed to retrieve final configuration", False)
-
-                            # Get final configuration using new unified function
-                            _get_netconf_config_parsed(on_final_config_retrieved)
-                        else:
-                            err_str: str = "Input application failed"
-                            if error_msg is not None:
-                                err_str = error_msg
-                            _log.error("Input application failed", {"error": err_str})
-                            state = "ready"
-                            current_request = None
-                            result_callback(err_str, False)
-
-                    _handle_input(request.format, request.input, on_input_applied)
-
-        # Step 1: Get base configuration before applying changes
-        def on_base_config_retrieved(config_tuple: (str, ?yang.gdata.Node), success: bool):
-            if success:
-                raw_xml, parsed_gdata = config_tuple
-                if parsed_gdata is not None:
-                    _log.info("Base configuration retrieved and parsed successfully")
-
-                    # Store for later use
-                    rollback_xml = raw_xml  # Save raw XML for rollback
-                    base_gdata = parsed_gdata  # Save parsed data for diff
-
-                    # Format base config for response
-                    target_base_config = ""
-                    if request.target_format == "cli":
-                        # CLI needs special handling
-                        def on_cli_base_retrieved(cli_config: str, cli_success: bool):
-                            if cli_success:
-                                process_with_base(cli_config)
-                            else:
-                                _log.error("Failed to get CLI base config")
-                                state = "ready"
-                                current_request = None
-                                result_callback("Failed to get CLI base config", False)
-                        _get_cli_config(on_cli_base_retrieved)
-                    else:
-                        # Format gdata for response
-                        target_base_config = format_gdata_output(parsed_gdata, request.target_format)
-                        process_with_base(target_base_config)
-                else:
-                    _log.error("Failed to parse base configuration")
-                    state = "ready"
-                    current_request = None
-                    result_callback("Failed to parse base configuration", False)
+        # Helper function to extract configuration element from raw XML
+        def extract_config_from_xml(raw_xml: str) -> str:
+            # The raw_xml is already just the <data> element content
+            # Find the <configuration> element within it
+            config_start = raw_xml.find("<configuration")
+            config_end = raw_xml.find("</configuration>") + len("</configuration>")
+            if config_start != -1 and config_end != -1:
+                return raw_xml[config_start:config_end]
             else:
-                _log.error("Failed to retrieve base configuration")
-                state = "ready"
-                current_request = None
-                result_callback("Failed to retrieve base configuration", False)
+                _log.warning("Could not find configuration element, using full XML")
+                return raw_xml
 
-        # Start by getting base configuration using the new unified function
+        def on_base_config_retrieved(config_tuple: ?(raw: str, gdata: yang.gdata.Node), error: ?Exception):
+            """Step 1: Process the retrieved base configuration"""
+            if error is not None:
+                _log.error("Failed to retrieve base configuration", {"error": str(error)})
+                abort("Failed to retrieve base configuration: " + str(error))
+                return
+
+            if config_tuple is None:
+                _log.error("No configuration tuple returned")
+                abort("No configuration returned")
+                return
+
+            if config_tuple is not None:
+                raw_xml: str = config_tuple.raw
+                parsed_gdata: yang.gdata.Node = config_tuple.gdata
+
+                _log.info("Base configuration retrieved and parsed successfully")
+
+                # Store for later use
+                rollback_xml = raw_xml  # Save raw XML for rollback
+                base_gdata = parsed_gdata  # Save parsed data for diff
+
+                # Format base config for response
+                if request.target_format == "cli":
+                    # CLI needs special handling
+                    _get_cli_config(on_base_cli_retrieved)
+                else:
+                    # Format gdata for response
+                    base_config_formatted = format_gdata_output(parsed_gdata, request.target_format)
+                    on_base_formatted()
+
+        def on_base_cli_retrieved(cli_config: str, cli_success: bool):
+            """Handle CLI format for base configuration"""
+            if not cli_success:
+                _log.error("Failed to get CLI base config")
+                abort("Failed to get CLI base config")
+                return
+            base_config_formatted = cli_config
+            on_base_formatted()
+
+        def on_base_formatted():
+            """Step 2: Base config is formatted, now apply input"""
+            _log.info("Base configuration formatted, applying input")
+            _handle_input(request.format, request.input, on_input_applied)
+
+        def on_input_applied(success: bool, error_msg: ?str):
+            """Step 3: Input has been applied, now get final config"""
+            if not success:
+                err_str = error_msg if error_msg is not None else "Input application failed"
+                _log.error("Input application failed", {"error": err_str})
+                abort(err_str)
+                return
+
+            _log.info("Input applied successfully, getting final configuration")
+            _get_netconf_config_parsed(on_final_config_retrieved)
+
+        def on_final_config_retrieved(config_tuple: ?(raw: str, gdata: yang.gdata.Node), error: ?Exception):
+            """Step 4: Process the retrieved final configuration"""
+            if error is not None:
+                _log.error("Failed to retrieve final configuration", {"error": str(error)})
+                abort("Failed to retrieve final configuration: " + str(error))
+                return
+
+            if config_tuple is None:
+                _log.error("No final configuration tuple returned")
+                abort("No final configuration returned")
+                return
+
+            if config_tuple is not None:
+                final_raw_xml: str = config_tuple.raw
+                final_parsed_gdata: yang.gdata.Node = config_tuple.gdata
+
+                _log.info("Final configuration retrieved and parsed successfully")
+
+                # Store final gdata for diff
+                final_gdata = final_parsed_gdata
+
+                # Format final config for response
+                if request.target_format == "cli":
+                    # CLI needs special handling
+                    _get_cli_config(on_final_cli_retrieved)
+                else:
+                    # Format gdata for response
+                    final_config_formatted = format_gdata_output(final_parsed_gdata, request.target_format)
+                    on_final_formatted()
+
+        def on_final_cli_retrieved(cli_config: str, cli_success: bool):
+            """Handle CLI format for final configuration"""
+            if not cli_success:
+                _log.error("Failed to get CLI final config")
+                abort("Failed to get CLI final config")
+                return
+            final_config_formatted = cli_config
+            on_final_formatted()
+
+        def on_final_formatted():
+            """Step 5: Final config is formatted, now compute diff"""
+            _log.info("Final configuration formatted successfully, computing diff")
+
+            # Get diff based on target format
+            if request.target_format == "cli":
+                _log.info("Getting CLI diff using compare rollback")
+                _get_cli_diff(on_diff_computed)
+            elif base_gdata is not None and final_gdata is not None:
+                # Use gdata diff for schema-aware formats
+                _log.info("Computing gdata-based diff")
+                diff_text = _compute_gdata_diff()
+                on_diff_computed(diff_text, True)
+            else:
+                _log.info("Diff not available")
+                on_diff_computed("", True)  # Empty diff
+
+        def on_diff_computed(diff_text: str, diff_success: bool):
+            """Step 6: Diff computed, now rollback to clean state"""
+            _log.info("Diff computed, starting rollback to clean device state")
+
+            # Store diff for response (use empty string if failed)
+            computed_diff = diff_text if diff_success else ""
+
+            # Start rollback process using saved XML
+            if rollback_xml is not None:
+                extracted_config = extract_config_from_xml(rollback_xml)
+                _log.info("Starting automatic rollback to clean device state using NETCONF")
+                config_preview = extracted_config[:200] if len(extracted_config) > 200 else extracted_config
+                _log.debug("Extracted config for rollback", {"config_preview": config_preview})
+                _rollback_to_config(extracted_config, lambda result, success: on_rollback_complete(computed_diff, result, success))
+            else:
+                _log.error("No rollback XML available")
+                on_rollback_complete(computed_diff, "No rollback XML available", False)
+
+        def on_rollback_complete(diff_text: str, rollback_result: str, rollback_success: bool):
+            """Step 7: Rollback complete, finish the conversion"""
+            if rollback_success:
+                _log.info("Device successfully rolled back to clean state")
+            else:
+                _log.warning("Rollback failed but conversion succeeded", {"rollback_result": rollback_result})
+
+            # Complete successfully with results
+            complete(diff_text)
+
+        def complete(diff_text: str):
+            """Successfully complete the conversion"""
+            # Return base, final configurations and diff
+            result_dict = {
+                "base_config": base_config_formatted,
+                "config": final_config_formatted,
+                "diff": diff_text
+            }
+            combined_result = json.encode(result_dict)
+            finish(None, combined_result)
+
+        def abort(error: str):
+            """Abort the conversion due to error"""
+            _log.error("Conversion aborted", {"error": error})
+            finish(error, None)
+
+        def finish(error: ?str, result: ?str):
+            """Final cleanup and callback"""
+            # Reset state
+            state = "ready"
+            current_request = None
+            # Clean up gdata storage
+            base_gdata = None
+            final_gdata = None
+            rollback_xml = None
+
+            # Call the result callback
+            if error is not None:
+                result_callback(error, False)
+            elif result is not None:
+                result_callback(result, True)
+            else:
+                result_callback("Unknown error", False)
+
+        # Start the conversion process
         _log.info("Getting base configuration")
         _get_netconf_config_parsed(on_base_config_retrieved)
 
@@ -642,11 +671,11 @@ actor DeviceInstance(auth: WorldCap, log_handler: logging.Handler, platform_name
         _log.debug("Waiting for CLI utility client to connect")
         after 0.1: try_get_config(0)  # Start checking after 100ms
 
-    def _get_netconf_config_parsed(result_callback: action((str, ?yang.gdata.Node), bool) -> None):
+    def _get_netconf_config_parsed(result_callback: action(?(raw: str, gdata: yang.gdata.Node), ?Exception) -> None):
         """Get NETCONF config and parse it with schemas
 
-        Returns a tuple of (raw_xml, parsed_gdata) to the callback.
-        Fails if parsing fails - we cannot proceed without parsed data.
+        Returns a tuple of (raw_xml, parsed_gdata) to the callback on success, or None with an exception on failure.
+        The tuple components are guaranteed to be non-None when the tuple itself is returned.
         """
         _log.info("Getting NETCONF config with parsing")
 
@@ -655,7 +684,7 @@ actor DeviceInstance(auth: WorldCap, log_handler: logging.Handler, platform_name
         if creds is not None:
             username, password = creds
         else:
-            result_callback(("", None), False)
+            result_callback(None, Exception("No credentials available"))
             return
 
         _log.info("Starting NETCONF retrieval", {"username": username, "host": ip_address, "port": netconf_port})
@@ -663,7 +692,7 @@ actor DeviceInstance(auth: WorldCap, log_handler: logging.Handler, platform_name
         def on_connect(client: ?netconf.Client, error: ?Exception):
             if error is not None:
                 _log.error("NETCONF connection error", {"error": error})
-                result_callback(("", None), False)
+                result_callback(None, Exception("NETCONF connection error: " + str(error)))
                 return
 
             def on_get_config_done(client: netconf.Client, response: ?xml.Node, error: ?netconf.NetconfError):
@@ -671,7 +700,7 @@ actor DeviceInstance(auth: WorldCap, log_handler: logging.Handler, platform_name
                 if error is not None:
                     _log.error("Get-config failed with NETCONF error", {"error": error})
                     client.close()
-                    result_callback(("", None), False)
+                    result_callback(None, Exception("Get-config failed with NETCONF error: " + str(error)))
                 elif response is not None:
                     # Extract the <data> element from the RPC reply
                     data_node: ?xml.Node = None
@@ -693,23 +722,23 @@ actor DeviceInstance(auth: WorldCap, log_handler: logging.Handler, platform_name
 
                                 # Close connection and return results
                                 client.close()
-                                result_callback((raw_xml, parsed_gdata), True)
+                                result_callback((raw=raw_xml, gdata=parsed_gdata), None)
                             except Exception as e:
                                 _log.error("Failed to parse with gen3 - cannot proceed", {"error": str(e)})
                                 client.close()
-                                result_callback(("", None), False)
+                                result_callback(None, Exception("Failed to parse with gen3: " + str(e)))
                         else:
                             _log.error("No compiled schema available - cannot proceed with conversion")
                             client.close()
-                            result_callback(("", None), False)
+                            result_callback(None, Exception("No compiled schema available - cannot proceed with conversion"))
                     else:
                         _log.error("No data element in get-config response")
                         client.close()
-                        result_callback(("", None), False)
+                        result_callback(None, Exception("No data element in get-config response"))
                 else:
                     _log.error("Get-config failed - received None response")
                     client.close()
-                    result_callback(("", None), False)
+                    result_callback(None, Exception("Get-config failed - received None response"))
 
             if client is not None:
                 _log.info("NETCONF client connected successfully")
@@ -717,7 +746,7 @@ actor DeviceInstance(auth: WorldCap, log_handler: logging.Handler, platform_name
                 client.get_config(on_get_config_done)
             else:
                 _log.error("NETCONF connection failed - no client")
-                result_callback(("", None), False)
+                result_callback(None, Exception("NETCONF connection failed - no client"))
                 return
 
         # Create NETCONF client
