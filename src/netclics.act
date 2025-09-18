@@ -156,7 +156,7 @@ actor DeviceInstance(auth: WorldCap, log_handler: logging.Handler, platform_name
                 result_callback(Exception(f"NETCONF rollback connection error: {error}"))
                 return
 
-            def on_edit_config_done(client: netconf.Client, response: ?xml.Node, error: ?netconf.NetconfError):
+            def on_edit_config_done(client: netconf.Client,error: ?netconf.NetconfError):
                 _log.debug("Rollback edit-config response received")
                 if error is not None:
                     _log.error("Rollback edit-config failed with NETCONF error", {"error": error})
@@ -190,24 +190,7 @@ actor DeviceInstance(auth: WorldCap, log_handler: logging.Handler, platform_name
 
                 # Apply the rollback configuration with default-operation=replace
                 _log.debug("Sending rollback edit-config with default-operation=replace")
-                # Use the rpc method directly to include default-operation=replace
-                nc_nsdefs = [(None, "urn:ietf:params:xml:ns:netconf:base:1.0")]
-                # Merge the RPC data with target-config
-                # Decode the target_config XML string into xml.Node objects to preserve
-                # structure. Direct assignment to text attribute of the <config> node
-                # would escape special characters, breaking the XML. We wrap the config
-                # in <data> tags for parsing because the config is likely to
-                # contain multiple top-level nodes, then use only the children.
-                # TODO: this is not very efficient as we decode the XML string to
-                # xml.Node only to encode the RPC document again right away.
-                target_config_xml = xml.decode("<data>{target_config}</data>")
-
-                children = [
-                    xml.Node("target", children=[xml.Node("candidate")]),
-                    xml.Node("default-operation", text="replace"),
-                    xml.Node("config", [("xc", "urn:ietf:params:xml:ns:netconf:base:1.0")], children=target_config_xml.children)
-                ]
-                client.rpc(xml.Node("edit-config", nc_nsdefs, children=children), on_edit_config_done)
+                client.edit_config(target_config, on_edit_config_done, datastore="candidate", default_operation="replace")
             else:
                 _log.error("NETCONF rollback connection failed - no client")
                 state = "ready"
