@@ -1162,10 +1162,12 @@ actor DeviceManager(config: SystemConfig, container_mgr: ContainerManager, auth:
 
     def get_device_for_request(platform_name: str) -> ?DeviceInstance:
         """Get or create a device for a request"""
-        # Simplified for now - just return first ready device
+        # Find a ready device for the specified platform
         for i in range(len(instances)):
             device = instances[i]
-            if device.get_state() == "ready":
+            info = instance_info[i]
+            info_platform = info.get("platform_name")
+            if device.get_state() == "ready" and isinstance(info_platform, str) and info_platform == platform_name:
                 return device
         return None
 
