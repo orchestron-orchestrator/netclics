@@ -90,6 +90,7 @@ actor DeviceInstance(auth: WorldCap, log_handler: logging.Handler, platform_name
     var state = "starting"  # starting, ready, busy, stopping, error
     var started_at = 0  # Timestamp when started
     var last_used_at = 0  # Timestamp of last use
+    var device_platform = platform  # Store platform type for use in methods
 
     # Schema storage
     var compiled_schema: ?yang.schema.DRoot = None  # Compiled YANG schema
@@ -117,7 +118,7 @@ actor DeviceInstance(auth: WorldCap, log_handler: logging.Handler, platform_name
         """Get device information for API responses"""
         instance_data = {
             "platform_name": platform_name,
-            "platform": platform,
+            "platform": device_platform,
             "instance_id": container_id,
             "ip_address": ip_address,
             "state": state,
@@ -565,8 +566,15 @@ actor DeviceInstance(auth: WorldCap, log_handler: logging.Handler, platform_name
             _log.error("CLI configuration failed", {"error": str(err), "response": response})
             callback(Exception("CLI configuration error: " + str(err)))
 
+        # Determine device type based on platform
+        device_type = "juniper_junos"  # Default
+        if device_platform == "cisco_iosxr":
+            device_type = "cisco_iosxr"
+        elif device_platform == "junos":
+            device_type = "juniper_junos"
+
         # Create router client
-        _log.info("Creating CLI client connection", {"host": ip_address, "port": ssh_port, "username": username})
+        _log.info("Creating CLI client connection", {"host": ip_address, "port": ssh_port, "username": username, "device_type": device_type})
         _log.debug("Password masked", {"password_length": len(password) if password is not None else 0})
 
         client = router_client.Client(
@@ -575,7 +583,7 @@ actor DeviceInstance(auth: WorldCap, log_handler: logging.Handler, platform_name
             username=username,
             password=password,
             port=ssh_port,
-            device_type="juniper_junos",  # Specify JUNOS device type
+            device_type=device_type,
             log_handler=log_handler
         )
 
@@ -620,8 +628,15 @@ actor DeviceInstance(auth: WorldCap, log_handler: logging.Handler, platform_name
                 _log.error("CLI config failed - received None response")
                 callback(None, Exception("CLI config failed"))
 
+        # Determine device type based on platform
+        device_type = "juniper_junos"  # Default
+        if device_platform == "cisco_iosxr":
+            device_type = "cisco_iosxr"
+        elif device_platform == "junos":
+            device_type = "juniper_junos"
+
         # Create router client
-        _log.info("Creating CLI utility client", {"host": ip_address, "port": ssh_port, "username": username})
+        _log.info("Creating CLI utility client", {"host": ip_address, "port": ssh_port, "username": username, "device_type": device_type})
         _log.debug("Password masked", {"password_length": len(password) if password is not None else 0})
 
         client = router_client.Client(
@@ -630,7 +645,7 @@ actor DeviceInstance(auth: WorldCap, log_handler: logging.Handler, platform_name
             username=username,
             password=password,
             port=ssh_port,
-            device_type="juniper_junos",  # Specify JUNOS device type
+            device_type=device_type,
             log_handler=log_handler
         )
 
@@ -769,8 +784,15 @@ actor DeviceInstance(auth: WorldCap, log_handler: logging.Handler, platform_name
             state = "ready"
             result_callback(None, Exception("CLI show configuration error: " + str(error)))
 
+        # Determine device type based on platform
+        device_type = "juniper_junos"  # Default
+        if device_platform == "cisco_iosxr":
+            device_type = "cisco_iosxr"
+        elif device_platform == "junos":
+            device_type = "juniper_junos"
+
         # Create router client
-        _log.info("Creating CLI client connection", {"host": ip_address, "port": ssh_port, "username": username})
+        _log.info("Creating CLI client connection", {"host": ip_address, "port": ssh_port, "username": username, "device_type": device_type})
         _log.debug("Password masked", {"password_length": len(password) if password is not None else 0})
 
         client = router_client.Client(
@@ -779,7 +801,7 @@ actor DeviceInstance(auth: WorldCap, log_handler: logging.Handler, platform_name
             username=username,
             password=password,
             port=ssh_port,
-            device_type="juniper_junos",  # Specify JUNOS device type
+            device_type=device_type,
             log_handler=log_handler
         )
 
@@ -841,8 +863,18 @@ actor DeviceInstance(auth: WorldCap, log_handler: logging.Handler, platform_name
                 _log.error("CLI diff failed - received None response")
                 result_callback(None, Exception("CLI diff failed"))
 
+        # Determine device type and diff command based on platform
+        device_type = "juniper_junos"  # Default
+        diff_command = "show configuration | compare rollback 1"  # Default Juniper command
+        if device_platform == "cisco_iosxr":
+            device_type = "cisco_iosxr"
+            diff_command = "show configuration commit changes last 1"
+        elif device_platform == "junos":
+            device_type = "juniper_junos"
+            diff_command = "show configuration | compare rollback 1"
+
         # Create router client
-        _log.info("Creating CLI client for diff", {"host": ip_address, "port": ssh_port, "username": username})
+        _log.info("Creating CLI client for diff", {"host": ip_address, "port": ssh_port, "username": username, "device_type": device_type})
         _log.debug("Password masked", {"password_length": len(password) if password is not None else 0})
 
         client = router_client.Client(
@@ -851,15 +883,15 @@ actor DeviceInstance(auth: WorldCap, log_handler: logging.Handler, platform_name
             username=username,
             password=password,
             port=ssh_port,
-            device_type="juniper_junos",  # Specify JUNOS device type
+            device_type=device_type,
             log_handler=log_handler
         )
 
         # Wait for connection and get diff
         def try_get_diff(attempt: int):
             if client.is_connected():
-                _log.debug("CLI client connected, sending diff command")
-                client.cmd(on_cmd_complete, "show configuration | compare rollback 1")
+                _log.debug("CLI client connected, sending diff command", {"command": diff_command})
+                client.cmd(on_cmd_complete, diff_command)
             elif attempt < 10:  # Retry for up to 5 seconds (10 attempts * 500ms)
                 _log.debug("CLI client not ready for diff, retrying", {"attempt": attempt + 1})
                 after 0.5: try_get_diff(attempt + 1)
@@ -1936,6 +1968,23 @@ def get_default_config() -> SystemConfig:
                     username="clab",
                     password="clab@123",
                     description="Local cRPD instance"
+                )
+            ]
+        ),
+        # Local Cisco IOS XRd static instance
+        PlatformConfig(
+            name="iosxrd 24.1.1-local",
+            platform="cisco_iosxr",
+            instances=[
+                InstanceSpec(
+                    id="local-iosxrd",
+                    host="127.0.0.1",
+                    netconf_port=830,
+                    ssh_port=22,
+                    restconf_port=32775,
+                    username="clab",
+                    password="clab@123",
+                    description="Local IOS XRd instance"
                 )
             ]
         ),
