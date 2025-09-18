@@ -1062,8 +1062,11 @@ actor DeviceInstance(auth: WorldCap, log_handler: logging.Handler, platform_name
                 if schema_data is not None:
                     schema_identifier = schema.identifier
                     if schema_identifier is not None:
-                        # Skip junos-rpc schemas as they're not needed, and also don't compile :/
-                        if schema_identifier.startswith("junos-rpc"):
+                        # Skip models:
+                        # - junos-rpc: all RPC modules use an undefined grouping?!
+                        # - openconfig: on Cisco IOS XRd openconfig-mpls.yang doesn't compile because submodule overrides prefix of parent import
+                        if schema_identifier.startswith("junos-rpc") or "openconfig" in schema_identifier:
+                            _log.debug("Skipping {schema_identifier}")
                             return
                         _log.debug("Downloaded schema", {"identifier": schema_identifier, "index": current_index + 1, "total": total_schemas})
                         schema_list.append(schema_data)
