@@ -13,8 +13,14 @@ jobs:
         with:
           channel: 'tip'
 
-      - name: "Check out repository code"
-        uses: actions/checkout@v4
+      - name: Set up env for containers
+        run: |
+          # IOS XRd
+          sudo sysctl -w fs.inotify.max_user_instances=64000
+          # cRPD
+          sudo apt-get update
+          sudo apt-get install -qy linux-modules-extra-$(uname -r)
+          sudo modprobe mpls_router mpls_gso vrf
 
       - name: "Install dependencies"
         run: |
@@ -22,8 +28,8 @@ jobs:
           sudo apt-get install -y libxml2-utils jq sshpass
           curl --proto '=https' --tlsv1.2 -sSf https://just.systems/install.sh | bash -s -- --to /usr/local/bin
 
-      - name: "Build NETCLICS"
-        run: just build
+      - name: "Check out repository code"
+        uses: actions/checkout@v4
 
       - name: "Check out licenses repo"
         uses: actions/checkout@v4
@@ -37,8 +43,11 @@ jobs:
         run: |
           echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
 
-      - name: "Start static instances (cRPD container)"
+      - name: "Start static instances (cRPD and XRd container)"
         run: just start-static-instances
+
+      - name: "Build NETCLICS"
+        run: just build
 
       - name: "Wait for cRPD to be ready"
         run: |
@@ -89,6 +98,22 @@ jobs:
 
       - name: "Test NETCONF error handling"
         run: just test-netconf-error
+
+      # IOS XRd Tests
+      - name: "Test IOS XRd CLI to Acton adata conversion"
+        run: just test-iosxrd-cli-to-acton-adata
+
+      - name: "Test IOS XRd CLI to CLI roundtrip"
+        run: just test-iosxrd-cli-to-cli
+
+      - name: "Test IOS XRd NETCONF to CLI conversion"
+        run: just test-iosxrd-netconf-to-cli
+
+      - name: "Test IOS XRd CLI to NETCONF conversion"
+        run: just test-iosxrd-cli-to-netconf
+
+      - name: "Test IOS XRd CLI to JSON conversion"
+        run: just test-iosxrd-cli-to-json
 
       # MCP Protocol Tests
       - name: "Test MCP initialize"

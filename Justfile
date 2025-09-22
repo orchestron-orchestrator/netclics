@@ -18,12 +18,18 @@ build-ldep:
 
 IMAGE_PATH := env_var_or_default("IMAGE_PATH", "ghcr.io/orchestron-orchestrator/")
 
-start-static-instances:
-    docker run -d --name crpd1 --rm --privileged --publish 42830:830 --publish 42022:22 -v ./test/crpd-startup.conf:/juniper.conf -v ./router-licenses/juniper_crpd24.lic:/config/license/juniper_crpd24.lic {{IMAGE_PATH}}crpd:24.4R1.9
+start-static-instances-crpd:
+    docker run -td --name crpd1 --rm --privileged --publish 42830:830 --publish 42022:22 -v ./test/crpd-startup.conf:/juniper.conf -v ./router-licenses/juniper_crpd24.lic:/config/license/juniper_crpd24.lic {{IMAGE_PATH}}crpd:24.4R1.9
     docker exec crpd1 cli -c "configure private; load merge /juniper.conf; commit"
 
+start-static-instances-xrd:
+    docker run -td --name xrd1 --rm --privileged --publish 43830:830 --publish 43022:22 -v ./test/xrd-startup.conf:/etc/xrd/first-boot.cfg --env XR_FIRST_BOOT_CONFIG=/etc/xrd/first-boot.cfg --env XR_MGMT_INTERFACES="linux:eth0,xr_name=Mg0/RP0/CPU0/0,chksum,snoop_v4,snoop_v6" {{IMAGE_PATH}}ios-xr/xrd-control-plane:24.1.1
+
+# Start both cRPD and XRD static instances
+start-static-instances: start-static-instances-crpd start-static-instances-xrd
+
 stop-static-instances:
-    docker stop crpd1
+    docker stop crpd1 xrd1 || true
 
 # Show available platforms
 platforms:
@@ -257,6 +263,94 @@ test-mcp-instances:
 
 # MCP: Test all endpoints
 test-mcp-all: test-mcp-initialize test-mcp-tools-list test-mcp-platforms test-mcp-instances test-mcp-convert
+
+# Test IOS XRd CLI to Acton adata conversion
+test-iosxrd-cli-to-acton-adata:
+    #!/usr/bin/env bash
+    RESULT=$(curl -s -X POST http://localhost:8080/api/v1/convert \
+      -H "Content-Type: application/json" \
+      -d '{
+        "input": "interface GigabitEthernet0/0/0/1\n description \"IOS XRd test interface\"\n ipv4 address 10.1.1.1 255.255.255.0\n no shutdown",
+        "format": "cli",
+        "target_format": "acton-adata",
+        "platform": "iosxrd 24.1.1-local"
+      }')
+    echo "$RESULT" | jq .
+
+    echo ""
+    echo "=== Configuration Diff ==="
+    echo "$RESULT" | jq -r '.diff'
+
+# Test IOS XRd CLI to CLI roundtrip
+test-iosxrd-cli-to-cli:
+    #!/usr/bin/env bash
+    RESULT=$(curl -s -X POST http://localhost:8080/api/v1/convert \
+      -H "Content-Type: application/json" \
+      -d '{
+        "input": "interface GigabitEthernet0/0/0/2\n description \"IOS XRd CLI roundtrip\"\n ipv4 address 10.2.2.1 255.255.255.0\n no shutdown",
+        "format": "cli",
+        "target_format": "cli",
+        "platform": "iosxrd 24.1.1-local"
+      }')
+    echo "$RESULT" | jq .
+
+    echo ""
+    echo "=== Configuration Diff ==="
+    echo "$RESULT" | jq -r '.diff'
+
+# Test IOS XRd NETCONF to CLI conversion
+test-iosxrd-netconf-to-cli:
+    #!/usr/bin/env bash
+    RESULT=$(curl -s -X POST http://localhost:8080/api/v1/convert \
+      -H "Content-Type: application/json" \
+      -d '{
+        "input": "<configuration><interfaces xmlns=\"http://openconfig.net/yang/interfaces\"><interface><name>GigabitEthernet0/0/0/3</name><config><name>GigabitEthernet0/0/0/3</name><description>IOS XRd NETCONF test</description></config></interface></interfaces></configuration>",
+        "format": "netconf",
+        "target_format": "cli",
+        "platform": "iosxrd 24.1.1-local"
+      }')
+    echo "$RESULT" | jq .
+
+    echo ""
+    echo "=== Configuration Diff ==="
+    echo "$RESULT" | jq -r '.diff'
+
+# Test IOS XRd CLI to NETCONF conversion
+test-iosxrd-cli-to-netconf:
+    #!/usr/bin/env bash
+    RESULT=$(curl -s -X POST http://localhost:8080/api/v1/convert \
+      -H "Content-Type: application/json" \
+      -d '{
+        "input": "interface GigabitEthernet0/0/0/4\n description \"IOS XRd to NETCONF\"\n ipv4 address 10.4.4.1 255.255.255.0\n no shutdown",
+        "format": "cli",
+        "target_format": "netconf",
+        "platform": "iosxrd 24.1.1-local"
+      }')
+    echo "$RESULT" | jq .
+
+    echo ""
+    echo "=== Configuration Diff ==="
+    echo "$RESULT" | jq -r '.diff'
+
+# Test IOS XRd CLI to JSON conversion
+test-iosxrd-cli-to-json:
+    #!/usr/bin/env bash
+    RESULT=$(curl -s -X POST http://localhost:8080/api/v1/convert \
+      -H "Content-Type: application/json" \
+      -d '{
+        "input": "interface GigabitEthernet0/0/0/5\n description \"IOS XRd to JSON\"\n ipv4 address 10.5.5.1 255.255.255.0\n no shutdown",
+        "format": "cli",
+        "target_format": "json",
+        "platform": "iosxrd 24.1.1-local"
+      }')
+    echo "$RESULT" | jq .
+
+    echo ""
+    echo "=== Configuration Diff ==="
+    echo "$RESULT" | jq -r '.diff' | jq .
+
+# Run all IOS XRd tests
+test-iosxrd-all: test-iosxrd-cli-to-acton-adata test-iosxrd-cli-to-cli test-iosxrd-netconf-to-cli test-iosxrd-cli-to-netconf test-iosxrd-cli-to-json
 
 # Clean up build artifacts
 clean:
