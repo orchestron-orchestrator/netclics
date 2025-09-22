@@ -23,7 +23,31 @@ start-static-instances-crpd:
     docker exec crpd1 cli -c "configure private; load merge /juniper.conf; commit"
 
 start-static-instances-xrd:
-    docker run -td --name xrd1 --rm --privileged --publish 43830:830 --publish 43022:22 -v ./test/xrd-startup.conf:/etc/xrd/first-boot.cfg --env XR_FIRST_BOOT_CONFIG=/etc/xrd/first-boot.cfg --env XR_MGMT_INTERFACES="linux:eth0,xr_name=Mg0/RP0/CPU0/0,chksum,snoop_v4,snoop_v6" {{IMAGE_PATH}}ios-xr/xrd-control-plane:24.1.1
+    #!/usr/bin/env bash
+    set -e
+    # Build XR_INTERFACES environment variable with GigabitEthernet interfaces
+    # Format: Gi0/0/0/port - XRd only supports 0/0/0/<port> format
+    XR_INTERFACES=""
+    for port in {0..23}; do
+        if [ -n "$XR_INTERFACES" ]; then
+            XR_INTERFACES="${XR_INTERFACES};"
+        fi
+        XR_INTERFACES="${XR_INTERFACES}linux:Gi0-0-0-${port},xr_name=Gi0/0/0/${port}"
+    done
+
+    # Start XRd container with all interface mappings
+    docker run -td --name xrd1 --rm --privileged \
+        --publish 43830:830 --publish 43022:22 \
+        -v ./test/xrd-startup.conf:/etc/xrd/first-boot.cfg \
+        --env XR_FIRST_BOOT_CONFIG=/etc/xrd/first-boot.cfg \
+        --env XR_MGMT_INTERFACES="linux:eth0,xr_name=Mg0/RP0/CPU0/0,chksum,snoop_v4,snoop_v6" \
+        --env XR_INTERFACES="$XR_INTERFACES" \
+        {{IMAGE_PATH}}ios-xr/xrd-control-plane:24.1.1
+
+    # Create GigabitEthernet dummy interfaces (48 ports on slot 0)
+    for port in {0..23}; do
+        docker exec xrd1 ip link add Gi0-0-0-${port} type dummy
+    done
 
 # Start both cRPD and XRD static instances
 start-static-instances: start-static-instances-crpd start-static-instances-xrd
