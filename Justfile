@@ -18,12 +18,18 @@ build-ldep:
 
 IMAGE_PATH := env_var_or_default("IMAGE_PATH", "ghcr.io/orchestron-orchestrator/")
 
-start-static-instances:
-    docker run -d --name crpd1 --rm --privileged --publish 42830:830 --publish 42022:22 -v ./test/crpd-startup.conf:/juniper.conf -v ./router-licenses/juniper_crpd24.lic:/config/license/juniper_crpd24.lic {{IMAGE_PATH}}crpd:24.4R1.9
+start-static-instances-crpd:
+    docker run -td --name crpd1 --rm --privileged --publish 42830:830 --publish 42022:22 -v ./test/crpd-startup.conf:/juniper.conf -v ./router-licenses/juniper_crpd24.lic:/config/license/juniper_crpd24.lic {{IMAGE_PATH}}crpd:24.4R1.9
     docker exec crpd1 cli -c "configure private; load merge /juniper.conf; commit"
 
+start-static-instances-xrd:
+    docker run -td --name xrd1 --rm --privileged --publish 43830:830 --publish 43022:22 -v ./test/xrd-startup.conf:/etc/xrd/first-boot.cfg --env XR_FIRST_BOOT_CONFIG=/etc/xrd/first-boot.cfg --env XR_MGMT_INTERFACES="linux:eth0,xr_name=Mg0/RP0/CPU0/0,chksum,snoop_v4,snoop_v6" {{IMAGE_PATH}}ios-xr/xrd-control-plane:24.1.1
+
+# Start both cRPD and XRD static instances
+start-static-instances: start-static-instances-crpd start-static-instances-xrd
+
 stop-static-instances:
-    docker stop crpd1
+    docker stop crpd1 xrd1 || true
 
 # Show available platforms
 platforms:
