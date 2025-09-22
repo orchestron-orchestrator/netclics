@@ -223,7 +223,7 @@ actor DeviceInstance(auth: WorldCap, log_handler: logging.Handler, platform_name
         # Local variables for this conversion only
         base_gdata: ?yang.gdata.Node = None
         final_gdata: ?yang.gdata.Node = None
-        rollback_xml: ?str = None
+        base_xml: ?xml.Node = None
 
         # Variables to hold formatted configs
         base_config_formatted = ""
@@ -248,19 +248,8 @@ actor DeviceInstance(auth: WorldCap, log_handler: logging.Handler, platform_name
                 _log.warning("Unknown target format, using XML", {"target_format": target_format})
                 return gdata.to_xmlstr(name="configuration", pretty=True)
 
-        # Helper function to extract configuration element from raw XML
-        def extract_config_from_xml(raw_xml: str) -> str:
-            # The raw_xml is already just the <data> element content
-            # Find the <configuration> element within it
-            config_start = raw_xml.find("<configuration")
-            config_end = raw_xml.find("</configuration>") + len("</configuration>")
-            if config_start != -1 and config_end != -1:
-                return raw_xml[config_start:config_end]
-            else:
-                _log.warning("Could not find configuration element, using full XML")
-                return raw_xml
 
-        def on_base_config_retrieved(config_tuple: ?(raw: str, gdata: yang.gdata.Node), error: ?Exception):
+        def on_base_config_retrieved(config_tuple: ?(raw: xml.Node, gdata: yang.gdata.Node), error: ?Exception):
             """Step 1: Process the retrieved base configuration"""
             if error is not None:
                 _log.error("Failed to retrieve base configuration", {"error": str(error)})
@@ -273,13 +262,13 @@ actor DeviceInstance(auth: WorldCap, log_handler: logging.Handler, platform_name
                 return
 
             if config_tuple is not None:
-                raw_xml: str = config_tuple.raw
+                raw_xml: xml.Node = config_tuple.raw
                 parsed_gdata: yang.gdata.Node = config_tuple.gdata
 
                 _log.info("Base configuration retrieved and parsed successfully")
 
                 # Store for later use
-                rollback_xml = raw_xml  # Save raw XML for rollback
+                base_xml = raw_xml  # Save raw XML node for rollback
                 base_gdata = parsed_gdata  # Save parsed data for diff
 
                 # Format base config for response
@@ -319,7 +308,7 @@ actor DeviceInstance(auth: WorldCap, log_handler: logging.Handler, platform_name
             _log.info("Input applied successfully, getting final configuration")
             _get_netconf_config_parsed(on_final_config_retrieved)
 
-        def on_final_config_retrieved(config_tuple: ?(raw: str, gdata: yang.gdata.Node), error: ?Exception):
+        def on_final_config_retrieved(config_tuple: ?(raw: xml.Node, gdata: yang.gdata.Node), error: ?Exception):
             """Step 4: Process the retrieved final configuration"""
             if error is not None:
                 _log.error("Failed to retrieve final configuration", {"error": str(error)})
@@ -332,7 +321,7 @@ actor DeviceInstance(auth: WorldCap, log_handler: logging.Handler, platform_name
                 return
 
             if config_tuple is not None:
-                final_raw_xml: str = config_tuple.raw
+                final_raw_xml: xml.Node = config_tuple.raw
                 final_parsed_gdata: yang.gdata.Node = config_tuple.gdata
 
                 _log.info("Final configuration retrieved and parsed successfully")
@@ -387,15 +376,16 @@ actor DeviceInstance(auth: WorldCap, log_handler: logging.Handler, platform_name
             computed_diff = diff_text if diff_text is not None else ""
 
             # Start rollback process using saved XML
-            if rollback_xml is not None:
-                extracted_config = extract_config_from_xml(rollback_xml)
+            if base_xml is not None:
                 _log.info("Starting automatic rollback to clean device state using NETCONF")
-                config_preview = extracted_config[:200] if len(extracted_config) > 200 else extracted_config
+                # Extract children without <data> wrapper for rollback
+                rollback_config = "\n".join([xml.encode(c) for c in base_xml.children])
+                config_preview = rollback_config[:200] if len(rollback_config) > 200 else rollback_config
                 _log.debug("Extracted config for rollback", {"config_preview": config_preview})
-                _rollback_to_config(extracted_config, lambda error: on_rollback_complete(computed_diff, error))
+                _rollback_to_config(rollback_config, lambda error: on_rollback_complete(computed_diff, error))
             else:
-                _log.error("No rollback XML available")
-                on_rollback_complete(computed_diff, Exception("No rollback XML available"))
+                _log.error("No base XML available")
+                on_rollback_complete(computed_diff, Exception("No base XML available"))
 
         def on_rollback_complete(diff_text: str, rollback_error: ?Exception):
             """Step 7: Rollback complete, finish the conversion"""
@@ -649,7 +639,7 @@ actor DeviceInstance(auth: WorldCap, log_handler: logging.Handler, platform_name
         _log.debug("Waiting for CLI utility client to connect")
         after 0.1: try_get_config(0)  # Start checking after 100ms
 
-    def _get_netconf_config_parsed(result_callback: action(?(raw: str, gdata: yang.gdata.Node), ?Exception) -> None):
+    def _get_netconf_config_parsed(result_callback: action(?(raw: xml.Node, gdata: yang.gdata.Node), ?Exception) -> None):
         """Get NETCONF config and parse it with schemas
 
         Returns a tuple of (raw_xml, parsed_gdata) to the callback on success, or None with an exception on failure.
@@ -681,26 +671,25 @@ actor DeviceInstance(auth: WorldCap, log_handler: logging.Handler, platform_name
                     result_callback(None, Exception("Get-config failed with NETCONF error: " + str(error)))
                 elif response is not None:
                     # Extract the <data> element from the RPC reply
-                    data_node: ?xml.Node = None
+                    config_xml: ?xml.Node = None
                     for child in response.children:
                         if child.tag == "data":
-                            data_node = child
+                            config_xml = child
                             break
 
-                    if data_node is not None:
-                        raw_xml = xml.encode(data_node)
-                        _log.debug("Got raw XML", {"length": len(raw_xml)})
+                    if config_xml is not None:
+                        _log.debug("Got raw XML", {"length": len(xml.encode(config_xml))})
 
                         # Parse with schemas - this is required for conversion
                         if compiled_schema is not None:
                             try:
                                 _log.info("Parsing XML with gen3 schemas")
-                                parsed_gdata = yang.gen3.from_xml(compiled_schema, data_node, loose=True)
+                                parsed_gdata = yang.gen3.from_xml(compiled_schema, config_xml, loose=True)
                                 _log.info("Successfully parsed to gdata")
 
                                 # Close connection and return results
                                 client.close()
-                                result_callback((raw=raw_xml, gdata=parsed_gdata), None)
+                                result_callback((raw=config_xml, gdata=parsed_gdata), None)
                             except Exception as e:
                                 _log.error("Failed to parse with gen3 - cannot proceed", {"error": str(e)})
                                 client.close()
