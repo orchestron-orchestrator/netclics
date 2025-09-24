@@ -11,7 +11,6 @@ import yang
 import yang.gen3
 import yang.gdata
 import yang.schema
-import schema_getter
 
 
 actor ContainerManager(proc_cap: process.ProcessCap, log_handler: logging.Handler):
@@ -1055,26 +1054,28 @@ actor DeviceInstance(auth: WorldCap, log_handler: logging.Handler, platform_name
             _log.info("Connected to device for schema initialization")
 
             # Create SchemaGetter actor
-            sg = schema_getter.SchemaGetter(client, log_handler)
+            sg = netconf.SchemaGetter(client)
 
             # Callback for each schema download
-            def on_schema_download(current_index: int, total_schemas: int, schema: (identifier: ?str, namespace: ?str, version: ?str, format: ?str), schema_data: ?str):
-                if schema_data is not None:
-                    schema_identifier = schema.identifier
-                    if schema_identifier is not None:
-                        # Skip models:
-                        # - junos-rpc: all RPC modules use an undefined grouping?!
-                        # - openconfig: on Cisco IOS XRd openconfig-mpls.yang doesn't compile because submodule overrides prefix of parent import
-                        if schema_identifier.startswith("junos-rpc") or "openconfig" in schema_identifier:
-                            _log.debug("Skipping {schema_identifier}")
-                            return
-                        _log.debug("Downloaded schema", {"identifier": schema_identifier, "index": current_index + 1, "total": total_schemas})
-                        schema_list.append(schema_data)
+            def on_schema_download(current_index: int, total_schemas: int, schema: (identifier: str, namespace: ?str, version: ?str, format: str), schema_data: ?str, error: ?netconf.NetconfError):
+                if error is not None:
+                    _log.error("Error downloading", {"identifier": schema.identifier, "index": current_index, "total": total_schemas, "error": error.error_message})
+                elif schema_data is not None:
+                    # Skip models:
+                    # - junos-rpc: all RPC modules use an undefined grouping?!
+                    # - openconfig: on Cisco IOS XRd openconfig-mpls.yang doesn't compile because submodule overrides prefix of parent import
+                    if schema.identifier.startswith("junos-rpc") or "openconfig" in schema.identifier:
+                        _log.debug("Skipping {schema.identifier}")
+                        return
+                    _log.debug("Downloaded schema", {"identifier": schema.identifier, "index": current_index, "total": total_schemas, "data": schema_data[:20]})
+                    schema_list.append(schema_data)
+                else:
+                    _log.warning("Empty schema data", {"identifier": schema.identifier, "index": current_index, "total": total_schemas})
 
             # Callback when all schemas are complete
             def on_schemas_complete(error: ?netconf.NetconfError):
                 if error is not None:
-                    _log.error("Error during schema download", {"error": error})
+                    _log.error("Error during schema download", {"error": error.error_message})
                     # Continue anyway - device can work without schemas
 
                 _log.info("All schemas downloaded", {"count": len(schema_list)})

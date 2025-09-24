@@ -2,13 +2,13 @@
     "dependencies": {
         "yang": {
             "repo_url": "https://github.com/orchestron-orchestrator/acton-yang.git",
-            "url": "https://github.com/orchestron-orchestrator/acton-yang/archive/8064e36baf26de48e6e6892dc2592439bd894b04.zip",
-            "hash": "12209264d406f4c72048ce6e066fe10959b74add7dab5b959498eb287a79a607bffd"
+            "url": "https://github.com/orchestron-orchestrator/acton-yang/archive/017ca9024cda60cf608b9281f8d9f99a292caeeb.zip",
+            "hash": "12209bf45896aab091ba640b7bac53487dd57f3fe480c37e93f166d51d8b5046f1c1"
         },
         "netconf": {
             "repo_url": "https://github.com/orchestron-orchestrator/netconf.git",
-            "url": "https://github.com/orchestron-orchestrator/netconf/archive/7798b44931328cd386441afec1e1a4568c3bf023.zip",
-            "hash": "12205567d8b25a647a9cdfd6d4a387da97659ae278f937fa9e918c3e6fb95a003cd3"
+            "url": "https://github.com/orchestron-orchestrator/netconf/archive/ec9358d5629e102dd3a9161713c0ab360d3df188.zip",
+            "hash": "122029ab2319806826dcfbb8d239866a40736739138ad0779b15573680225f749de4"
         },
         "netcli": {
             "repo_url": "https://github.com/orchestron-orchestrator/netcli.git",
