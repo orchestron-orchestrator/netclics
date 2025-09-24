@@ -44,6 +44,7 @@ start-static-instances-xrd:
         --env XR_INTERFACES="$XR_INTERFACES" \
         {{IMAGE_PATH}}ios-xr/xrd-control-plane:24.1.1
 
+    sleep 1
     # Create GigabitEthernet dummy interfaces (48 ports on slot 0)
     for port in {0..23}; do
         docker exec xrd1 ip link add Gi0-0-0-${port} type dummy
