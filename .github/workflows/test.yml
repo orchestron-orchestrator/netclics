@@ -15,9 +15,6 @@ jobs:
 
       - name: Set up env for containers
         run: |
-          # Disable AppArmor (interferes with creating dummy interfaces for Cisco IOS XRd)
-          sudo aa-teardown || true
-          sudo systemctl disable --now apparmor.service
           # IOS XRd
           sudo sysctl -w fs.inotify.max_user_instances=64000
           # cRPD
