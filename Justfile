@@ -377,6 +377,24 @@ test-iosxrd-cli-to-json:
     echo "=== Configuration Diff ==="
     echo "$RESULT" | jq -r '.diff' | jq .
 
+# Test IOS XRd CLI to Acton adata conversion with unified-model module-set
+test-iosxrd-cli-to-acton-adata-unified-model:
+    #!/usr/bin/env bash
+    RESULT=$(curl -s -X POST http://localhost:8080/api/v1/convert \
+      -H "Content-Type: application/json" \
+      -d '{
+        "input": "interface GigabitEthernet0/0/0/6\n description \"IOS XRd unified-model test\"\n ipv4 address 10.6.6.1 255.255.255.0\n no shutdown",
+        "format": "cli",
+        "target_format": "acton-adata",
+        "platform": "iosxrd 24.1.1-local",
+        "module_set": "cisco-xr-unified-model"
+      }')
+    echo "$RESULT" | jq .
+
+    echo ""
+    echo "=== Configuration Diff ==="
+    echo "$RESULT" | jq -r '.diff'
+
 # Run all IOS XRd tests
 test-iosxrd-all: test-iosxrd-cli-to-acton-adata test-iosxrd-cli-to-cli test-iosxrd-netconf-to-cli test-iosxrd-cli-to-netconf test-iosxrd-cli-to-json
 
