@@ -35,12 +35,15 @@ start-static-instances-xrd:
         XR_INTERFACES="${XR_INTERFACES}linux:Gi0-0-0-${port},xr_name=Gi0/0/0/${port}"
     done
 
-    # Start XRd container with all interface mappings
+    # Start XRd container with all interface mappings to dummy Gi0/0/0/X interfaces
+    # We use the snoop* flags to indicate that IPv4/IPv6 management interface
+    # settings should be snooped from the eth0 (container) interface:
+    # https://xrdocs.io/virtual-routing/tutorials/2022-08-25-user-interface-and-knobs-for-xrd/
     docker run -td --name xrd1 --rm --privileged \
         --publish 43830:830 --publish 43022:22 \
         -v ./test/xrd-startup.conf:/etc/xrd/first-boot.cfg \
         --env XR_FIRST_BOOT_CONFIG=/etc/xrd/first-boot.cfg \
-        --env XR_MGMT_INTERFACES="linux:eth0,xr_name=Mg0/RP0/CPU0/0,chksum,snoop_v4,snoop_v6" \
+        --env XR_MGMT_INTERFACES="linux:eth0,xr_name=Mg0/RP0/CPU0/0,chksum,snoop_v4,snoop_v4_default_route,snoop_v6,snoop_v6_default_route" \
         --env XR_INTERFACES="$XR_INTERFACES" \
         {{IMAGE_PATH}}ios-xr/xrd-control-plane:24.1.1
 
