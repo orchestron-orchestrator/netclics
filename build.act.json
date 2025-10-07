@@ -7,8 +7,8 @@
         },
         "netconf": {
             "repo_url": "https://github.com/orchestron-orchestrator/netconf.git",
-            "url": "https://github.com/orchestron-orchestrator/netconf/archive/40e4ac2d3772f82100ed80be3ede4570f9850813.zip",
-            "hash": "122083a088be74f823276c0a8975a81f82292178cc98c0ed71a37a4e88e550dc27c2"
+            "url": "https://github.com/orchestron-orchestrator/netconf/archive/7a9a0eb87c1bc0d6a69a0f6ccddafd0b12ce80f5.zip",
+            "hash": "1220a7991b5c512d210b27cac0a2979b2c85463ba16580d5e48f7548371e36bb8e3f"
         },
         "netcli": {
             "repo_url": "https://github.com/orchestron-orchestrator/netcli.git",
