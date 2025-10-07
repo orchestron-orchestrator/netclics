@@ -1051,11 +1051,13 @@ actor DeviceInstance(auth: WorldCap, log_handler: logging.Handler, platform_name
             username, password = creds
         else:
             _log.error("No credentials available for RFC compliance configuration")
+            state = "error"
             return
 
         def on_connect(client: netconf.Client, error: ?Exception):
             if error is not None:
                 _log.error("Failed to connect for RFC compliance configuration", {"error": error})
+                state = "error"
                 return
 
             _log.info("Connected for RFC compliance configuration")
