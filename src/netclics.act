@@ -157,8 +157,11 @@ actor DeviceInstance(auth: WorldCap, log_handler: logging.Handler, platform_name
 
     # Map module-sets which are include and exclude patterns to expanded YANG module names
     var expanded_module_sets: dict[str, set[_SchemaId]] = {}
-    # Store compiled module-set schema hashes
-    var compiled_schemas: dict[str, u64] = {}
+    # Store compiled module-set schema hashes. The hash value is None for
+    # schemas that have not yet compiled or have compilation errors.
+    var compiled_schemas: dict[str, ?u64] = {}
+    # Track schema compilation errors for module-set
+    var compiled_schemas_errors: dict[str, str] = {}
 
     # Raw downloaded schemas, I guess we could expose these via API?
     var schema_dict: dict[_SchemaId, str] = {}
@@ -196,7 +199,29 @@ actor DeviceInstance(auth: WorldCap, log_handler: logging.Handler, platform_name
             desc = instance_spec.description
             if desc is not None:
                 instance_data["description"] = desc
+
+        msi = {}
+        for name, schema_hash in compiled_schemas.items():
+            # This logic is equivalent to get_compiled_schema(), but we avoid
+            # actually fetching the schema, just check the error state
+            if schema_hash is not None:
+                msi[name] = {"compiled": True, "error": None}
+            elif name in compiled_schemas_errors:
+                msi[name] = {"compiled": False, "error": compiled_schemas_errors[name]}
+            else:
+                msi[name] = {"compiled": False, "error": "Schema not compiled"}
+        instance_data["module_sets"] = msi
+
         return instance_data
+
+    def get_compiled_schema(module_set_name) -> (?yang.schema.DRoot, ?str):
+        h = compiled_schemas.get(module_set_name)
+        if h is not None:
+            return (schema_registry.get_schema(h), None)
+        elif module_set_name in compiled_schemas_errors:
+            return (None, compiled_schemas_errors[module_set_name])
+        else:
+            return (None, "Schema not compiled")
 
     def validate_module_set(module_set: str) -> ?str:
         """Validate if the requested module_set is available. Returns error message if invalid, None if valid."""
@@ -314,11 +339,11 @@ actor DeviceInstance(auth: WorldCap, log_handler: logging.Handler, platform_name
             elif target_format == "acton-gdata":
                 return gdata.prsrc()
             elif target_format == "acton-adata":
-                compiled_schema = schema_registry.get_schema(compiled_schemas.get(request.module_set))
+                compiled_schema, error = get_compiled_schema(request.module_set)
                 if compiled_schema is not None:
                     return yang.gen3.pradata(compiled_schema, gdata, loose=True, self_name="dev")
                 else:
-                    _log.warning("No compiled schema for adata conversion, using gdata")
+                    _log.warning("No compiled schema for adata conversion, using gdata", {"error": compiled_schema})
                     return gdata.prsrc()
             elif target_format in ["netconf", "xml"]:
                 return gdata.to_xmlstr(name="configuration", pretty=True)
@@ -780,7 +805,7 @@ actor DeviceInstance(auth: WorldCap, log_handler: logging.Handler, platform_name
                         _log.debug("Got raw XML", {"length": len(xml.encode(config_xml))})
 
                         # Parse with schemas - this is required for conversion
-                        compiled_schema = schema_registry.get_schema(compiled_schemas.get(module_set))
+                        compiled_schema, serror = get_compiled_schema(module_set)
                         if compiled_schema is not None:
                             try:
                                 _log.info("Parsing XML with gen3 schemas")
@@ -795,7 +820,7 @@ actor DeviceInstance(auth: WorldCap, log_handler: logging.Handler, platform_name
                                 client.close()
                                 result_callback(None, Exception("Failed to parse with gen3: " + str(e)))
                         else:
-                            _log.error("No compiled schema available - cannot proceed with conversion")
+                            _log.error("No compiled schema available - cannot proceed with conversion", {"error": serror})
                             client.close()
                             result_callback(None, Exception("No compiled schema available - cannot proceed with conversion"))
                     else:
@@ -1001,11 +1026,11 @@ actor DeviceInstance(auth: WorldCap, log_handler: logging.Handler, platform_name
                             return diff_result.prsrc()
                         elif target_format == "acton-adata":
                             # Convert diff to adata format if schema is available
-                            compiled_schema = schema_registry.get_schema(compiled_schemas.get(module_set))
+                            compiled_schema, error = get_compiled_schema(module_set)
                             if compiled_schema is not None:
                                 return yang.gen3.pradata(compiled_schema, diff_result, loose=True, self_name="dev")
                             else:
-                                _log.warning("No compiled schema for adata diff conversion, using prsrc")
+                                _log.warning("No compiled schema for adata diff conversion, using prsrc", {"error": error})
                                 return diff_result.prsrc()
                         elif target_format in ["netconf", "xml"]:
                             # For XML formats, return the diff as XML string
@@ -1223,7 +1248,8 @@ actor DeviceInstance(auth: WorldCap, log_handler: logging.Handler, platform_name
             def on_compile(name: str, duration: time.Duration, hash: ?u64, error: ?Exception):
                 if error is not None:
                     compiled_schemas[name] = None
-                    _log.error("Failed to compile schemas for module-set {repr(name)}", {"error": str(error)})
+                    compiled_schemas_errors[name] = str(error)
+                    _log.error("Failed to compile schemas", {"module-set": name, "error": str(error), "duration": duration.to_float()})
                 elif hash is not None:
                     compiled_schemas[name] = hash
                     _log.info("Successfully compiled YANG schemas", {"module-set": name, "duration": duration.to_float()})
@@ -1251,7 +1277,6 @@ actor DeviceInstance(auth: WorldCap, log_handler: logging.Handler, platform_name
 actor DeviceManager(config: SystemConfig, container_mgr: ContainerManager, auth: WorldCap, log_handler: logging.Handler):
     """Manages device lifecycle and state transitions"""
     var instances = []  # DeviceInstance actors
-    var instance_info = []  # Cached info for API responses
     var pending_requests = []  # Requests waiting for a device
     var next_instance_id = 1
     var schema_registry = SchemaRegistry()
@@ -1263,8 +1288,18 @@ actor DeviceManager(config: SystemConfig, container_mgr: ContainerManager, auth:
 
     def count_instances(platform_name: str, state: ?str = None) -> int:
         """Count instances for a platform, optionally filtered by state"""
-        # Simplified for now - just return length of instance_info
-        return len(instance_info)
+        count = 0
+        for device in instances:
+            device_info = device.get_info()
+            device_platform = device_info.get("platform_name")
+            if isinstance(device_platform, str) and device_platform == platform_name:
+                if state is None:
+                    count += 1
+                else:
+                    device_state = device_info.get("state")
+                    if isinstance(device_state, str) and device_state == state:
+                        count += 1
+        return count
 
     def initialize_static_instances(platform: PlatformConfig):
         """Initialize static instances for a platform"""
@@ -1290,22 +1325,6 @@ actor DeviceManager(config: SystemConfig, container_mgr: ContainerManager, auth:
             device.initialize_schemas(platform.module_sets)
             instances.append(device)
 
-            # Add to instance_info for API responses
-            instance_data = {
-                "platform_name": platform.name,
-                "platform": platform.platform,
-                "instance_id": spec.id,
-                "ip_address": spec.host,
-                "state": "ready",
-                "netconf_port": spec.netconf_port,
-                "ssh_port": spec.ssh_port,
-                "instance_type": "static"
-            }
-            desc = spec.description
-            if desc is not None:
-                instance_data["description"] = desc
-            instance_info.append(instance_data)
-
     def get_device_for_request(platform_name: str) -> ?DeviceInstance:
         """Get or create a device for a request"""
         # Debug logging
@@ -1314,11 +1333,11 @@ actor DeviceManager(config: SystemConfig, container_mgr: ContainerManager, auth:
         # Find a ready device for the specified platform
         for i in range(len(instances)):
             device = instances[i]
-            info = instance_info[i]
-            info_platform = info.get("platform_name")
-            device_state = device.get_state()
+            device_info = device.get_info()
+            info_platform = device_info.get("platform_name")
+            device_state = device_info.get("state")
             _log.debug("Checking device", {"index": i, "platform": str(info_platform), "state": device_state})
-            if device_state == "ready" and isinstance(info_platform, str) and info_platform == platform_name:
+            if isinstance(device_state, str) and device_state == "ready" and isinstance(info_platform, str) and info_platform == platform_name:
                 _log.info("Found matching device", {"platform": platform_name, "index": i})
                 return device
         _log.warning("No matching device found", {"platform": platform_name})
@@ -1364,7 +1383,11 @@ actor DeviceManager(config: SystemConfig, container_mgr: ContainerManager, auth:
 
     def get_instance_info() -> list[dict[str, ?value]]:
         """Get instance info for API responses"""
-        return instance_info
+        # Dynamically collect info from all device instances
+        current_info = []
+        for device in instances:
+            current_info.append(device.get_info())
+        return current_info
 
     def get_config() -> SystemConfig:
         """Get system configuration"""
@@ -1957,7 +1980,26 @@ actor MCPServer(convert_fn: action(ConvertRequest, action(?str, ?Exception) -> N
                 instance_id = instance.get_def("instance_id", "Unknown")
                 instance_type = instance.get_def("instance_type", "Unknown")
                 ip = instance.get_def("ip_address", "Unknown")
-                instances_text = instances_text + "- {instance_id} ({platform_name}) - {state} [{instance_type}] @ {ip}\n"
+                instances_text = instances_text + "- {instance_id} ({platform_name}) - {state} [{instance_type}] @ {ip}"
+
+                # Add module-set compilation status if available
+                module_sets = instance.get("module_sets")
+                if isinstance(module_sets, dict) and len(module_sets) > 0:
+                    instances_text = instances_text + "\n    Module sets:"
+                    for name, status in module_sets.items():
+                        if isinstance(status, dict):
+                            compiled = status.get_def("compiled", False)
+                            error = status.get("error")
+                            if isinstance(compiled, bool) and compiled:
+                                instances_text = instances_text + "\n      ✓ {name}"
+                            elif isinstance(error, str) and error != "Schema not compiled":
+                                # Show error for failed compilations
+                                error_preview = error[:50] + "..." if len(error) > 50 else error
+                                instances_text = instances_text + "\n      ✗ {name} ({error_preview})"
+                            else:
+                                instances_text = instances_text + "\n      ⏳ {name} (compiling)"
+
+                instances_text = instances_text + "\n"
 
             result = {
                 "content": [
