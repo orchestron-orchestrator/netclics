@@ -103,6 +103,9 @@ jobs:
       - name: "Test IOS XRd CLI to Acton adata conversion"
         run: just test-iosxrd-cli-to-acton-adata
 
+      - name: "Test IOS XRd CLI to Acton adata conversion (Unified Model module-set)"
+        run: just test-iosxrd-cli-to-acton-adata-unified-model
+
       - name: "Test IOS XRd CLI to CLI roundtrip"
         run: just test-iosxrd-cli-to-cli
 

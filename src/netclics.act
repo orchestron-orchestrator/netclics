@@ -11,6 +11,11 @@ import yang
 import yang.gen3
 import yang.gdata
 import yang.schema
+import schema_filter
+
+
+# Constant for the wildcard (all modules) default module-set
+ALL_MODULE_SET = "all"
 
 
 actor ContainerManager(proc_cap: process.ProcessCap, log_handler: logging.Handler):
@@ -82,7 +87,66 @@ actor ContainerManager(proc_cap: process.ProcessCap, log_handler: logging.Handle
         _log.info("Stopping container", {"container_name": container_name})
         # Since we use --rm, container will be removed automatically
 
-actor DeviceInstance(auth: WorldCap, log_handler: logging.Handler, platform_name: str, platform: str,
+
+actor SchemaRegistry():
+    var store: dict[u64, yang.schema.DRoot] = {}
+
+    def _list_hash(l: list[str]) -> u64:
+        h = hasher()
+        for le in l:
+            h.update(le.encode())
+        return h.finalize()
+
+    def add_schema(yang_src: list[str], cb: proc(time.Duration, ?u64, ?Exception) -> None):
+        sw = time.Stopwatch()
+        content_hash = _list_hash(yang_src)
+        if content_hash not in store:
+            try:
+                compiled_schema = yang.compile(yang_src)
+                store[content_hash] = compiled_schema
+            except Exception as e:
+                # Schema compilation failed, return error
+                cb(sw.elapsed(), None, e)
+                return
+        cb(sw.elapsed(), content_hash, None)
+
+    def get_schema(content_hash) -> ?yang.schema.DRoot:
+        if content_hash is not None:
+            return store.get(content_hash)
+
+
+class _SchemaId:
+    def __init__(self, identifier: str, version: ?str, format: ?str):
+        self.identifier = identifier
+        self.version = version
+        self.format = format
+
+    def __repr__(self):
+        return "(identifier={repr(self.identifier)}, version={repr(self.version)}, format={repr(self.format)})"
+
+    def to_named_tuple(self):
+        return (identifier=self.identifier, version=self.version, format=self.format)
+
+
+extension _SchemaId (Hashable):
+    def __eq__(self, other):
+        return self.identifier == other.identifier and self.version == other.version and self.format == other.format
+
+    def hash(self, h):
+        self.identifier.hash(h)
+        _version = self.version
+        if _version is not None:
+            _version.hash(h)
+        else:
+            "".hash(h)
+        _format = self.format
+        if _format is not None:
+            _format.hash(h)
+        else:
+            "".hash(h)
+
+
+actor DeviceInstance(auth: WorldCap, log_handler: logging.Handler, platform_name: str, platform: str, schema_registry,
                      container_id: str, ip_address: str,
                      netconf_port: int, ssh_port: int, instance_spec: ?InstanceSpec = None):
     """Actor representing a device instance that can process conversion requests"""
@@ -91,10 +155,16 @@ actor DeviceInstance(auth: WorldCap, log_handler: logging.Handler, platform_name
     var last_used_at = 0  # Timestamp of last use
     var device_platform = platform  # Store platform type for use in methods
 
-    # Schema storage
-    var compiled_schema: ?yang.schema.DRoot = None  # Compiled YANG schema
-    var schema_list: list[str] = []  # Raw YANG schema strings
-    var schema_ready = False  # Flag indicating schemas are ready
+    # Map module-sets which are include and exclude patterns to expanded YANG module names
+    var expanded_module_sets: dict[str, set[_SchemaId]] = {}
+    # Store compiled module-set schema hashes. The hash value is None for
+    # schemas that have not yet compiled or have compilation errors.
+    var compiled_schemas: dict[str, ?u64] = {}
+    # Track schema compilation errors for module-set
+    var compiled_schemas_errors: dict[str, str] = {}
+
+    # Raw downloaded schemas, I guess we could expose these via API?
+    var schema_dict: dict[_SchemaId, str] = {}
 
     # Set up logging
     logh = logging.Handler("DeviceInstance [{container_id}]")
@@ -129,7 +199,39 @@ actor DeviceInstance(auth: WorldCap, log_handler: logging.Handler, platform_name
             desc = instance_spec.description
             if desc is not None:
                 instance_data["description"] = desc
+
+        msi = {}
+        for name, schema_hash in compiled_schemas.items():
+            # This logic is equivalent to get_compiled_schema(), but we avoid
+            # actually fetching the schema, just check the error state
+            if schema_hash is not None:
+                msi[name] = {"compiled": True, "error": None}
+            elif name in compiled_schemas_errors:
+                msi[name] = {"compiled": False, "error": compiled_schemas_errors[name]}
+            else:
+                msi[name] = {"compiled": False, "error": "Schema not compiled"}
+        instance_data["module_sets"] = msi
+
         return instance_data
+
+    def get_compiled_schema(module_set_name) -> (?yang.schema.DRoot, ?str):
+        h = compiled_schemas.get(module_set_name)
+        if h is not None:
+            return (schema_registry.get_schema(h), None)
+        elif module_set_name in compiled_schemas_errors:
+            return (None, compiled_schemas_errors[module_set_name])
+        else:
+            return (None, "Schema not compiled")
+
+    def validate_module_set(module_set: str) -> ?str:
+        """Validate if the requested module_set is available. Returns error message if invalid, None if valid."""
+        if module_set == "":
+            # Empty module_set is valid (uses default)
+            return None
+        if module_set not in compiled_schemas:
+            available_sets = list(compiled_schemas.keys())
+            return "Invalid module_set: '{module_set}'. Available module sets: {', '.join(available_sets)}"
+        return None
 
     def _rollback_to_config(target_config: str, result_callback: action(?Exception) -> None):
         """Rollback device configuration to a previous state"""
@@ -215,7 +317,7 @@ actor DeviceInstance(auth: WorldCap, log_handler: logging.Handler, platform_name
 
     def convert(request: ConvertRequest, result_callback: action(?str, ?Exception) -> None):
         """Process a conversion request on this device"""
-        _log.info("DeviceInstance.convert called", {"device": container_id, "input_format": request.format, "output_format": request.target_format})
+        _log.info("DeviceInstance.convert called", {"device": container_id, "input_format": request.format, "output_format": request.target_format, "module_set": request.module_set})
         _log.debug("Input data", {"device": container_id, "input_data": request.input})
 
         state = "busy"
@@ -237,10 +339,11 @@ actor DeviceInstance(auth: WorldCap, log_handler: logging.Handler, platform_name
             elif target_format == "acton-gdata":
                 return gdata.prsrc()
             elif target_format == "acton-adata":
+                compiled_schema, error = get_compiled_schema(request.module_set)
                 if compiled_schema is not None:
                     return yang.gen3.pradata(compiled_schema, gdata, loose=True, self_name="dev")
                 else:
-                    _log.warning("No compiled schema for adata conversion, using gdata")
+                    _log.warning("No compiled schema for adata conversion, using gdata", {"error": compiled_schema})
                     return gdata.prsrc()
             elif target_format in ["netconf", "xml"]:
                 return gdata.to_xmlstr(name="configuration", pretty=True)
@@ -306,7 +409,7 @@ actor DeviceInstance(auth: WorldCap, log_handler: logging.Handler, platform_name
                 return
 
             _log.info("Input applied successfully, getting final configuration")
-            _get_netconf_config_parsed(on_final_config_retrieved)
+            _get_netconf_config_parsed(request.module_set, on_final_config_retrieved)
 
         def on_final_config_retrieved(config_tuple: ?(raw: xml.Node, gdata: yang.gdata.Node), error: ?Exception):
             """Step 4: Process the retrieved final configuration"""
@@ -362,7 +465,7 @@ actor DeviceInstance(auth: WorldCap, log_handler: logging.Handler, platform_name
             elif base_gdata is not None and final_gdata is not None:
                 # Use gdata diff for schema-aware formats
                 _log.info("Computing gdata-based diff")
-                diff_text = _compute_gdata_diff(base_gdata, final_gdata, request.target_format)
+                diff_text = _compute_gdata_diff(base_gdata, final_gdata, request.target_format, request.module_set)
                 on_diff_computed(diff_text, None)
             else:
                 _log.info("Diff not available")
@@ -428,7 +531,7 @@ actor DeviceInstance(auth: WorldCap, log_handler: logging.Handler, platform_name
 
         # Start the conversion process
         _log.info("Getting base configuration")
-        _get_netconf_config_parsed(on_base_config_retrieved)
+        _get_netconf_config_parsed(request.module_set, on_base_config_retrieved)
 
     def _handle_input(input_format: str, input_data: str, callback: action(?Exception) -> None):
         """Apply input data using the appropriate input handler"""
@@ -660,7 +763,7 @@ actor DeviceInstance(auth: WorldCap, log_handler: logging.Handler, platform_name
         _log.debug("Waiting for CLI utility client to connect")
         after 0.1: try_get_config(0)  # Start checking after 100ms
 
-    def _get_netconf_config_parsed(result_callback: action(?(raw: xml.Node, gdata: yang.gdata.Node), ?Exception) -> None):
+    def _get_netconf_config_parsed(module_set: str, result_callback: action(?(raw: xml.Node, gdata: yang.gdata.Node), ?Exception) -> None):
         """Get NETCONF config and parse it with schemas
 
         Returns a tuple of (raw_xml, parsed_gdata) to the callback on success, or None with an exception on failure.
@@ -702,6 +805,7 @@ actor DeviceInstance(auth: WorldCap, log_handler: logging.Handler, platform_name
                         _log.debug("Got raw XML", {"length": len(xml.encode(config_xml))})
 
                         # Parse with schemas - this is required for conversion
+                        compiled_schema, serror = get_compiled_schema(module_set)
                         if compiled_schema is not None:
                             try:
                                 _log.info("Parsing XML with gen3 schemas")
@@ -716,7 +820,7 @@ actor DeviceInstance(auth: WorldCap, log_handler: logging.Handler, platform_name
                                 client.close()
                                 result_callback(None, Exception("Failed to parse with gen3: " + str(e)))
                         else:
-                            _log.error("No compiled schema available - cannot proceed with conversion")
+                            _log.error("No compiled schema available - cannot proceed with conversion", {"error": serror})
                             client.close()
                             result_callback(None, Exception("No compiled schema available - cannot proceed with conversion"))
                     else:
@@ -908,7 +1012,7 @@ actor DeviceInstance(auth: WorldCap, log_handler: logging.Handler, platform_name
         _log.debug("Waiting for CLI client to connect for diff")
         after 0.1: try_get_diff(0)  # Start checking after 100ms
 
-    def _compute_gdata_diff(base_gdata: yang.gdata.Node, final_gdata: yang.gdata.Node, target_format: str) -> str:
+    def _compute_gdata_diff(base_gdata: yang.gdata.Node, final_gdata: yang.gdata.Node, target_format: str, module_set: str) -> str:
         """Compute diff between base and final gdata configs"""
         try:
             # Use yang.gdata.diff for semantic diff
@@ -922,10 +1026,11 @@ actor DeviceInstance(auth: WorldCap, log_handler: logging.Handler, platform_name
                             return diff_result.prsrc()
                         elif target_format == "acton-adata":
                             # Convert diff to adata format if schema is available
+                            compiled_schema, error = get_compiled_schema(module_set)
                             if compiled_schema is not None:
                                 return yang.gen3.pradata(compiled_schema, diff_result, loose=True, self_name="dev")
                             else:
-                                _log.warning("No compiled schema for adata diff conversion, using prsrc")
+                                _log.warning("No compiled schema for adata diff conversion, using prsrc", {"error": error})
                                 return diff_result.prsrc()
                         elif target_format in ["netconf", "xml"]:
                             # For XML formats, return the diff as XML string
@@ -971,11 +1076,13 @@ actor DeviceInstance(auth: WorldCap, log_handler: logging.Handler, platform_name
             username, password = creds
         else:
             _log.error("No credentials available for RFC compliance configuration")
+            state = "error"
             return
 
         def on_connect(client: netconf.Client, error: ?Exception):
             if error is not None:
                 _log.error("Failed to connect for RFC compliance configuration", {"error": error})
+                state = "error"
                 return
 
             _log.info("Connected for RFC compliance configuration")
@@ -1032,7 +1139,7 @@ actor DeviceInstance(auth: WorldCap, log_handler: logging.Handler, platform_name
             skip_host_key_check=True
         )
 
-    def initialize_schemas():
+    def initialize_schemas(module_sets):
         """Initialize schemas by downloading them from the device and compiling them"""
         _log.info("Initializing YANG schemas for device", {"device": container_id})
 
@@ -1052,23 +1159,57 @@ actor DeviceInstance(auth: WorldCap, log_handler: logging.Handler, platform_name
                 return
 
             _log.info("Connected to device for schema initialization")
+            sw = time.Stopwatch()
 
-            # Create SchemaGetter actor
-            sg = netconf.SchemaGetter(client)
+            def on_list_schemas(c: netconf.Client, schemas: list[(identifier: str, namespace: str, version: str, format: str)], error: ?netconf.NetconfError):
+                if error is not None:
+                    _log.error("Error: Failed to list schemas: {error}")
+                    state = "error"
+                    return
+
+                # Filter only YANG schemas because we only compile YANG
+                for s in schemas:
+                    if s.format != "yang":
+                        continue
+                    # Skip known broken models:
+                    # - junos-rpc: all RPC modules use an undefined grouping?!
+                    if s.identifier.startswith("junos-rpc"):
+                        _log.debug("Skipping {s.identifier}: undefined grouping common-forwarding")
+                        continue
+                    sid = _SchemaId(s.identifier, s.version, s.format)
+
+                    if len(module_sets) > 0:
+                        # Use module set filtering
+                        for module_set in module_sets:
+                            if schema_filter.should_include_module(s.identifier, [module_set]):
+                                expanded_module_sets.setdefault(module_set, set())
+                                expanded_module_sets[module_set].add(sid)
+
+                    # Also "create" the wildcard (all module-set)
+                    expanded_module_sets.setdefault(ALL_MODULE_SET, set())
+                    expanded_module_sets[ALL_MODULE_SET].add(sid)
+
+                schemas_to_download = set()
+                for mss in expanded_module_sets.values():
+                    schemas_to_download.update(mss)
+
+                if len(schemas_to_download) == 0:
+                    _log.error("No schemas available for download")
+                    state = "error"
+                    return
+
+                print("Found {len(schemas_to_download)} schemas to download", {"duration": sw.elapsed().to_float()})
+                sw.reset()
+                sg = netconf.SchemaGetter(c)
+                sg.download(on_schema_download, on_schemas_complete, [std.to_named_tuple() for std in schemas_to_download])
 
             # Callback for each schema download
-            def on_schema_download(current_index: int, total_schemas: int, schema: (identifier: str, namespace: ?str, version: ?str, format: str), schema_data: ?str, error: ?netconf.NetconfError):
+            def on_schema_download(current_index: int, total_schemas: int, schema: (identifier: str, version: ?str, format: ?str), schema_data: ?str, error: ?netconf.NetconfError):
                 if error is not None:
                     _log.error("Error downloading", {"identifier": schema.identifier, "index": current_index, "total": total_schemas, "error": error.error_message})
                 elif schema_data is not None:
-                    # Skip models:
-                    # - junos-rpc: all RPC modules use an undefined grouping?!
-                    # - openconfig: on Cisco IOS XRd openconfig-mpls.yang doesn't compile because submodule overrides prefix of parent import
-                    if schema.identifier.startswith("junos-rpc") or "openconfig" in schema.identifier:
-                        _log.debug("Skipping {schema.identifier}")
-                        return
                     _log.debug("Downloaded schema", {"identifier": schema.identifier, "index": current_index, "total": total_schemas, "data": schema_data[:20]})
-                    schema_list.append(schema_data)
+                    schema_dict[_SchemaId(schema.identifier, schema.version, schema.format)] = schema_data
                 else:
                     _log.warning("Empty schema data", {"identifier": schema.identifier, "index": current_index, "total": total_schemas})
 
@@ -1078,28 +1219,43 @@ actor DeviceInstance(auth: WorldCap, log_handler: logging.Handler, platform_name
                     _log.error("Error during schema download", {"error": error.error_message})
                     # Continue anyway - device can work without schemas
 
-                _log.info("All schemas downloaded", {"count": len(schema_list)})
+                _log.info("All schemas downloaded", {"count": len(schema_dict), "duration": sw.elapsed().to_float()})
+
+                deleted = set(compiled_schemas.keys()) - set(expanded_module_sets.keys())
+                for d in deleted:
+                    del compiled_schemas[d]
 
                 # Compile the schemas
-                try:
-                    compiled_schema = yang.compile(schema_list)
-                    _log.info("Successfully compiled YANG schemas")
-                    schema_ready = True
-                except Exception as e:
-                    _log.error("Failed to compile schemas", {"error": e})
-                    compiled_schema = None
-                    schema_ready = False
+                for name, modules in expanded_module_sets.items():
+                    _log.debug("Compiling YANG schemas", {"module-set": name})
+                    compiled_schemas.setdefault(name, None)
+                    yangs = []
+                    for sid in modules:
+                        y = schema_dict.get_def(sid, "")
+                        if y != "":
+                            yangs.append(y)
+                    schema_registry.add_schema(yangs, lambda d, h, e: on_compile(name, d, h, e))
 
                 # Close the NETCONF connection
                 client.close()
 
-                # Set state to ready regardless of schema compilation result
-                # (device can still work without schemas for basic operations)
+                # Set state to ready immediately so device can handle requests (basic, ones that do not require schema)
+                # Schema compilation will happen in background
                 state = "ready"
-                _log.info("Device initialization complete", {"device": container_id, "schemas_compiled": schema_ready})
+                _log.info("Device ready for requests, schema initialization continuing in background", {"device": container_id})
 
-            # Start downloading all schemas
-            sg.download(on_schema_download, on_schemas_complete, "all")
+            # Callback when a module-set schema is compiled by SchemaRegistry
+            def on_compile(name: str, duration: time.Duration, hash: ?u64, error: ?Exception):
+                if error is not None:
+                    compiled_schemas[name] = None
+                    compiled_schemas_errors[name] = str(error)
+                    _log.error("Failed to compile schemas", {"module-set": name, "error": str(error), "duration": duration.to_float()})
+                elif hash is not None:
+                    compiled_schemas[name] = hash
+                    _log.info("Successfully compiled YANG schemas", {"module-set": name, "duration": duration.to_float()})
+
+
+            client.list_schemas(on_list_schemas)
 
         # Create NETCONF client
         _log.info("Creating NETCONF client for schema initialization", {"host": ip_address, "port": netconf_port})
@@ -1117,12 +1273,13 @@ actor DeviceInstance(auth: WorldCap, log_handler: logging.Handler, platform_name
             skip_host_key_check=True
         )
 
+
 actor DeviceManager(config: SystemConfig, container_mgr: ContainerManager, auth: WorldCap, log_handler: logging.Handler):
     """Manages device lifecycle and state transitions"""
     var instances = []  # DeviceInstance actors
-    var instance_info = []  # Cached info for API responses
     var pending_requests = []  # Requests waiting for a device
     var next_instance_id = 1
+    var schema_registry = SchemaRegistry()
 
     # Set up logging
     logh = logging.Handler("DeviceManager")
@@ -1131,8 +1288,18 @@ actor DeviceManager(config: SystemConfig, container_mgr: ContainerManager, auth:
 
     def count_instances(platform_name: str, state: ?str = None) -> int:
         """Count instances for a platform, optionally filtered by state"""
-        # Simplified for now - just return length of instance_info
-        return len(instance_info)
+        count = 0
+        for device in instances:
+            device_info = device.get_info()
+            device_platform = device_info.get("platform_name")
+            if isinstance(device_platform, str) and device_platform == platform_name:
+                if state is None:
+                    count += 1
+                else:
+                    device_state = device_info.get("state")
+                    if isinstance(device_state, str) and device_state == state:
+                        count += 1
+        return count
 
     def initialize_static_instances(platform: PlatformConfig):
         """Initialize static instances for a platform"""
@@ -1142,6 +1309,7 @@ actor DeviceManager(config: SystemConfig, container_mgr: ContainerManager, auth:
                 log_handler=log_handler,
                 platform_name=platform.name,
                 platform=platform.platform,
+                schema_registry=schema_registry,
                 container_id=spec.id,
                 ip_address=spec.host,
                 netconf_port=spec.netconf_port,
@@ -1154,24 +1322,8 @@ actor DeviceManager(config: SystemConfig, container_mgr: ContainerManager, auth:
                 device.configure_rfc_compliance()
 
             # Initialize schemas on device startup
-            device.initialize_schemas()
+            device.initialize_schemas(platform.module_sets)
             instances.append(device)
-
-            # Add to instance_info for API responses
-            instance_data = {
-                "platform_name": platform.name,
-                "platform": platform.platform,
-                "instance_id": spec.id,
-                "ip_address": spec.host,
-                "state": "ready",
-                "netconf_port": spec.netconf_port,
-                "ssh_port": spec.ssh_port,
-                "instance_type": "static"
-            }
-            desc = spec.description
-            if desc is not None:
-                instance_data["description"] = desc
-            instance_info.append(instance_data)
 
     def get_device_for_request(platform_name: str) -> ?DeviceInstance:
         """Get or create a device for a request"""
@@ -1181,11 +1333,11 @@ actor DeviceManager(config: SystemConfig, container_mgr: ContainerManager, auth:
         # Find a ready device for the specified platform
         for i in range(len(instances)):
             device = instances[i]
-            info = instance_info[i]
-            info_platform = info.get("platform_name")
-            device_state = device.get_state()
+            device_info = device.get_info()
+            info_platform = device_info.get("platform_name")
+            device_state = device_info.get("state")
             _log.debug("Checking device", {"index": i, "platform": str(info_platform), "state": device_state})
-            if device_state == "ready" and isinstance(info_platform, str) and info_platform == platform_name:
+            if isinstance(device_state, str) and device_state == "ready" and isinstance(info_platform, str) and info_platform == platform_name:
                 _log.info("Found matching device", {"platform": platform_name, "index": i})
                 return device
         _log.warning("No matching device found", {"platform": platform_name})
@@ -1205,6 +1357,7 @@ actor DeviceManager(config: SystemConfig, container_mgr: ContainerManager, auth:
             log_handler=log_handler,
             platform_name="dynamic-platform",  # Hardcoded for now
             platform="dynamic",  # Hardcoded for now
+            schema_registry=schema_registry,
             container_id=f"starting-{instance_id}",
             ip_address="pending",
             netconf_port=830,  # Use default for now
@@ -1230,7 +1383,11 @@ actor DeviceManager(config: SystemConfig, container_mgr: ContainerManager, auth:
 
     def get_instance_info() -> list[dict[str, ?value]]:
         """Get instance info for API responses"""
-        return instance_info
+        # Dynamically collect info from all device instances
+        current_info = []
+        for device in instances:
+            current_info.append(device.get_info())
+        return current_info
 
     def get_config() -> SystemConfig:
         """Get system configuration"""
@@ -1263,6 +1420,7 @@ class PlatformConfig(object):
     netconf_port: int
     ssh_port: int
     restconf_port: int
+    module_sets: list[str]
     instances: list[InstanceSpec]
     active_instances: int
     available_instances: int
@@ -1271,6 +1429,7 @@ class PlatformConfig(object):
                  min_instances: int = 0, max_instances: int = 10,
                  startup_time_seconds: int = 60, idle_timeout_seconds: int = 300,
                  netconf_port: int = 830, ssh_port: int = 22, restconf_port: int = 443,
+                 module_sets: list[str] = [],
                  instances: ?list[InstanceSpec] = None):
         self.name = name
         self.platform = platform
@@ -1282,6 +1441,7 @@ class PlatformConfig(object):
         self.netconf_port = netconf_port  # NETCONF port inside container
         self.ssh_port = ssh_port  # SSH/CLI port inside container
         self.restconf_port = restconf_port  # RESTCONF port inside container
+        self.module_sets = module_sets
         if instances is not None and len(instances) > 0:
             self.instances = instances
         else:
@@ -1305,11 +1465,12 @@ class SystemConfig(object):
         return None
 
 class ConvertRequest(object):
-    def __init__(self, input: str, format: str, target_format: str, platform: str, cb: ?action(str) -> None = None):
+    def __init__(self, input: str, format: str, target_format: str, platform: str, module_set: str, cb: ?action(str) -> None = None):
         self.input = input
         self.format = format
         self.target_format = target_format
         self.platform = platform
+        self.module_set = module_set
         self.platform_version = None  # For now, always None
         self.cb = cb  # Optional callback for async processing
 
@@ -1329,10 +1490,11 @@ class ConvertRequest(object):
         format_val = data["format"]
         target_format_val = data["target_format"]
         platform_val = data["platform"]
+        module_set_val =  data.get_def("module_set", ALL_MODULE_SET)
 
         # Type check all at once
-        if isinstance(input_val, str) and isinstance(format_val, str) and isinstance(target_format_val, str) and isinstance(platform_val, str):
-            return ConvertRequest(input_val, format_val, target_format_val, platform_val, None)
+        if isinstance(input_val, str) and isinstance(format_val, str) and isinstance(target_format_val, str) and isinstance(platform_val, str) and isinstance(module_set_val, str):
+            return ConvertRequest(input_val, format_val, target_format_val, platform_val, module_set_val, None)
         raise ValueError("All fields must be strings")
 
 actor Director(auth: WorldCap, proc_cap: process.ProcessCap, log_handler: logging.Handler):
@@ -1351,7 +1513,7 @@ actor Director(auth: WorldCap, proc_cap: process.ProcessCap, log_handler: loggin
 
     def convert(request: ConvertRequest, callback: action(?str, ?Exception) -> None):
         """Process a conversion request"""
-        _log.info("Director.convert called", {"input_format": request.format, "output_format": request.target_format, "platform": request.platform, "input_length": len(request.input)})
+        _log.info("Director.convert called", {"input_format": request.format, "output_format": request.target_format, "platform": request.platform, "module_set": request.module_set, "input_length": len(request.input)})
 
         dm = device_manager
         if dm is not None:
@@ -1359,6 +1521,14 @@ actor Director(auth: WorldCap, proc_cap: process.ProcessCap, log_handler: loggin
             device = dm.get_device_for_request(request.platform)
             if device is not None:
                 _log.info("Device acquired successfully")
+
+                # Validate module_set if specified
+                if request.module_set != "":
+                    validation_error = device.validate_module_set(request.module_set)
+                    if validation_error is not None:
+                        _log.error("Module set validation failed", {"error": validation_error})
+                        callback(None, Exception(validation_error))
+                        return
 
                 # Dispatch conversion request to the device
                 _log.info("Dispatching conversion request to device")
@@ -1400,6 +1570,7 @@ actor Director(auth: WorldCap, proc_cap: process.ProcessCap, log_handler: loggin
                 platform_data = {
                     "name": platform.name,
                     "platform": platform.platform,
+                    "module_sets": platform.module_sets,
                     "scaling_type": "static" if platform.uses_static_instances() else "dynamic",
                     "total_instances": total_instances,
                     "available_instances": available_instances
@@ -1621,7 +1792,8 @@ actor MCPServer(convert_fn: action(ConvertRequest, action(?str, ?Exception) -> N
                             "input_config": {"type": "string", "description": "The configuration to convert"},
                             "format": {"type": "string", "description": "Input format (cli, netconf, json)"},
                             "target_format": {"type": "string", "description": "Target format (cli, netconf, json, acton-adata, acton-gdata)"},
-                            "platform": {"type": "string", "description": "Platform identifier"}
+                            "platform": {"type": "string", "description": "Platform identifier"},
+                            "module_set": {"type": "string", "description": "Name of predefined module-set"}
                         },
                         "required": ["input_config", "format", "target_format", "platform"]
                     }
@@ -1703,12 +1875,12 @@ actor MCPServer(convert_fn: action(ConvertRequest, action(?str, ?Exception) -> N
                 return
             else:
                 platform = args["platform"]
-
+            module_set = args.get_def("module_set", ALL_MODULE_SET)
 
             # Type checking
-            if isinstance(input_config, str) and isinstance(format_val, str) and isinstance(target_format, str) and isinstance(platform, str):
+            if isinstance(input_config, str) and isinstance(format_val, str) and isinstance(target_format, str) and isinstance(platform, str) and isinstance(module_set, str):
                 # All parameters are valid strings, create conversion request
-                convert_req = ConvertRequest(input_config, format_val, target_format, platform, None)
+                convert_req = ConvertRequest(input_config, format_val, target_format, platform, module_set, None)
             else:
                 _send_error_response(request_id, MCP_INVALID_PARAMS, "All parameters must be strings", respond, "convert_config-validation")
                 return
@@ -1808,7 +1980,26 @@ actor MCPServer(convert_fn: action(ConvertRequest, action(?str, ?Exception) -> N
                 instance_id = instance.get_def("instance_id", "Unknown")
                 instance_type = instance.get_def("instance_type", "Unknown")
                 ip = instance.get_def("ip_address", "Unknown")
-                instances_text = instances_text + "- {instance_id} ({platform_name}) - {state} [{instance_type}] @ {ip}\n"
+                instances_text = instances_text + "- {instance_id} ({platform_name}) - {state} [{instance_type}] @ {ip}"
+
+                # Add module-set compilation status if available
+                module_sets = instance.get("module_sets")
+                if isinstance(module_sets, dict) and len(module_sets) > 0:
+                    instances_text = instances_text + "\n    Module sets:"
+                    for name, status in module_sets.items():
+                        if isinstance(status, dict):
+                            compiled = status.get_def("compiled", False)
+                            error = status.get("error")
+                            if isinstance(compiled, bool) and compiled:
+                                instances_text = instances_text + "\n      ✓ {name}"
+                            elif isinstance(error, str) and error != "Schema not compiled":
+                                # Show error for failed compilations
+                                error_preview = error[:50] + "..." if len(error) > 50 else error
+                                instances_text = instances_text + "\n      ✗ {name} ({error_preview})"
+                            else:
+                                instances_text = instances_text + "\n      ⏳ {name} (compiling)"
+
+                instances_text = instances_text + "\n"
 
             result = {
                 "content": [
@@ -2000,6 +2191,7 @@ def get_default_config() -> SystemConfig:
         PlatformConfig(
             name="iosxrd 24.1.1-local",
             platform="cisco_iosxr",
+            module_sets=["cisco-xr-classic", "cisco-xr-unified-model"],
             instances=[
                 InstanceSpec(
                     id="local-iosxrd",
