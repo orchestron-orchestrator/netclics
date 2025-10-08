@@ -68,7 +68,7 @@ OPENCONFIG = ModuleSet(
 IETF = ModuleSet(
     "ietf",
     "IETF standard models",
-    include_patterns=["^ietf-"]
+    include_patterns=["^ietf-", "^iana-"]
 )
 
 ALL_MODULES = ModuleSet(

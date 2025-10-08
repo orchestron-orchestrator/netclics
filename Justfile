@@ -398,6 +398,94 @@ test-iosxrd-cli-to-acton-adata-unified-model:
 # Run all IOS XRd tests
 test-iosxrd-all: test-iosxrd-cli-to-acton-adata test-iosxrd-cli-to-cli test-iosxrd-netconf-to-cli test-iosxrd-cli-to-netconf test-iosxrd-cli-to-json
 
+# Test IOS XE CLI to Acton adata conversion
+test-iosxe-cli-to-acton-adata:
+    #!/usr/bin/env bash
+    RESULT=$(curl -s -X POST http://localhost:8080/api/v1/convert \
+      -H "Content-Type: application/json" \
+      -d '{
+        "input": "interface GigabitEthernet2\n description \"IOS XE test interface\"\n ip address 10.1.1.1 255.255.255.0\n no shutdown",
+        "format": "cli",
+        "target_format": "acton-adata",
+        "platform": "iosxe 17.15.03a-local"
+      }')
+    echo "$RESULT" | jq .
+
+    echo ""
+    echo "=== Configuration Diff ==="
+    echo "$RESULT" | jq -r '.diff'
+
+# Test IOS XE CLI to CLI roundtrip
+test-iosxe-cli-to-cli:
+    #!/usr/bin/env bash
+    RESULT=$(curl -s -X POST http://localhost:8080/api/v1/convert \
+      -H "Content-Type: application/json" \
+      -d '{
+        "input": "interface GigabitEthernet2\n description \"IOS XE CLI roundtrip\"\n ip address 10.2.2.1 255.255.255.0\n no shutdown",
+        "format": "cli",
+        "target_format": "cli",
+        "platform": "iosxe 17.15.03a-local"
+      }')
+    echo "$RESULT" | jq .
+
+    echo ""
+    echo "=== Configuration Diff ==="
+    echo "$RESULT" | jq -r '.diff'
+
+# Test IOS XE NETCONF to CLI conversion
+test-iosxe-netconf-to-cli:
+    #!/usr/bin/env bash
+    RESULT=$(curl -s -X POST http://localhost:8080/api/v1/convert \
+      -H "Content-Type: application/json" \
+      -d '{
+        "input": "<native xmlns=\"http://cisco.com/ns/yang/Cisco-IOS-XE-native\"><interface><GigabitEthernet><name>2</name><description>IOS XE NETCONF test</description></GigabitEthernet></interface></native>",
+        "format": "netconf",
+        "target_format": "cli",
+        "platform": "iosxe 17.15.03a-local"
+      }')
+    echo "$RESULT" | jq .
+
+    echo ""
+    echo "=== Configuration Diff ==="
+    echo "$RESULT" | jq -r '.diff'
+
+# Test IOS XE CLI to NETCONF conversion
+test-iosxe-cli-to-netconf:
+    #!/usr/bin/env bash
+    RESULT=$(curl -s -X POST http://localhost:8080/api/v1/convert \
+      -H "Content-Type: application/json" \
+      -d '{
+        "input": "interface GigabitEthernet2\n description \"IOS XE to NETCONF\"\n ip address 10.4.4.1 255.255.255.0\n no shutdown",
+        "format": "cli",
+        "target_format": "netconf",
+        "platform": "iosxe 17.15.03a-local"
+      }')
+    echo "$RESULT" | jq .
+
+    echo ""
+    echo "=== Configuration Diff ==="
+    echo "$RESULT" | jq -r '.diff'
+
+# Test IOS XE CLI to JSON conversion
+test-iosxe-cli-to-json:
+    #!/usr/bin/env bash
+    RESULT=$(curl -s -X POST http://localhost:8080/api/v1/convert \
+      -H "Content-Type: application/json" \
+      -d '{
+        "input": "interface GigabitEthernet2\n description \"IOS XE to JSON\"\n ip address 10.5.5.1 255.255.255.0\n no shutdown",
+        "format": "cli",
+        "target_format": "json",
+        "platform": "iosxe 17.15.03a-local"
+      }')
+    echo "$RESULT" | jq .
+
+    echo ""
+    echo "=== Configuration Diff ==="
+    echo "$RESULT" | jq -r '.diff' | jq .
+
+# Run all IOS XE tests
+test-iosxe-all: test-iosxe-cli-to-acton-adata test-iosxe-cli-to-cli test-iosxe-netconf-to-cli test-iosxe-cli-to-netconf test-iosxe-cli-to-json
+
 # Clean up build artifacts
 clean:
     rm -rf out/ .acton.lock *.log

@@ -102,7 +102,7 @@ actor SchemaRegistry():
         content_hash = _list_hash(yang_src)
         if content_hash not in store:
             try:
-                compiled_schema = yang.compile(yang_src)
+                compiled_schema = yang.compile(yang_src, strict_quoting=False)
                 store[content_hash] = compiled_schema
             except Exception as e:
                 # Schema compilation failed, return error
@@ -155,6 +155,7 @@ actor DeviceInstance(auth: WorldCap, log_handler: logging.Handler, platform_name
     var last_used_at = 0  # Timestamp of last use
     var device_platform = platform  # Store platform type for use in methods
 
+    var capabilities: list[str] = []
     # Map module-sets which are include and exclude patterns to expanded YANG module names
     var expanded_module_sets: dict[str, set[_SchemaId]] = {}
     # Store compiled module-set schema hashes. The hash value is None for
@@ -223,6 +224,23 @@ actor DeviceInstance(auth: WorldCap, log_handler: logging.Handler, platform_name
         else:
             return (None, "Schema not compiled")
 
+    def target_datastore():
+        # In order of preference, we have these alternative commit procedures:
+        # - write directly to running, if writable-running is supported
+        # - write to candidate + commit
+        if has_writable_running():
+            return "running"
+        elif has_candidate():
+            return "candidate"
+
+        raise ValueError("No writable datastore available")
+
+    def has_candidate():
+        return "urn:ietf:params:netconf:capability:candidate:1.0" in capabilities
+
+    def has_writable_running():
+        return "urn:ietf:params:netconf:capability:writable-running:1.0" in capabilities
+
     def validate_module_set(module_set: str) -> ?str:
         """Validate if the requested module_set is available. Returns error message if invalid, None if valid."""
         if module_set == "":
@@ -233,10 +251,21 @@ actor DeviceInstance(auth: WorldCap, log_handler: logging.Handler, platform_name
             return "Invalid module_set: '{module_set}'. Available module sets: {', '.join(available_sets)}"
         return None
 
-    def _rollback_to_config(target_config: str, result_callback: action(?Exception) -> None):
+    def _rollback_to_config(base_xml, base_gdata, final_gdata, result_callback: action(?Exception) -> None):
         """Rollback device configuration to a previous state"""
         _log.info("DeviceInstance.rollback called", {"device": container_id})
-        _log.debug("Target config length", {"device": container_id, "config_length": len(target_config)})
+        if platform == "cisco_iosxe":
+            backward_diff = yang.gdata.diff(final_gdata, base_gdata)
+            if backward_diff is not None:
+                target_config = backward_diff.to_xmlstr()
+            else:
+                result_callback()
+                return
+        else:
+            # Extract children without <data> wrapper for rollback
+            target_config = "\n".join([xml.encode(c) for c in base_xml.children])
+        config_preview = target_config[:200] if len(target_config) > 200 else target_config
+        _log.debug("Extracted config for rollback", {"config_preview": config_preview, "config_length": len(target_config)})
 
         state = "busy"
 
@@ -258,7 +287,7 @@ actor DeviceInstance(auth: WorldCap, log_handler: logging.Handler, platform_name
                 result_callback(Exception(f"NETCONF rollback connection error: {error}"))
                 return
 
-            def on_edit_config_done(client: netconf.Client,error: ?netconf.NetconfError):
+            def on_edit_config_done(client: netconf.Client, error: ?netconf.NetconfError):
                 _log.debug("Rollback edit-config response received")
                 if error is not None:
                     _log.error("Rollback edit-config failed with NETCONF error", {"error": error})
@@ -269,30 +298,35 @@ actor DeviceInstance(auth: WorldCap, log_handler: logging.Handler, platform_name
                     _log.info("Rollback edit-config completed successfully")
 
                     # Now commit the rollback
-                    def on_commit_done(client: netconf.Client, commit_error: ?netconf.NetconfError):
-                        _log.debug("Rollback commit response received")
-                        if commit_error is not None:
-                            _log.error("Rollback commit failed with NETCONF error", {"error": commit_error})
-                            client.close()
-                            state = "ready"
-                            result_callback(Exception(f"NETCONF rollback commit error: {commit_error}"))
-                        else:
-                            _log.info("Rollback commit completed successfully")
-                            client.close()
-                            state = "ready"
-                            result_callback(None)
-
                     _log.debug("Sending rollback commit request")
                     client.commit(on_commit_done)
+
+            def on_commit_done(client: netconf.Client, error: ?netconf.NetconfError):
+                _log.debug("Rollback commit response received")
+                if error is not None:
+                    _log.error("Rollback commit failed with NETCONF error", {"error": error})
+                    client.close()
+                    state = "ready"
+                    result_callback(Exception(f"NETCONF rollback commit error: {error}"))
+                else:
+                    _log.info("Rollback commit completed successfully")
+                    client.close()
+                    state = "ready"
+                    result_callback(None)
 
             if client is not None:
                 # Client is guaranteed to be non-None here
                 _log.info("NETCONF client connected successfully")
                 _log.debug("Client capabilities", {"capabilities": str(client.get_capabilities())})
 
-                # Apply the rollback configuration with default-operation=replace
-                _log.debug("Sending rollback edit-config with default-operation=replace")
-                client.edit_config(target_config, on_edit_config_done, datastore="candidate", default_operation="replace")
+                if platform == "cisco_iosxe":
+                    # On Cisco IOS XE we merge the running with with a computed diff
+                    op = None
+                else:
+                    # On all other platforms we replace the config with base
+                    op = "replace"
+                _log.debug("Sending rollback edit-config with default-operation={op}")
+                client.edit_config(target_config, on_edit_config_done if has_candidate() else on_commit_done, target_datastore(), default_operation=op)
             else:
                 _log.error("NETCONF rollback connection failed - no client")
                 state = "ready"
@@ -479,13 +513,9 @@ actor DeviceInstance(auth: WorldCap, log_handler: logging.Handler, platform_name
             computed_diff = diff_text if diff_text is not None else ""
 
             # Start rollback process using saved XML
-            if base_xml is not None:
+            if base_xml is not None and base_gdata is not None:
                 _log.info("Starting automatic rollback to clean device state using NETCONF")
-                # Extract children without <data> wrapper for rollback
-                rollback_config = "\n".join([xml.encode(c) for c in base_xml.children])
-                config_preview = rollback_config[:200] if len(rollback_config) > 200 else rollback_config
-                _log.debug("Extracted config for rollback", {"config_preview": config_preview})
-                _rollback_to_config(rollback_config, lambda error: on_rollback_complete(computed_diff, error))
+                _rollback_to_config(base_xml, base_gdata, final_gdata, lambda error: on_rollback_complete(computed_diff, error))
             else:
                 _log.error("No base XML available")
                 on_rollback_complete(computed_diff, Exception("No base XML available"))
@@ -578,19 +608,19 @@ actor DeviceInstance(auth: WorldCap, log_handler: logging.Handler, platform_name
                     _log.info("Edit-config completed successfully")
 
                     # Now commit the candidate configuration
-                    def on_commit_done(client: netconf.Client, commit_error: ?netconf.NetconfError):
-                        _log.debug("Commit response received")
-                        if commit_error is not None:
-                            _log.error("Commit failed with NETCONF error", {"error": commit_error})
-                            client.close()
-                            callback(Exception(f"NETCONF commit error: {commit_error}"))
-                        else:
-                            _log.info("Commit completed successfully")
-                            client.close()
-                            callback(None)
-
                     _log.debug("Sending commit request")
                     client.commit(on_commit_done)
+
+            def on_commit_done(client: netconf.Client, error: ?netconf.NetconfError):
+                _log.debug("Commit response received")
+                if error is not None:
+                    _log.error("Commit failed with NETCONF error", {"error": error})
+                    client.close()
+                    callback(Exception(f"NETCONF commit error: {error}"))
+                else:
+                    _log.info("Commit completed successfully")
+                    client.close()
+                    callback(None)
 
             if client is not None:
                 _log.info("NETCONF client connected successfully")
@@ -598,8 +628,7 @@ actor DeviceInstance(auth: WorldCap, log_handler: logging.Handler, platform_name
 
                 # Apply the input configuration
                 _log.debug("Sending edit-config with input", {"input_data": input_data})
-                # Try candidate datastore instead of running
-                client.edit_config(input_data, on_edit_config_done, "candidate")
+                client.edit_config(input_data, on_edit_config_done if has_candidate() else on_commit_done, target_datastore())
             else:
                 _log.error("NETCONF connection failed - no client")
                 callback(Exception("NETCONF connection failed"))
@@ -663,6 +692,8 @@ actor DeviceInstance(auth: WorldCap, log_handler: logging.Handler, platform_name
         # Determine device type based on platform
         if device_platform == "cisco_iosxr":
             device_type = "cisco_iosxr"
+        elif device_platform == "cisco_iosxe":
+            device_type = "cisco_iosxe"
         elif device_platform == "junos":
             device_type = "juniper_junos"
         else:
@@ -687,7 +718,18 @@ actor DeviceInstance(auth: WorldCap, log_handler: logging.Handler, platform_name
         def try_configure(attempt: int):
             if client.is_connected():
                 _log.debug("CLI client connected, sending configuration commands")
-                client.configure_and_commit(on_success, on_error, cli_commands)
+                # For IOS XE, clear the archive log before applying config for clean diff
+                if device_platform == "cisco_iosxe":
+                    _log.debug("Clearing archive log for IOS XE before configuration")
+                    def on_clear_complete(err: ?Exception, response: ?str):
+                        if err is not None:
+                            _log.warning("Failed to clear archive log", {"error": str(err)})
+                            callback(err)
+                        else:
+                            client.configure_and_commit(on_success, on_error, cli_commands)
+                    client.cmd(on_clear_complete, "clear archive log config force")
+                else:
+                    client.configure_and_commit(on_success, on_error, cli_commands)
             elif attempt < 10:  # Retry for up to 5 seconds (10 attempts * 500ms)
                 _log.debug("CLI client not ready, retrying", {"attempt": attempt + 1})
                 after 0.5: try_configure(attempt + 1)
@@ -728,6 +770,8 @@ actor DeviceInstance(auth: WorldCap, log_handler: logging.Handler, platform_name
         device_type = None
         if device_platform == "cisco_iosxr":
             device_type = "cisco_iosxr"
+        elif device_platform == "cisco_iosxe":
+            device_type = "cisco_iosxe"
         elif device_platform == "junos":
             device_type = "juniper_junos"
         else:
@@ -887,6 +931,8 @@ actor DeviceInstance(auth: WorldCap, log_handler: logging.Handler, platform_name
         device_type = None
         if device_platform == "cisco_iosxr":
             device_type = "cisco_iosxr"
+        elif device_platform == "cisco_iosxe":
+            device_type = "cisco_iosxe"
         elif device_platform == "junos":
             device_type = "juniper_junos"
         else:
@@ -971,6 +1017,9 @@ actor DeviceInstance(auth: WorldCap, log_handler: logging.Handler, platform_name
         if device_platform == "cisco_iosxr":
             device_type = "cisco_iosxr"
             diff_command = "show configuration commit changes last 1"
+        elif device_platform == "cisco_iosxe":
+            device_type = "cisco_iosxe"
+            diff_command = "show archive log config all provisioning"
         elif device_platform == "junos":
             device_type = "juniper_junos"
             diff_command = "show configuration | compare rollback 1"
@@ -1066,66 +1115,51 @@ actor DeviceInstance(auth: WorldCap, log_handler: logging.Handler, platform_name
             _log.error("No InstanceSpec available for device", {"device": container_id})
             return None
 
-    def configure_rfc_compliance():
-        """Configure the device for RFC/YANG compliant NETCONF operation (Juniper-specific)"""
-        _log.info("Configuring Juniper device for RFC/YANG compliance", {"device": container_id})
+    def apply_netconf_config(config_xml: str, config_name: str):
+        """Generic method to apply NETCONF configuration to device"""
+        _log.info("Applying NETCONF configuration", {"device": container_id, "config": config_name})
 
         # Get credentials
         creds = _get_credentials()
         if creds is not None:
             username, password = creds
         else:
-            _log.error("No credentials available for RFC compliance configuration")
-            state = "error"
+            _log.error("No credentials available for configuration", {"config": config_name})
             return
 
         def on_connect(client: netconf.Client, error: ?Exception):
             if error is not None:
-                _log.error("Failed to connect for RFC compliance configuration", {"error": error})
-                state = "error"
+                _log.error("NETCONF connection failed", {"error": error, "config": config_name})
                 return
 
-            _log.info("Connected for RFC compliance configuration")
-
-            # Configuration to enable RFC-compliant and YANG-compliant modes
-            config_xml = """
-            <configuration>
-                <system>
-                    <services>
-                        <netconf>
-                            <rfc-compliant/>
-                            <yang-compliant/>
-                        </netconf>
-                    </services>
-                </system>
-            </configuration>
-            """
+            _log.debug("Connected to device for configuration", {"config": config_name})
+            capabilities = client.get_capabilities()
 
             def on_edit_config_done(c: netconf.Client, error: ?netconf.NetconfError):
                 if error is not None:
-                    _log.error("Failed to configure RFC compliance", {"error": error.error_message})
+                    _log.error("Failed to apply configuration", {"error": error.error_message, "config": config_name})
                     c.close()
                 else:
-                    _log.info("Successfully configured RFC/YANG compliance")
+                    _log.info("Successfully applied configuration", {"config": config_name})
                     # Commit the configuration
                     c.commit(on_commit_done)
 
             def on_commit_done(c: netconf.Client, error: ?netconf.NetconfError):
                 if error is not None:
-                    _log.error("Failed to commit RFC compliance configuration", {"error": error.error_message})
+                    _log.error("Failed to commit configuration", {"error": error.error_message, "config": config_name})
                 else:
-                    _log.info("RFC/YANG compliance configuration committed")
+                    _log.info("Configuration committed", {"config": config_name})
                 c.close()
 
-            # Parse the config XML
+            # Parse and apply the config XML
             try:
-                client.edit_config(config_xml, on_edit_config_done, "candidate")
+                client.edit_config(config_xml, on_edit_config_done if has_candidate() else on_commit_done, target_datastore())
             except Exception as e:
-                _log.error("Failed to parse RFC compliance config", {"error": str(e)})
+                _log.error("Failed to parse configuration", {"error": str(e), "config": config_name})
                 client.close()
 
-        # Create NETCONF client for RFC compliance configuration
-        _log.info("Creating NETCONF client for RFC compliance configuration")
+        # Create NETCONF client for configuration
+        _log.info("Creating NETCONF client for configuration", {"config": config_name})
         netconf_client = netconf.Client(
             auth=auth,
             on_connect=on_connect,
@@ -1138,6 +1172,52 @@ actor DeviceInstance(auth: WorldCap, log_handler: logging.Handler, platform_name
             log_handler=log_handler,
             skip_host_key_check=True
         )
+
+    def configure_rfc_compliance():
+        """Configure the device for RFC/YANG compliant NETCONF operation (Juniper-specific)"""
+        # Configuration to enable RFC-compliant and YANG-compliant modes
+        config_xml = """
+        <configuration>
+            <system>
+                <services>
+                    <netconf>
+                        <rfc-compliant/>
+                        <yang-compliant/>
+                    </netconf>
+                </services>
+            </system>
+        </configuration>
+        """
+        apply_netconf_config(config_xml, "RFC/YANG compliance")
+
+    def configure_iosxe_archive_ssh():
+        """Configure archive on IOS XE device for configuration tracking"""
+        config = """<native xmlns="http://cisco.com/ns/yang/Cisco-IOS-XE-native">
+    <archive>
+        <log>
+            <config>
+                <logging>
+                    <enable/>
+                </logging>
+            </config>
+        </log>
+        <path>bootflash:archive</path>
+    </archive>
+    <ip>
+        <ssh>
+            <server>
+                <peruser>
+                    <session>
+                        <limit>16</limit>
+                    </session>
+                </peruser>
+            </server>
+            <maxstartups>128</maxstartups>
+        </ssh>
+    </ip>
+</native>"""
+
+        apply_netconf_config(config, "IOS XE archive, SSH limits")
 
     def initialize_schemas(module_sets):
         """Initialize schemas by downloading them from the device and compiling them"""
@@ -1173,8 +1253,12 @@ actor DeviceInstance(auth: WorldCap, log_handler: logging.Handler, platform_name
                         continue
                     # Skip known broken models:
                     # - junos-rpc: all RPC modules use an undefined grouping?!
+                    # - tailf-rollback: Unable to get child yang-patch-status from non-inner node
                     if s.identifier.startswith("junos-rpc"):
                         _log.debug("Skipping {s.identifier}: undefined grouping common-forwarding")
+                        continue
+                    elif s.identifier == "tailf-rollback" or s.identifier.startswith("cicso-xe-openconfig"):
+                        _log.debug("Skipping {s.identifier}: Cisco IOS XE ")
                         continue
                     sid = _SchemaId(s.identifier, s.version, s.format)
 
@@ -1320,6 +1404,10 @@ actor DeviceManager(config: SystemConfig, container_mgr: ContainerManager, auth:
             # For Juniper platforms, configure RFC compliance first
             if platform.platform == "junos":
                 device.configure_rfc_compliance()
+
+            # For Cisco IOS XE platforms, configure archive, SSH limits
+            if platform.platform == "cisco_iosxe":
+                device.configure_iosxe_archive_ssh()
 
             # Initialize schemas on device startup
             device.initialize_schemas(platform.module_sets)
@@ -2202,6 +2290,23 @@ def get_default_config() -> SystemConfig:
                     username="clab",
                     password="clab@123",
                     description="Local IOS XRd instance"
+                )
+            ]
+        ),
+        # Local Cisco IOS XE static instance
+        PlatformConfig(
+            name="iosxe 17.15.03a-local",
+            platform="cisco_iosxe",
+            instances=[
+                InstanceSpec(
+                    id="local-iosxe",
+                    host="127.0.0.1",
+                    netconf_port=44830,
+                    ssh_port=44022,
+                    restconf_port=32776,
+                    username="clab",
+                    password="clab@123",
+                    description="Local IOS XE instance"
                 )
             ]
         ),
