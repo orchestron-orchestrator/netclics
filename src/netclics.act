@@ -102,7 +102,7 @@ actor SchemaRegistry():
         content_hash = _list_hash(yang_src)
         if content_hash not in store:
             try:
-                compiled_schema = yang.compile(yang_src)
+                compiled_schema = yang.compile(yang_src, strict_quoting=False)
                 store[content_hash] = compiled_schema
             except Exception as e:
                 # Schema compilation failed, return error
@@ -663,6 +663,8 @@ actor DeviceInstance(auth: WorldCap, log_handler: logging.Handler, platform_name
         # Determine device type based on platform
         if device_platform == "cisco_iosxr":
             device_type = "cisco_iosxr"
+        elif device_platform == "cisco_iosxe":
+            device_type = "cisco_iosxe"
         elif device_platform == "junos":
             device_type = "juniper_junos"
         else:
@@ -687,7 +689,18 @@ actor DeviceInstance(auth: WorldCap, log_handler: logging.Handler, platform_name
         def try_configure(attempt: int):
             if client.is_connected():
                 _log.debug("CLI client connected, sending configuration commands")
-                client.configure_and_commit(on_success, on_error, cli_commands)
+                # For IOS XE, clear the archive log before applying config for clean diff
+                if device_platform == "cisco_iosxe":
+                    _log.debug("Clearing archive log for IOS XE before configuration")
+                    def on_clear_complete(err: ?Exception, response: ?str):
+                        if err is not None:
+                            _log.warning("Failed to clear archive log", {"error": str(err)})
+                            callback(err)
+                        else:
+                            client.configure_and_commit(on_success, on_error, cli_commands)
+                    client.cmd(on_clear_complete, "clear archive log config force")
+                else:
+                    client.configure_and_commit(on_success, on_error, cli_commands)
             elif attempt < 10:  # Retry for up to 5 seconds (10 attempts * 500ms)
                 _log.debug("CLI client not ready, retrying", {"attempt": attempt + 1})
                 after 0.5: try_configure(attempt + 1)
@@ -728,6 +741,8 @@ actor DeviceInstance(auth: WorldCap, log_handler: logging.Handler, platform_name
         device_type = None
         if device_platform == "cisco_iosxr":
             device_type = "cisco_iosxr"
+        elif device_platform == "cisco_iosxe":
+            device_type = "cisco_iosxe"
         elif device_platform == "junos":
             device_type = "juniper_junos"
         else:
@@ -887,6 +902,8 @@ actor DeviceInstance(auth: WorldCap, log_handler: logging.Handler, platform_name
         device_type = None
         if device_platform == "cisco_iosxr":
             device_type = "cisco_iosxr"
+        elif device_platform == "cisco_iosxe":
+            device_type = "cisco_iosxe"
         elif device_platform == "junos":
             device_type = "juniper_junos"
         else:
@@ -971,6 +988,9 @@ actor DeviceInstance(auth: WorldCap, log_handler: logging.Handler, platform_name
         if device_platform == "cisco_iosxr":
             device_type = "cisco_iosxr"
             diff_command = "show configuration commit changes last 1"
+        elif device_platform == "cisco_iosxe":
+            device_type = "cisco_iosxe"
+            diff_command = "show archive log config all provisioning"
         elif device_platform == "junos":
             device_type = "juniper_junos"
             diff_command = "show configuration | compare rollback 1"
@@ -1066,66 +1086,50 @@ actor DeviceInstance(auth: WorldCap, log_handler: logging.Handler, platform_name
             _log.error("No InstanceSpec available for device", {"device": container_id})
             return None
 
-    def configure_rfc_compliance():
-        """Configure the device for RFC/YANG compliant NETCONF operation (Juniper-specific)"""
-        _log.info("Configuring Juniper device for RFC/YANG compliance", {"device": container_id})
+    def apply_netconf_config(config_xml: str, config_name: str):
+        """Generic method to apply NETCONF configuration to device"""
+        _log.info("Applying NETCONF configuration", {"device": container_id, "config": config_name})
 
         # Get credentials
         creds = _get_credentials()
         if creds is not None:
             username, password = creds
         else:
-            _log.error("No credentials available for RFC compliance configuration")
-            state = "error"
+            _log.error("No credentials available for configuration", {"config": config_name})
             return
 
         def on_connect(client: netconf.Client, error: ?Exception):
             if error is not None:
-                _log.error("Failed to connect for RFC compliance configuration", {"error": error})
-                state = "error"
+                _log.error("NETCONF connection failed", {"error": error, "config": config_name})
                 return
 
-            _log.info("Connected for RFC compliance configuration")
-
-            # Configuration to enable RFC-compliant and YANG-compliant modes
-            config_xml = """
-            <configuration>
-                <system>
-                    <services>
-                        <netconf>
-                            <rfc-compliant/>
-                            <yang-compliant/>
-                        </netconf>
-                    </services>
-                </system>
-            </configuration>
-            """
+            _log.debug("Connected to device for configuration", {"config": config_name})
 
             def on_edit_config_done(c: netconf.Client, error: ?netconf.NetconfError):
                 if error is not None:
-                    _log.error("Failed to configure RFC compliance", {"error": error.error_message})
+                    _log.error("Failed to apply configuration", {"error": error.error_message, "config": config_name})
                     c.close()
                 else:
-                    _log.info("Successfully configured RFC/YANG compliance")
+                    _log.info("Successfully applied configuration", {"config": config_name})
                     # Commit the configuration
                     c.commit(on_commit_done)
 
             def on_commit_done(c: netconf.Client, error: ?netconf.NetconfError):
                 if error is not None:
-                    _log.error("Failed to commit RFC compliance configuration", {"error": error.error_message})
+                    _log.error("Failed to commit configuration", {"error": error.error_message, "config": config_name})
                 else:
-                    _log.info("RFC/YANG compliance configuration committed")
+                    _log.info("Configuration committed", {"config": config_name})
                 c.close()
 
-            # Parse the config XML
+            # Parse and apply the config XML
             try:
                 client.edit_config(config_xml, on_edit_config_done, "candidate")
             except Exception as e:
-                _log.error("Failed to parse RFC compliance config", {"error": str(e)})
+                _log.error("Failed to parse configuration", {"error": str(e), "config": config_name})
                 client.close()
 
-        # Create NETCONF client for RFC compliance configuration
-        _log.info("Creating NETCONF client for RFC compliance configuration")
+        # Create NETCONF client for configuration
+        _log.info("Creating NETCONF client for configuration", {"config": config_name})
         netconf_client = netconf.Client(
             auth=auth,
             on_connect=on_connect,
@@ -1138,6 +1142,42 @@ actor DeviceInstance(auth: WorldCap, log_handler: logging.Handler, platform_name
             log_handler=log_handler,
             skip_host_key_check=True
         )
+
+    def configure_rfc_compliance():
+        """Configure the device for RFC/YANG compliant NETCONF operation (Juniper-specific)"""
+        # Configuration to enable RFC-compliant and YANG-compliant modes
+        config_xml = """
+        <configuration>
+            <system>
+                <services>
+                    <netconf>
+                        <rfc-compliant/>
+                        <yang-compliant/>
+                    </netconf>
+                </services>
+            </system>
+        </configuration>
+        """
+        apply_netconf_config(config_xml, "RFC/YANG compliance")
+
+    def configure_iosxe_archive():
+        """Configure archive on IOS XE device for configuration tracking"""
+        # Configure archive with the XML provided
+        archive_config = """
+        <native xmlns="http://cisco.com/ns/yang/Cisco-IOS-XE-native">
+            <archive>
+                <log>
+                    <config>
+                        <logging>
+                            <enable/>
+                        </logging>
+                    </config>
+                </log>
+                <path>bootflash:archive</path>
+            </archive>
+        </native>
+        """
+        apply_netconf_config(archive_config, "IOS XE archive")
 
     def initialize_schemas(module_sets):
         """Initialize schemas by downloading them from the device and compiling them"""
@@ -1173,8 +1213,12 @@ actor DeviceInstance(auth: WorldCap, log_handler: logging.Handler, platform_name
                         continue
                     # Skip known broken models:
                     # - junos-rpc: all RPC modules use an undefined grouping?!
+                    # - tailf-rollback: Unable to get child yang-patch-status from non-inner node
                     if s.identifier.startswith("junos-rpc"):
                         _log.debug("Skipping {s.identifier}: undefined grouping common-forwarding")
+                        continue
+                    elif s.identifier == "tailf-rollback" or s.identifier.startswith("cicso-xe-openconfig"):
+                        _log.debug("Skipping {s.identifier}: Cisco IOS XE ")
                         continue
                     sid = _SchemaId(s.identifier, s.version, s.format)
 
@@ -1320,6 +1364,10 @@ actor DeviceManager(config: SystemConfig, container_mgr: ContainerManager, auth:
             # For Juniper platforms, configure RFC compliance first
             if platform.platform == "junos":
                 device.configure_rfc_compliance()
+
+            # For Cisco IOS XE platforms, configure archive
+            if platform.platform == "cisco_iosxe":
+                device.configure_iosxe_archive()
 
             # Initialize schemas on device startup
             device.initialize_schemas(platform.module_sets)
@@ -2177,7 +2225,7 @@ def get_default_config() -> SystemConfig:
             instances=[
                 InstanceSpec(
                     id="local-crpd",
-                    host="127.0.0.1",
+                    host="10.99.0.93",
                     netconf_port=42830,
                     ssh_port=42022,
                     restconf_port=32774,
@@ -2195,13 +2243,30 @@ def get_default_config() -> SystemConfig:
             instances=[
                 InstanceSpec(
                     id="local-iosxrd",
-                    host="127.0.0.1",
+                    host="10.99.0.93",
                     netconf_port=43830,
                     ssh_port=43022,
                     restconf_port=32775,
                     username="clab",
                     password="clab@123",
                     description="Local IOS XRd instance"
+                )
+            ]
+        ),
+        # Local Cisco IOS XE static instance
+        PlatformConfig(
+            name="iosxe 17.15.03a-local",
+            platform="cisco_iosxe",
+            instances=[
+                InstanceSpec(
+                    id="local-iosxe",
+                    host="10.99.0.93",
+                    netconf_port=44830,
+                    ssh_port=44022,
+                    restconf_port=32776,
+                    username="clab",
+                    password="clab@123",
+                    description="Local IOS XE instance"
                 )
             ]
         ),

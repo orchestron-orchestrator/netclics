@@ -2,8 +2,9 @@
     "dependencies": {
         "yang": {
             "repo_url": "https://github.com/orchestron-orchestrator/acton-yang.git",
-            "url": "https://github.com/orchestron-orchestrator/acton-yang/archive/24aaa7bfce8f2064827915785e5f78ff2ce4560a.zip",
-            "hash": "12204a2a5bc10d5d9464ce3425f06ab0f8d67fa1b9323b8fcb291ae360fa8b77ef9b"
+            "repo_ref": "cisco-xe",
+            "url": "https://github.com/orchestron-orchestrator/acton-yang/archive/10df792d339bcc30566ed8f78430524709f30464.zip",
+            "hash": "1220ceedbefef144e1d4ab350cd7daca27f8360437f84c374d6575b966b25ab6162d"
         },
         "netconf": {
             "repo_url": "https://github.com/orchestron-orchestrator/netconf.git",
@@ -12,8 +13,9 @@
         },
         "netcli": {
             "repo_url": "https://github.com/orchestron-orchestrator/netcli.git",
-            "url": "https://github.com/orchestron-orchestrator/netcli/archive/22b857b5ed22b2b0f56b81307d89ff93d2d0ff2c.zip",
-            "hash": "1220157d785c2cb7c6d075fd817ce8b9488ffa02f9ca9b2b72258376c6e1052d734a"
+            "repo_ref": "cisco-xe",
+            "url": "https://github.com/orchestron-orchestrator/netcli/archive/46605e86f1d82a28599e51317a7100d376a2d7c0.zip",
+            "hash": "1220754895045982af19dfdc258031569f9a798564c75216c3cf0f2cb73653be431f"
         }
     },
     "zig_dependencies": {}

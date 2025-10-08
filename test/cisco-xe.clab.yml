@@ -1,0 +1,9 @@
+name: netclics
+topology:
+  nodes:
+    xe:
+      kind: cisco_c8000v
+      image: gitlab.dev.terastrm.net:4567/abs/vrnetlab/vr-c8000v:17.15.03a_clab
+      ports:
+        - "44022:22"
+        - "44830:830"
