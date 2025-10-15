@@ -2297,6 +2297,7 @@ def get_default_config() -> SystemConfig:
         PlatformConfig(
             name="iosxe 17.15.03a-local",
             platform="cisco_iosxe",
+            module_sets=["cisco-xe-native"],
             instances=[
                 InstanceSpec(
                     id="local-iosxe",
