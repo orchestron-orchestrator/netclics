@@ -70,10 +70,8 @@ jobs:
       - name: "Test instances endpoint"
         run: just instances
 
-      - name: "Wait for NETCLICS to initialize device connections"
-        run: |
-          echo "Waiting for NETCLICS to initialize device connections..."
-          sleep 30
+      - name: "Wait for all schemas to be compiled"
+        run: just wait-for-schemas
 
       - name: "Test XML to XML conversion"
         run: just test-xml-to-xml-crpd

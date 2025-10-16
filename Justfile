@@ -494,6 +494,38 @@ test-iosxe-cli-to-json:
 # Run all IOS XE tests
 test-iosxe-all: test-iosxe-cli-to-acton-adata test-iosxe-cli-to-cli test-iosxe-netconf-to-cli test-iosxe-cli-to-netconf test-iosxe-cli-to-json
 
+# Wait for all instances to be ready and schemas to be compiled
+wait-for-schemas:
+    #!/usr/bin/env bash
+    echo "Waiting for all instances to be ready and schemas to be compiled..."
+
+    while true; do
+        INSTANCES=$(curl -s http://localhost:8080/api/v1/instances)
+
+        # Check if any instances are not ready
+        NOT_READY=$(echo "$INSTANCES" | jq -r '.instances[] | select(.state != "ready") | "\(.instance_id): \(.state)"')
+
+        if [ -n "$NOT_READY" ]; then
+            echo "Waiting for instances to be ready:"
+            echo "$NOT_READY"
+            sleep 2
+            continue
+        fi
+
+        # Check if all module sets are compiled
+        NOT_COMPILED=$(echo "$INSTANCES" | \
+            jq -r '.instances[] | .instance_id as $id | .module_sets | to_entries[] | select(.value.compiled == false) | "\($id)/\(.key): \(.value.error // "compiling...")"')
+
+        if [ -z "$NOT_COMPILED" ]; then
+            echo "All instances ready and schemas compiled successfully!"
+            exit 0
+        fi
+
+        echo "Compiling schemas:"
+        echo "$NOT_COMPILED"
+        sleep 2
+    done
+
 # Clean up build artifacts
 clean:
     rm -rf out/ .acton.lock *.log
