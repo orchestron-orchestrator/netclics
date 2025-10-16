@@ -53,11 +53,14 @@ start-static-instances-xrd:
         docker exec xrd1 ip link add Gi0-0-0-${port} type dummy
     done
 
-# Start both cRPD and XRD static instances
-start-static-instances: start-static-instances-crpd start-static-instances-xrd
+start-static-instances-xe:
+    docker run -td --name xe1 --rm --privileged --publish 44830:830 --publish 44022:22 {{IMAGE_PATH}}vrnetlab/vr-c8000v:17.15.03a --trace
+
+# Start all static instances
+start-static-instances: start-static-instances-crpd start-static-instances-xrd start-static-instances-xe
 
 stop-static-instances:
-    docker stop crpd1 xrd1 || true
+    docker stop crpd1 xrd1 xe1 || true
 
 # Show available platforms
 platforms:

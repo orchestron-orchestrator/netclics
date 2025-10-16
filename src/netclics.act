@@ -2263,8 +2263,8 @@ def get_default_config() -> SystemConfig:
                     netconf_port=44830,
                     ssh_port=44022,
                     restconf_port=32776,
-                    username="clab",
-                    password="clab@123",
+                    username="vrnetlab",
+                    password="VR-netlab9",
                     description="Local IOS XE instance"
                 )
             ]
