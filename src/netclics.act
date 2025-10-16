@@ -154,6 +154,7 @@ actor DeviceInstance(auth: WorldCap, log_handler: logging.Handler, platform_name
     var started_at = 0  # Timestamp when started
     var last_used_at = 0  # Timestamp of last use
     var device_platform = platform  # Store platform type for use in methods
+    var retry_delay = 5  # Retry delay in seconds for NETCONF connections
 
     var capabilities: list[str] = []
     # Map module-sets which are include and exclude patterns to expanded YANG module names
@@ -241,6 +242,50 @@ actor DeviceInstance(auth: WorldCap, log_handler: logging.Handler, platform_name
     def has_writable_running():
         return "urn:ietf:params:netconf:capability:writable-running:1.0" in capabilities
 
+    def create_netconf_client_with_retry(username: str, password: str, on_success: action(netconf.Client) -> None, on_failure: ?action(Exception) -> None=None, max_retries: ?int = None):
+        """Create a NETCONF client with automatic retry on connection failure
+
+        Args:
+            username: Username for authentication
+            password: Password for authentication
+            on_success: Callback when connection succeeds
+            on_failure: Callback when connection fails (only used if max_retries is set)
+            max_retries: Maximum number of retries (None for unlimited)
+        """
+        def attempt_connection(retry_count=0):
+            _log.info("Attempting NETCONF connection", {"attempt": retry_count, "host": ip_address, "port": netconf_port, "unlimited": True if max_retries is None else False})
+
+            def on_connect(client: ?netconf.Client, error: ?Exception):
+                if error is not None:
+                    _log.warning("NETCONF connection attempt failed", {"attempt": retry_count, "error": str(error)})
+                    if max_retries is not None and retry_count >= max_retries:
+                        _log.error("Max retries reached", {"max_retries": max_retries})
+                        if on_failure is not None:
+                            on_failure(Exception(f"Failed to connect after {max_retries} attempts: {error}"))
+                    else:
+                        after float(retry_delay): attempt_connection(retry_count+1)
+                elif client is not None:
+                    _log.info("NETCONF connection successful", {"attempt": retry_count})
+                    capabilities = client.get_capabilities()
+                    on_success(client)
+
+            # Create new client for this attempt
+            netconf.Client(
+                auth=auth,
+                on_connect=on_connect,
+                on_notif=None,
+                address=ip_address,
+                username=username,
+                key=None,
+                password=password,
+                port=netconf_port,
+                log_handler=log_handler,
+                skip_host_key_check=True
+            )
+
+        # Start the first connection attempt
+        attempt_connection()
+
     def validate_module_set(module_set: str) -> ?str:
         """Validate if the requested module_set is available. Returns error message if invalid, None if valid."""
         if module_set == "":
@@ -280,12 +325,8 @@ actor DeviceInstance(auth: WorldCap, log_handler: logging.Handler, platform_name
 
         _log.info("Starting NETCONF rollback", {"username": username, "host": ip_address, "port": netconf_port})
 
-        def on_connect(client: ?netconf.Client, error: ?Exception):
-            if error is not None:
-                _log.error("NETCONF rollback connection error", {"error": error})
-                state = "ready"
-                result_callback(Exception(f"NETCONF rollback connection error: {error}"))
-                return
+        def on_connect_success(client: netconf.Client):
+            _log.info("NETCONF client connected successfully for rollback")
 
             def on_edit_config_done(client: netconf.Client, error: ?netconf.NetconfError):
                 _log.debug("Rollback edit-config response received")
@@ -314,40 +355,22 @@ actor DeviceInstance(auth: WorldCap, log_handler: logging.Handler, platform_name
                     state = "ready"
                     result_callback(None)
 
-            if client is not None:
-                # Client is guaranteed to be non-None here
-                _log.info("NETCONF client connected successfully")
-                _log.debug("Client capabilities", {"capabilities": str(client.get_capabilities())})
-
-                if platform == "cisco_iosxe":
-                    # On Cisco IOS XE we merge the running with with a computed diff
-                    op = None
-                else:
-                    # On all other platforms we replace the config with base
-                    op = "replace"
-                _log.debug("Sending rollback edit-config with default-operation={op}")
-                client.edit_config(target_config, on_edit_config_done if has_candidate() else on_commit_done, target_datastore(), default_operation=op)
+            if platform == "cisco_iosxe":
+                # On Cisco IOS XE we merge the running with with a computed diff
+                op = None
             else:
-                _log.error("NETCONF rollback connection failed - no client")
-                state = "ready"
-                result_callback(Exception("NETCONF rollback connection failed"))
-                return
+                # On all other platforms we replace the config with base
+                op = "replace"
+            client.edit_config(target_config, on_edit_config_done if has_candidate() else on_commit_done, target_datastore(), default_operation=op)
 
-        # Create NETCONF client for rollback
+        def on_connect_failure(error: Exception):
+            _log.error("NETCONF rollback connection failed after retries", {"error": str(error)})
+            state = "ready"
+            result_callback(error)
+
+        # Create NETCONF client for rollback (limited retries)
         _log.info("Creating NETCONF client connection for rollback")
-        netconf_client = netconf.Client(
-            auth=auth,
-            on_connect=on_connect,
-            on_notif=None,
-            address=ip_address,
-            username=username,
-            key=None,
-            password=password,
-            port=netconf_port,
-            log_handler=log_handler,
-            skip_host_key_check=True
-        )
-        _log.info("NETCONF rollback client created, attempting connection")
+        create_netconf_client_with_retry(username, password, on_connect_success, on_connect_failure, max_retries=5)
 
     def convert(request: ConvertRequest, result_callback: action(?str, ?Exception) -> None):
         """Process a conversion request on this device"""
@@ -592,11 +615,8 @@ actor DeviceInstance(auth: WorldCap, log_handler: logging.Handler, platform_name
             return
         _log.info("Starting NETCONF input", {"username": username, "host": ip_address, "port": netconf_port})
 
-        def on_connect(client: ?netconf.Client, error: ?Exception):
-            if error is not None:
-                _log.error("NETCONF connection error", {"error": error})
-                callback(Exception(f"NETCONF connection error: {error}"))
-                return
+        def on_connect_success(client: netconf.Client):
+            _log.info("NETCONF client connected successfully")
 
             def on_edit_config_done(client: netconf.Client, error: ?netconf.NetconfError):
                 _log.debug("Edit-config response received")
@@ -622,35 +642,17 @@ actor DeviceInstance(auth: WorldCap, log_handler: logging.Handler, platform_name
                     client.close()
                     callback(None)
 
-            if client is not None:
-                _log.info("NETCONF client connected successfully")
-                _log.debug("Client capabilities", {"capabilities": str(client.get_capabilities())})
+            # Apply the input configuration
+            _log.debug("Sending edit-config with input", {"input_data": input_data})
+            client.edit_config(input_data, on_edit_config_done if has_candidate() else on_commit_done, target_datastore())
 
-                # Apply the input configuration
-                _log.debug("Sending edit-config with input", {"input_data": input_data})
-                client.edit_config(input_data, on_edit_config_done if has_candidate() else on_commit_done, target_datastore())
-            else:
-                _log.error("NETCONF connection failed - no client")
-                callback(Exception("NETCONF connection failed"))
-                return
+        def on_connect_failure(error: Exception):
+            _log.error("NETCONF connection failed after retries", {"error": str(error)})
+            callback(error)
 
-        # Create NETCONF client
+        # Create NETCONF client (limited retries for conversions)
         _log.info("Creating NETCONF client connection", {"host": ip_address, "port": netconf_port, "username": username})
-        _log.debug("Password masked", {"password_length": len(password)})
-
-        netconf_client = netconf.Client(
-            auth=auth,
-            on_connect=on_connect,
-            on_notif=None,
-            address=ip_address,
-            username=username,
-            key=None,
-            password=password,
-            port=netconf_port,
-            log_handler=log_handler,
-            skip_host_key_check=True
-        )
-        _log.info("NETCONF client created, attempting connection")
+        create_netconf_client_with_retry(username, password, on_connect_success, on_connect_failure, max_retries=5)
 
     def _cli_input(input_data: str, callback: action(?Exception) -> None):
         """Apply CLI configuration via router_client"""
@@ -825,11 +827,8 @@ actor DeviceInstance(auth: WorldCap, log_handler: logging.Handler, platform_name
 
         _log.info("Starting NETCONF retrieval", {"username": username, "host": ip_address, "port": netconf_port})
 
-        def on_connect(client: ?netconf.Client, error: ?Exception):
-            if error is not None:
-                _log.error("NETCONF connection error", {"error": error})
-                result_callback(None, Exception("NETCONF connection error: " + str(error)))
-                return
+        def on_connect_success(client: netconf.Client):
+            _log.info("NETCONF client connected successfully")
 
             def on_get_config_done(client: netconf.Client, response: ?xml.Node, error: ?netconf.NetconfError):
                 _log.debug("Get-config response received")
@@ -876,30 +875,15 @@ actor DeviceInstance(auth: WorldCap, log_handler: logging.Handler, platform_name
                     client.close()
                     result_callback(None, Exception("Get-config failed - received None response"))
 
-            if client is not None:
-                _log.info("NETCONF client connected successfully")
-                _log.debug("Client capabilities", {"capabilities": str(client.get_capabilities())})
-                client.get_config(on_get_config_done)
-            else:
-                _log.error("NETCONF connection failed - no client")
-                result_callback(None, Exception("NETCONF connection failed - no client"))
-                return
+            client.get_config(on_get_config_done)
 
-        # Create NETCONF client
+        def on_connect_failure(error: Exception):
+            _log.error("NETCONF connection failed after retries", {"error": str(error)})
+            result_callback(None, error)
+
+        # Create NETCONF client with retry (limited retries for conversions)
         _log.info("Creating NETCONF client", {"host": ip_address, "port": netconf_port, "username": username})
-
-        netconf_client = netconf.Client(
-            auth=auth,
-            on_connect=on_connect,
-            on_notif=None,
-            address=ip_address,
-            username=username,
-            key=None,
-            password=password,
-            port=netconf_port,
-            log_handler=log_handler,
-            skip_host_key_check=True
-        )
+        create_netconf_client_with_retry(username, password, on_connect_success, on_connect_failure, max_retries=5)
 
     def _cli_output(result_callback: action(?str, ?Exception) -> None):
         """Retrieve configuration via CLI commands"""
@@ -1127,13 +1111,8 @@ actor DeviceInstance(auth: WorldCap, log_handler: logging.Handler, platform_name
             _log.error("No credentials available for configuration", {"config": config_name})
             return
 
-        def on_connect(client: netconf.Client, error: ?Exception):
-            if error is not None:
-                _log.error("NETCONF connection failed", {"error": error, "config": config_name})
-                return
-
+        def on_connect_success(client: netconf.Client):
             _log.debug("Connected to device for configuration", {"config": config_name})
-            capabilities = client.get_capabilities()
 
             def on_edit_config_done(c: netconf.Client, error: ?netconf.NetconfError):
                 if error is not None:
@@ -1158,20 +1137,12 @@ actor DeviceInstance(auth: WorldCap, log_handler: logging.Handler, platform_name
                 _log.error("Failed to parse configuration", {"error": str(e), "config": config_name})
                 client.close()
 
-        # Create NETCONF client for configuration
+        def on_connect_failure(error: Exception):
+            _log.error("NETCONF connection failed for configuration after retries", {"error": str(error), "config": config_name})
+
+        # Create NETCONF client for configuration (unlimited retries for initialization)
         _log.info("Creating NETCONF client for configuration", {"config": config_name})
-        netconf_client = netconf.Client(
-            auth=auth,
-            on_connect=on_connect,
-            on_notif=None,
-            address=ip_address,
-            username=username,
-            key=None,
-            password=password,
-            port=netconf_port,
-            log_handler=log_handler,
-            skip_host_key_check=True
-        )
+        create_netconf_client_with_retry(username, password, on_connect_success, on_connect_failure)
 
     def configure_rfc_compliance():
         """Configure the device for RFC/YANG compliant NETCONF operation (Juniper-specific)"""
@@ -1232,12 +1203,7 @@ actor DeviceInstance(auth: WorldCap, log_handler: logging.Handler, platform_name
             state = "error"
             return
 
-        def on_connect(client: netconf.Client, error: ?Exception):
-            if error is not None:
-                _log.error("Failed to connect for schema initialization", {"error": error})
-                state = "error"
-                return
-
+        def on_connect_success(client: netconf.Client):
             _log.info("Connected to device for schema initialization")
             sw = time.Stopwatch()
 
@@ -1341,21 +1307,13 @@ actor DeviceInstance(auth: WorldCap, log_handler: logging.Handler, platform_name
 
             client.list_schemas(on_list_schemas)
 
-        # Create NETCONF client
-        _log.info("Creating NETCONF client for schema initialization", {"host": ip_address, "port": netconf_port})
+        def on_connect_failure(error: Exception):
+            _log.error("Failed to connect for schema initialization after retries", {"error": str(error)})
+            state = "error"
 
-        netconf_client = netconf.Client(
-            auth=auth,
-            on_connect=on_connect,
-            on_notif=None,
-            address=ip_address,
-            username=username,
-            key=None,
-            password=password,
-            port=netconf_port,
-            log_handler=log_handler,
-            skip_host_key_check=True
-        )
+        # Create NETCONF client for schema initialization
+        _log.info("Creating NETCONF client for schema initialization", {"host": ip_address, "port": netconf_port})
+        create_netconf_client_with_retry(username, password, on_connect_success, on_connect_failure)
 
 
 actor DeviceManager(config: SystemConfig, container_mgr: ContainerManager, auth: WorldCap, log_handler: logging.Handler):
