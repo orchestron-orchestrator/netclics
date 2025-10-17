@@ -12,6 +12,19 @@ jobs:
       - uses: actonlang/setup-acton@v1
         with:
           channel: 'tip'
+      - name: "Cache acton stuff"
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/acton
+            ~/.cache/ayang
+            out/
+            !out/bin
+          # Hacky cache update:
+          # https://github.com/actions/cache/blob/main/tips-and-workarounds.md#update-a-cache
+          key: acton-${{ github.run_id }}
+          restore-keys: |
+            acton
 
       - name: Set up env for containers
         run: |
