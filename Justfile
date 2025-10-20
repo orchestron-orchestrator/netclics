@@ -53,11 +53,14 @@ start-static-instances-xrd:
         docker exec xrd1 ip link add Gi0-0-0-${port} type dummy
     done
 
-# Start both cRPD and XRD static instances
-start-static-instances: start-static-instances-crpd start-static-instances-xrd
+start-static-instances-xe:
+    docker run -td --name xe1 --rm --privileged --publish 44830:830 --publish 44022:22 {{IMAGE_PATH}}vrnetlab/vr-c8000v:17.15.03a --trace
+
+# Start all static instances
+start-static-instances: start-static-instances-crpd start-static-instances-xrd start-static-instances-xe
 
 stop-static-instances:
-    docker stop crpd1 xrd1 || true
+    docker stop crpd1 xrd1 xe1 || true
 
 # Show available platforms
 platforms:
@@ -397,6 +400,131 @@ test-iosxrd-cli-to-acton-adata-unified-model:
 
 # Run all IOS XRd tests
 test-iosxrd-all: test-iosxrd-cli-to-acton-adata test-iosxrd-cli-to-cli test-iosxrd-netconf-to-cli test-iosxrd-cli-to-netconf test-iosxrd-cli-to-json
+
+# Test IOS XE CLI to Acton adata conversion
+test-iosxe-cli-to-acton-adata:
+    #!/usr/bin/env bash
+    RESULT=$(curl -s -X POST http://localhost:8080/api/v1/convert \
+      -H "Content-Type: application/json" \
+      -d '{
+        "input": "interface GigabitEthernet2\n description \"IOS XE test interface\"\n ip address 10.1.1.1 255.255.255.0\n no shutdown",
+        "format": "cli",
+        "target_format": "acton-adata",
+        "platform": "iosxe 17.15.03a-local",
+        "module_set": "cisco-xe-native"
+      }')
+    echo "$RESULT" | jq .
+
+    echo ""
+    echo "=== Configuration Diff ==="
+    echo "$RESULT" | jq -r '.diff'
+
+# Test IOS XE CLI to CLI roundtrip
+test-iosxe-cli-to-cli:
+    #!/usr/bin/env bash
+    RESULT=$(curl -s -X POST http://localhost:8080/api/v1/convert \
+      -H "Content-Type: application/json" \
+      -d '{
+        "input": "interface GigabitEthernet2\n description \"IOS XE CLI roundtrip\"\n ip address 10.2.2.1 255.255.255.0\n no shutdown",
+        "format": "cli",
+        "target_format": "cli",
+        "platform": "iosxe 17.15.03a-local",
+        "module_set": "cisco-xe-native"
+      }')
+    echo "$RESULT" | jq .
+
+    echo ""
+    echo "=== Configuration Diff ==="
+    echo "$RESULT" | jq -r '.diff'
+
+# Test IOS XE NETCONF to CLI conversion
+test-iosxe-netconf-to-cli:
+    #!/usr/bin/env bash
+    RESULT=$(curl -s -X POST http://localhost:8080/api/v1/convert \
+      -H "Content-Type: application/json" \
+      -d '{
+        "input": "<native xmlns=\"http://cisco.com/ns/yang/Cisco-IOS-XE-native\"><interface><GigabitEthernet><name>2</name><description>IOS XE NETCONF test</description></GigabitEthernet></interface></native>",
+        "format": "netconf",
+        "target_format": "cli",
+        "platform": "iosxe 17.15.03a-local",
+        "module_set": "cisco-xe-native"
+      }')
+    echo "$RESULT" | jq .
+
+    echo ""
+    echo "=== Configuration Diff ==="
+    echo "$RESULT" | jq -r '.diff'
+
+# Test IOS XE CLI to NETCONF conversion
+test-iosxe-cli-to-netconf:
+    #!/usr/bin/env bash
+    RESULT=$(curl -s -X POST http://localhost:8080/api/v1/convert \
+      -H "Content-Type: application/json" \
+      -d '{
+        "input": "interface GigabitEthernet2\n description \"IOS XE to NETCONF\"\n ip address 10.4.4.1 255.255.255.0\n no shutdown",
+        "format": "cli",
+        "target_format": "netconf",
+        "platform": "iosxe 17.15.03a-local",
+        "module_set": "cisco-xe-native"
+      }')
+    echo "$RESULT" | jq .
+
+    echo ""
+    echo "=== Configuration Diff ==="
+    echo "$RESULT" | jq -r '.diff'
+
+# Test IOS XE CLI to JSON conversion
+test-iosxe-cli-to-json:
+    #!/usr/bin/env bash
+    RESULT=$(curl -s -X POST http://localhost:8080/api/v1/convert \
+      -H "Content-Type: application/json" \
+      -d '{
+        "input": "interface GigabitEthernet2\n description \"IOS XE to JSON\"\n ip address 10.5.5.1 255.255.255.0\n no shutdown",
+        "format": "cli",
+        "target_format": "json",
+        "platform": "iosxe 17.15.03a-local",
+        "module_set": "cisco-xe-native"
+      }')
+    echo "$RESULT" | jq .
+
+    echo ""
+    echo "=== Configuration Diff ==="
+    echo "$RESULT" | jq -r '.diff' | jq .
+
+# Run all IOS XE tests
+test-iosxe-all: test-iosxe-cli-to-acton-adata test-iosxe-cli-to-cli test-iosxe-netconf-to-cli test-iosxe-cli-to-netconf test-iosxe-cli-to-json
+
+# Wait for all instances to be ready and schemas to be compiled
+wait-for-schemas:
+    #!/usr/bin/env bash
+    echo "Waiting for all instances to be ready and schemas to be compiled..."
+
+    while true; do
+        INSTANCES=$(curl -s http://localhost:8080/api/v1/instances)
+
+        # Check if any instances are not ready
+        NOT_READY=$(echo "$INSTANCES" | jq -r '.instances[] | select(.state != "ready") | "\(.instance_id): \(.state)"')
+
+        if [ -n "$NOT_READY" ]; then
+            echo "Waiting for instances to be ready:"
+            echo "$NOT_READY"
+            sleep 2
+            continue
+        fi
+
+        # Check if all module sets are compiled
+        NOT_COMPILED=$(echo "$INSTANCES" | \
+            jq -r '.instances[] | .instance_id as $id | .module_sets | to_entries[] | select(.value.compiled == false) | "\($id)/\(.key): \(.value.error // "compiling...")"')
+
+        if [ -z "$NOT_COMPILED" ]; then
+            echo "All instances ready and schemas compiled successfully!"
+            exit 0
+        fi
+
+        echo "Compiling schemas:"
+        echo "$NOT_COMPILED"
+        sleep 2
+    done
 
 # Clean up build artifacts
 clean:

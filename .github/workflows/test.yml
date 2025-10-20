@@ -43,7 +43,7 @@ jobs:
         run: |
           echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
 
-      - name: "Start static instances (cRPD and XRd container)"
+      - name: "Start static instances (cRPD and XRd containers, XE VM)"
         run: just start-static-instances
 
       - name: "Build NETCLICS"
@@ -70,10 +70,8 @@ jobs:
       - name: "Test instances endpoint"
         run: just instances
 
-      - name: "Wait for NETCLICS to initialize device connections"
-        run: |
-          echo "Waiting for NETCLICS to initialize device connections..."
-          sleep 30
+      - name: "Wait for all schemas to be compiled"
+        run: just wait-for-schemas
 
       - name: "Test XML to XML conversion"
         run: just test-xml-to-xml-crpd
@@ -117,6 +115,22 @@ jobs:
 
       - name: "Test IOS XRd CLI to JSON conversion"
         run: just test-iosxrd-cli-to-json
+
+      # IOS XE Tests
+      - name: "Test IOS XE CLI to Acton adata conversion"
+        run: just test-iosxe-cli-to-acton-adata
+
+      - name: "Test IOS XE CLI to CLI roundtrip"
+        run: just test-iosxe-cli-to-cli
+
+      - name: "Test IOS XE NETCONF to CLI conversion"
+        run: just test-iosxe-netconf-to-cli
+
+      - name: "Test IOS XE CLI to NETCONF conversion"
+        run: just test-iosxe-cli-to-netconf
+
+      - name: "Test IOS XE CLI to JSON conversion"
+        run: just test-iosxe-cli-to-json
 
       # MCP Protocol Tests
       - name: "Test MCP initialize"
