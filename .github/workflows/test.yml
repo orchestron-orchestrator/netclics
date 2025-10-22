@@ -83,6 +83,9 @@ jobs:
       - name: "Test instances endpoint"
         run: just instances
 
+      - name: "Wait for all instances to be ready"
+        run: just wait-for-instances 600
+
       - name: "Wait for all schemas to be compiled"
         run: just wait-for-schemas
 

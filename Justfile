@@ -494,22 +494,54 @@ test-iosxe-cli-to-json:
 # Run all IOS XE tests
 test-iosxe-all: test-iosxe-cli-to-acton-adata test-iosxe-cli-to-cli test-iosxe-netconf-to-cli test-iosxe-cli-to-netconf test-iosxe-cli-to-json
 
-# Wait for all instances to be ready and schemas to be compiled
-wait-for-schemas:
+# Wait for all instances to be ready (reach "ready" state)
+# Usage: just wait-for-instances [timeout_seconds]
+# Default timeout: 180 seconds
+wait-for-instances timeout="180":
     #!/usr/bin/env bash
-    echo "Waiting for all instances to be ready and schemas to be compiled..."
+    echo "Waiting for all instances to be ready..."
 
-    while true; do
+    MAX_WAIT={{timeout}}  # Maximum wait time in seconds
+    ELAPSED=0
+
+    while [ $ELAPSED -lt $MAX_WAIT ]; do
         INSTANCES=$(curl -s http://localhost:8080/api/v1/instances)
 
         # Check if any instances are not ready
         NOT_READY=$(echo "$INSTANCES" | jq -r '.instances[] | select(.state != "ready") | "\(.instance_id): \(.state)"')
 
-        if [ -n "$NOT_READY" ]; then
-            echo "Waiting for instances to be ready:"
-            echo "$NOT_READY"
-            sleep 2
-            continue
+        if [ -z "$NOT_READY" ]; then
+            echo "All instances are ready!"
+            exit 0
+        fi
+
+        echo "Waiting for instances to be ready ($ELAPSED/$MAX_WAIT seconds):"
+        echo "$NOT_READY"
+        sleep 2
+        ELAPSED=$((ELAPSED + 2))
+    done
+
+    echo "Timeout waiting for instances to be ready after $MAX_WAIT seconds"
+    exit 1
+
+# Wait for all schemas to be compiled
+# Usage: just wait-for-schemas [timeout_seconds]
+# Default timeout: 180 seconds
+wait-for-schemas timeout="180":
+    #!/usr/bin/env bash
+    echo "Waiting for all schemas to be compiled..."
+
+    MAX_WAIT={{timeout}}  # Maximum wait time in seconds
+    ELAPSED=0
+
+    while [ $ELAPSED -lt $MAX_WAIT ]; do
+        INSTANCES=$(curl -s http://localhost:8080/api/v1/instances)
+
+        # First check if there are any instances
+        INSTANCE_COUNT=$(echo "$INSTANCES" | jq '.instances | length')
+        if [ "$INSTANCE_COUNT" -eq 0 ]; then
+            echo "No instances found. Ensure NETCLICS server is running with instances."
+            exit 1
         fi
 
         # Check if all module sets are compiled
@@ -517,14 +549,25 @@ wait-for-schemas:
             jq -r '.instances[] | .instance_id as $id | .module_sets | to_entries[] | select(.value.compiled == false) | "\($id)/\(.key): \(.value.error // "compiling...")"')
 
         if [ -z "$NOT_COMPILED" ]; then
-            echo "All instances ready and schemas compiled successfully!"
+            echo "All schemas compiled successfully!"
             exit 0
         fi
 
-        echo "Compiling schemas:"
+        echo "Compiling schemas ($ELAPSED/$MAX_WAIT seconds):"
         echo "$NOT_COMPILED"
         sleep 2
+        ELAPSED=$((ELAPSED + 2))
     done
+
+    echo "Timeout waiting for schemas to compile after $MAX_WAIT seconds"
+    exit 1
+
+# Wait for both instances to be ready and schemas to be compiled
+# Usage: just wait-for-all [instances_timeout] [schemas_timeout]
+# Default timeouts: 180 seconds for instances, 180 seconds for schemas
+wait-for-all instances_timeout="180" schemas_timeout="180":
+    just wait-for-instances {{instances_timeout}}
+    just wait-for-schemas {{schemas_timeout}}
 
 # Clean up build artifacts
 clean:
