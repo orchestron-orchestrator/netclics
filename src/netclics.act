@@ -1207,6 +1207,7 @@ actor DeviceInstance(auth: WorldCap, log_handler: logging.Handler, platform_name
         def on_connect_success(client: netconf.Client):
             _log.info("Connected to device for schema initialization")
             sw = time.Stopwatch()
+            schema_getter: ?netconf.SchemaGetter = None
 
             def on_list_schemas(c: netconf.Client, schemas: list[(identifier: str, namespace: str, version: str, format: str)], error: ?netconf.NetconfError):
                 if error is not None:
@@ -1251,11 +1252,14 @@ actor DeviceInstance(auth: WorldCap, log_handler: logging.Handler, platform_name
 
                 print("Found {len(schemas_to_download)} schemas to download", {"duration": sw.elapsed().to_float()})
                 sw.reset()
-                sg = netconf.SchemaGetter(c)
-                sg.download(on_schema_download, on_schemas_complete, [std.to_named_tuple() for std in schemas_to_download])
+                schema_getter = netconf.SchemaGetter(c)
+                schema_getter.download(on_schema_download, on_schemas_complete, [std.to_named_tuple() for std in schemas_to_download])
 
             # Callback for each schema download
-            def on_schema_download(current_index: int, total_schemas: int, schema: (identifier: str, version: ?str, format: ?str), schema_data: ?str, error: ?netconf.NetconfError):
+            def on_schema_download(sg, current_index: int, total_schemas: int, schema: (identifier: str, version: ?str, format: ?str), schema_data: ?str, error: ?netconf.NetconfError):
+                if schema_getter is not None and sg is not schema_getter:
+                    _log.debug("Ingoring callback from old SchemaGetter")
+                    return
                 if error is not None:
                     _log.error("Error downloading", {"identifier": schema.identifier, "index": current_index, "total": total_schemas, "error": error.error_message})
                 elif schema_data is not None:
@@ -1265,7 +1269,10 @@ actor DeviceInstance(auth: WorldCap, log_handler: logging.Handler, platform_name
                     _log.warning("Empty schema data", {"identifier": schema.identifier, "index": current_index, "total": total_schemas})
 
             # Callback when all schemas are complete
-            def on_schemas_complete(error: ?netconf.NetconfError):
+            def on_schemas_complete(sg, error: ?netconf.NetconfError):
+                if schema_getter is not None and sg is not schema_getter:
+                    _log.debug("Ingoring callback from old SchemaGetter")
+                    return
                 if error is not None:
                     _log.error("Error during schema download", {"error": error.error_message})
                     # Continue anyway - device can work without schemas
