@@ -1,3 +1,4 @@
+import file
 import http
 import json
 import logging
@@ -88,7 +89,7 @@ actor ContainerManager(proc_cap: process.ProcessCap, log_handler: logging.Handle
         # Since we use --rm, container will be removed automatically
 
 
-actor SchemaRegistry():
+actor SchemaRegistry(fc: file.FileCap):
     var store: dict[u64, yang.schema.DRoot] = {}
 
     def _list_hash(l: list[str]) -> u64:
@@ -102,7 +103,7 @@ actor SchemaRegistry():
         content_hash = _list_hash(yang_src)
         if content_hash not in store:
             try:
-                compiled_schema = yang.compile(yang_src, strict_quoting=False)
+                compiled_schema = yang.compile_with_cache(yang_src, strict_quoting=False, fc=fc)
                 store[content_hash] = compiled_schema
             except Exception as e:
                 # Schema compilation failed, return error
@@ -1321,7 +1322,7 @@ actor DeviceManager(config: SystemConfig, container_mgr: ContainerManager, auth:
     var instances = []  # DeviceInstance actors
     var pending_requests = []  # Requests waiting for a device
     var next_instance_id = 1
-    var schema_registry = SchemaRegistry()
+    var schema_registry = SchemaRegistry(file.FileCap(auth))
 
     # Set up logging
     logh = logging.Handler("DeviceManager")
