@@ -373,6 +373,52 @@ actor DeviceInstance(auth: WorldCap, log_handler: logging.Handler, platform_name
         _log.info("Creating NETCONF client connection for rollback")
         create_netconf_client_with_retry(username, password, on_connect_success, on_connect_failure, max_retries=5)
 
+    def _clear_iosxe_archive_log(callback: action(?Exception) -> None):
+        """Clear the IOS XE archive log to ensure clean configuration state"""
+        _log.info("Clearing IOS XE archive log")
+
+        # Get credentials
+        creds = _get_credentials()
+        if creds is not None:
+            username, password = creds
+        else:
+            callback(Exception("No credentials available for archive log clearing"))
+            return
+
+        # Create router client for CLI access
+        client = router_client.Client(
+            auth=auth,
+            address=ip_address,
+            username=username,
+            password=password,
+            port=ssh_port,
+            device_type="cisco_iosxe",
+            log_handler=log_handler
+        )
+
+        def try_clear(attempt: int):
+            if client.is_connected():
+                _log.debug("CLI client connected, clearing archive log")
+                def on_clear_complete(err: ?Exception, response: ?str):
+                    if err is not None:
+                        _log.warning("Failed to clear archive log", {"error": str(err)})
+                        # Don't fail the whole operation, just log the warning
+                    else:
+                        _log.info("Archive log cleared successfully")
+                    # Disconnect the client and proceed regardless of clear result
+                    client.disconnect()
+                    callback(None)
+                client.cmd(on_clear_complete, "clear archive log config force")
+            elif attempt < 10:  # Retry for up to 5 seconds
+                _log.debug("CLI client not ready for archive clear, retrying", {"attempt": attempt + 1})
+                after 0.5: try_clear(attempt + 1)
+            else:
+                _log.error("CLI client failed to connect for archive clearing")
+                client.disconnect()
+                callback(Exception("CLI client connection timeout"))
+
+        after 0.1: try_clear(0)  # Start checking after 100ms
+
     def convert(request: ConvertRequest, result_callback: action(?str, ?Exception) -> None):
         """Process a conversion request on this device"""
         _log.info("DeviceInstance.convert called", {"device": container_id, "input_format": request.format, "output_format": request.target_format, "module_set": request.module_set})
@@ -585,7 +631,17 @@ actor DeviceInstance(auth: WorldCap, log_handler: logging.Handler, platform_name
 
         # Start the conversion process
         _log.info("Getting base configuration")
-        _get_netconf_config_parsed(request.module_set, on_base_config_retrieved)
+
+        # For IOS XE, clear the archive log at the beginning of conversion for clean state
+        if device_platform == "cisco_iosxe":
+            def on_archive_clear_done(err: ?Exception):
+                if err is None:
+                    _get_netconf_config_parsed(request.module_set, on_base_config_retrieved)
+                else:
+                    abort("Failed to clear archive log: " + str(err))
+            _clear_iosxe_archive_log(on_archive_clear_done)
+        else:
+            _get_netconf_config_parsed(request.module_set, on_base_config_retrieved)
 
     def _handle_input(input_format: str, input_data: str, callback: action(?Exception) -> None):
         """Apply input data using the appropriate input handler"""
