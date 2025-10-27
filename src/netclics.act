@@ -1110,25 +1110,25 @@ actor DeviceInstance(auth: WorldCap, log_handler: logging.Handler, platform_name
 
             if diff_result is not None:
                 # Convert diff to appropriate format based on target_format
-                        if target_format == "json":
-                            return diff_result.to_json()
-                        elif target_format == "acton-gdata":
-                            return diff_result.prsrc()
-                        elif target_format == "acton-adata":
-                            # Convert diff to adata format if schema is available
-                            compiled_schema, error = get_compiled_schema(module_set)
-                            if compiled_schema is not None:
-                                return yang.gen3.pradata(compiled_schema, diff_result, loose=True, self_name="dev")
-                            else:
-                                _log.warning("No compiled schema for adata diff conversion, using prsrc", {"error": error})
-                                return diff_result.prsrc()
-                        elif target_format in ["netconf", "xml"]:
-                            # For XML formats, return the diff as XML string
-                            return diff_result.to_xmlstr()
-                        else:
-                            # Default to prsrc format for unknown formats
-                            _log.warning("Unknown target format for diff, using prsrc", {"target_format": target_format})
-                            return diff_result.prsrc()
+                if target_format == "json":
+                    return diff_result.to_json()
+                elif target_format == "acton-gdata":
+                    return diff_result.prsrc()
+                elif target_format == "acton-adata":
+                    # Convert diff to adata format if schema is available
+                    compiled_schema, error = get_compiled_schema(module_set)
+                    if compiled_schema is not None:
+                        return yang.gen3.pradata(compiled_schema, diff_result, loose=True, self_name="dev")
+                    else:
+                        _log.warning("No compiled schema for adata diff conversion, using prsrc", {"error": error})
+                        return diff_result.prsrc()
+                elif target_format in ["netconf", "xml"]:
+                    # For XML formats, return the diff as XML string
+                    return diff_result.to_xmlstr()
+                else:
+                    # Default to prsrc format for unknown formats
+                    _log.warning("Unknown target format for diff, using prsrc", {"target_format": target_format})
+                    return diff_result.prsrc()
             else:
                 _log.info("No differences found between base and final configs")
                 return "No configuration changes"
