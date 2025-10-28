@@ -77,7 +77,7 @@ test-xml-to-xml-crpd:
     RESULT=$(curl -s -X POST http://localhost:8080/api/v1/convert \
       -H "Content-Type: application/json" \
       -d '{
-        "input": "<configuration xmlns:junos=\"http://xml.juniper.net/junos/24.4R0/junos\"><interfaces><interface><name>eth-0/1/2</name><description>foo</description></interface></interfaces></configuration>",
+        "input": "<configuration xmlns:junos=\"http://xml.juniper.net/junos/24.4R0/junos\"><interfaces><interface><name>eth-0/1/2</name><description>XML to XML test</description><unit><name>0</name><family><inet><address><name>10.1.1.1/24</name></address></inet></family></unit></interface></interfaces></configuration>",
         "format": "netconf",
         "target_format": "netconf",
         "platform": "crpd 24.4R1.9-local"
@@ -335,7 +335,7 @@ test-iosxrd-netconf-to-cli:
     RESULT=$(curl -s -X POST http://localhost:8080/api/v1/convert \
       -H "Content-Type: application/json" \
       -d '{
-        "input": "<configuration><interfaces xmlns=\"http://openconfig.net/yang/interfaces\"><interface><name>GigabitEthernet0/0/0/3</name><config><name>GigabitEthernet0/0/0/3</name><description>IOS XRd NETCONF test</description></config></interface></interfaces></configuration>",
+        "input": "<interfaces xmlns=\"http://cisco.com/ns/yang/Cisco-IOS-XR-um-interface-cfg\"><interface><interface-name>GigabitEthernet0/0/0/3</interface-name><description>IOS XRd NETCONF to CLI test</description><ipv4><addresses xmlns=\"http://cisco.com/ns/yang/Cisco-IOS-XR-um-if-ip-address-cfg\"><address><address>10.1.1.1</address><netmask>255.255.255.0</netmask></address></addresses></ipv4></interface></interfaces>",
         "format": "netconf",
         "target_format": "cli",
         "platform": "iosxrd 24.1.1-local"
@@ -443,7 +443,7 @@ test-iosxe-netconf-to-cli:
     RESULT=$(curl -s -X POST http://localhost:8080/api/v1/convert \
       -H "Content-Type: application/json" \
       -d '{
-        "input": "<native xmlns=\"http://cisco.com/ns/yang/Cisco-IOS-XE-native\"><interface><GigabitEthernet><name>2</name><description>IOS XE NETCONF test</description></GigabitEthernet></interface></native>",
+        "input": "<native xmlns=\"http://cisco.com/ns/yang/Cisco-IOS-XE-native\"><interface><GigabitEthernet><name>2</name><description>IOS XE NETCONF to CLI</description><ip><address><primary><address>10.1.1.1</address><mask>255.255.255.0</mask></primary></address></ip></GigabitEthernet></interface></native>",
         "format": "netconf",
         "target_format": "cli",
         "platform": "iosxe 17.15.03a-local",
@@ -461,7 +461,7 @@ test-iosxe-cli-to-netconf:
     RESULT=$(curl -s -X POST http://localhost:8080/api/v1/convert \
       -H "Content-Type: application/json" \
       -d '{
-        "input": "interface GigabitEthernet2\n description \"IOS XE to NETCONF\"\n ip address 10.4.4.1 255.255.255.0\n no shutdown",
+        "input": "interface GigabitEthernet2\n description \"IOS XE CLI to NETCONF\"\n ip address 10.4.4.1 255.255.255.0\n no shutdown",
         "format": "cli",
         "target_format": "netconf",
         "platform": "iosxe 17.15.03a-local",
@@ -479,7 +479,7 @@ test-iosxe-cli-to-json:
     RESULT=$(curl -s -X POST http://localhost:8080/api/v1/convert \
       -H "Content-Type: application/json" \
       -d '{
-        "input": "interface GigabitEthernet2\n description \"IOS XE to JSON\"\n ip address 10.5.5.1 255.255.255.0\n no shutdown",
+        "input": "interface GigabitEthernet2\n description \"IOS XE CLI to JSON\"\n ip address 10.5.5.1 255.255.255.0\n no shutdown",
         "format": "cli",
         "target_format": "json",
         "platform": "iosxe 17.15.03a-local",
