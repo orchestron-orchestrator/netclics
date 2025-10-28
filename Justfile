@@ -569,6 +569,129 @@ wait-for-all instances_timeout="180" schemas_timeout="180":
     just wait-for-instances {{instances_timeout}}
     just wait-for-schemas {{schemas_timeout}}
 
+# Test multi-step configuration
+test-multi-step:
+    #!/usr/bin/env bash
+    echo "=== Multi-Step Configuration Test ==="
+    RESULT=$(curl -s -X POST http://localhost:8080/api/v1/convert \
+      -H "Content-Type: application/json" \
+      -d '{
+        "input": [
+          "set policy-options prefix-list RFC1918 10.0.0.0/8",
+          "set policy-options policy-statement REJECT-PRIVATE term 1 from prefix-list RFC1918"
+        ],
+        "format": "cli",
+        "target_format": "netconf",
+        "platform": "crpd 24.4R1.9-local"
+      }')
+    echo "$RESULT" | jq .
+
+    echo ""
+    echo "=== Step-by-Step Summary ==="
+    echo "$RESULT" | jq -r '.steps[] | "Step: \(.input)\nHas diff: \(if .diff == "" then "No" else "Yes" end)\n"'
+
+# Test multi-step CLI -> NETCONF for IOS XE
+test-multi-step-iosxe:
+    #!/usr/bin/env bash
+    echo "=== Multi-Step IOS XE Configuration Test (CLI -> NETCONF) ==="
+    RESULT=$(curl -s -X POST http://localhost:8080/api/v1/convert \
+      -H "Content-Type: application/json" \
+      -d '{
+        "input": [
+          "interface GigabitEthernet2\n description Test Interface",
+          "interface GigabitEthernet2\n ip address 192.168.1.1 255.255.255.0"
+        ],
+        "format": "cli",
+        "target_format": "netconf",
+        "platform": "iosxe 17.15.03a-local",
+      }')
+    echo "$RESULT" | jq .
+
+# Test multi-step CLI -> NETCONF for IOS XR
+test-multi-step-iosxr:
+    #!/usr/bin/env bash
+    echo "=== Multi-Step IOS XR Configuration Test (CLI -> NETCONF) ==="
+    RESULT=$(curl -s -X POST http://localhost:8080/api/v1/convert \
+      -H "Content-Type: application/json" \
+      -d '{
+        "input": [
+          "interface GigabitEthernet0/0/0/1\n description XR Test Interface",
+          "interface GigabitEthernet0/0/0/1\n ipv4 address 10.1.1.1 255.255.255.0"
+        ],
+        "format": "cli",
+        "target_format": "netconf",
+        "platform": "iosxrd 24.1.1-local"
+      }')
+    echo "$RESULT" | jq .
+
+# Test multi-step CLI -> CLI (useful for verifying CLI normalization)
+test-multi-step-cli-to-cli:
+    #!/usr/bin/env bash
+    echo "=== Multi-Step CLI -> CLI Test (cRPD) ==="
+    RESULT=$(curl -s -X POST http://localhost:8080/api/v1/convert \
+      -H "Content-Type: application/json" \
+      -d '{
+        "input": [
+          "set interfaces ge-0/0/1 description \"Test Port\"",
+          "set interfaces ge-0/0/1 unit 0 family inet address 10.0.0.1/24"
+        ],
+        "format": "cli",
+        "target_format": "cli",
+        "platform": "crpd 24.4R1.9-local"
+      }')
+    echo "$RESULT" | jq .
+
+    echo ""
+    echo "=== Checking CLI diffs ==="
+    echo "$RESULT" | jq -r '.steps[] | "Input: \(.input)\nDiff:\n\(.diff)\n---"'
+
+# Test multi-step NETCONF -> CLI
+test-multi-step-netconf-to-cli:
+    #!/usr/bin/env bash
+    echo "=== Multi-Step NETCONF -> CLI Test (cRPD) ==="
+    RESULT=$(curl -s -X POST http://localhost:8080/api/v1/convert \
+      -H "Content-Type: application/json" \
+      -d '{
+        "input": [
+          "<configuration><interfaces><interface><name>ge-0/0/2</name><description>NETCONF Test</description></interface></interfaces></configuration>",
+          "<configuration><interfaces><interface><name>ge-0/0/2</name><unit><name>0</name><family><inet><address><name>172.16.0.1/24</name></address></inet></family></unit></interface></interfaces></configuration>"
+        ],
+        "format": "netconf",
+        "target_format": "cli",
+        "platform": "crpd 24.4R1.9-local"
+      }')
+    echo "$RESULT" | jq .
+
+    echo ""
+    echo "=== Checking CLI diffs ==="
+    echo "$RESULT" | jq -r '.steps[] | "Input: \(.input)\nDiff:\n\(.diff)\n---"'
+
+# Test multi-step CLI -> CLI for IOS XE (verifies archive cleaning)
+test-multi-step-iosxe-cli-to-cli:
+    #!/usr/bin/env bash
+    echo "=== Multi-Step CLI -> CLI Test (IOS XE) ==="
+    RESULT=$(curl -s -X POST http://localhost:8080/api/v1/convert \
+      -H "Content-Type: application/json" \
+      -d '{
+        "input": [
+          "interface GigabitEthernet3\n description \"First step - description only\"",
+          "interface GigabitEthernet3\n ip address 192.168.10.1 255.255.255.0",
+          "interface GigabitEthernet3\n no shutdown"
+        ],
+        "format": "cli",
+        "target_format": "cli",
+        "platform": "iosxe 17.15.03a-local"
+      }')
+    echo "$RESULT" | jq .
+
+    echo ""
+    echo "=== Checking CLI diffs for each step ==="
+    echo "$RESULT" | jq -r '.steps[] | "Step Input:\n\(.input)\n\nResulting Diff:\n\(.diff)\n================================"'
+
+# Test all multi-step scenarios across all platforms and format combinations
+test-multi-step-all: test-multi-step test-multi-step-iosxe test-multi-step-iosxr test-multi-step-cli-to-cli test-multi-step-netconf-to-cli test-multi-step-iosxe-cli-to-cli
+    @echo "All multi-step tests completed"
+
 # Clean up build artifacts
 clean:
     rm -rf out/ .acton.lock *.log

@@ -148,6 +148,25 @@ jobs:
       - name: "Test IOS XE CLI to JSON conversion"
         run: just test-iosxe-cli-to-json
 
+      # Multi-step Configuration Tests
+      - name: "Test multi-step configuration (cRPD)"
+        run: just test-multi-step
+
+      - name: "Test multi-step CLI to CLI (cRPD)"
+        run: just test-multi-step-cli-to-cli
+
+      - name: "Test multi-step NETCONF to CLI (cRPD)"
+        run: just test-multi-step-netconf-to-cli
+
+      - name: "Test multi-step configuration (IOS XE)"
+        run: just test-multi-step-iosxe
+
+      - name: "Test multi-step CLI to CLI (IOS XE)"
+        run: just test-multi-step-iosxe-cli-to-cli
+
+      - name: "Test multi-step configuration (IOS XR)"
+        run: just test-multi-step-iosxr
+
       # MCP Protocol Tests
       - name: "Test MCP initialize"
         run: just test-mcp-initialize
