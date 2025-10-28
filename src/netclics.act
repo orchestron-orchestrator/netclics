@@ -169,6 +169,10 @@ actor DeviceInstance(auth: WorldCap, log_handler: logging.Handler, platform_name
     # Raw downloaded schemas, I guess we could expose these via API?
     var schema_dict: dict[_SchemaId, str] = {}
 
+    # Persistent clients for conversion operations (reused throughout conversion)
+    var conversion_netconf_client: ?netconf.Client = None
+    var conversion_cli_client: ?router_client.Client = None
+
     # Set up logging
     logh = logging.Handler("DeviceInstance [{container_id}]")
     logh.set_handler(log_handler)
@@ -373,6 +377,127 @@ actor DeviceInstance(auth: WorldCap, log_handler: logging.Handler, platform_name
         _log.info("Creating NETCONF client connection for rollback")
         create_netconf_client_with_retry(username, password, on_connect_success, on_connect_failure, max_retries=5)
 
+    def _clear_iosxe_archive_log(callback: action(?Exception) -> None):
+        """Clear the IOS XE archive log to ensure clean configuration state"""
+        _log.info("Clearing IOS XE archive log")
+
+        def on_client_success(client: router_client.Client):
+            _log.debug("CLI client ready, clearing archive log")
+            def on_clear_complete(err: ?Exception, response: ?str):
+                if err is not None:
+                    _log.warning("Failed to clear archive log", {"error": str(err)})
+                else:
+                    _log.info("Archive log cleared successfully")
+                callback(None)
+            client.cmd(on_clear_complete, "clear archive log config force")
+
+        def on_client_error(error: Exception):
+            _log.error("Failed to get CLI client for archive clearing", {"error": str(error)})
+            callback(error)
+
+        _get_or_create_cli_client(on_client_success, on_client_error)
+
+    def _get_or_create_netconf_client(on_success: action(netconf.Client) -> None, on_error: action(Exception) -> None):
+        """Get existing NETCONF client or create a new one for conversion operations"""
+        nc_client = conversion_netconf_client
+        if nc_client is not None:
+            _log.debug("Reusing existing NETCONF client for conversion")
+            on_success(nc_client)
+        else:
+            _log.info("Creating new NETCONF client for conversion")
+            creds = _get_credentials()
+            if creds is not None:
+                username, password = creds
+            else:
+                on_error(Exception("No credentials available"))
+                return
+
+            def on_connect_success(client: netconf.Client):
+                conversion_netconf_client = client
+                _log.info("NETCONF client created and stored for reuse")
+                on_success(client)
+
+            def on_connect_failure(error: Exception):
+                _log.error("Failed to create NETCONF client", {"error": str(error)})
+                on_error(error)
+
+            create_netconf_client_with_retry(username, password, on_connect_success, on_connect_failure, max_retries=5)
+
+    def _get_or_create_cli_client(on_success: action(router_client.Client) -> None, on_error: action(Exception) -> None):
+        """Get existing CLI client or create a new one for conversion operations"""
+        cli_client = conversion_cli_client
+        if cli_client is not None:
+            _log.debug("Reusing existing CLI client for conversion")
+            on_success(cli_client)
+        else:
+            _log.info("Creating new CLI client for conversion")
+            creds = _get_credentials()
+            if creds is not None:
+                username, password = creds
+            else:
+                on_error(Exception("No credentials available"))
+                return
+
+            # Determine device type based on platform
+            device_type = None
+            if device_platform == "cisco_iosxr":
+                device_type = "cisco_iosxr"
+            elif device_platform == "cisco_iosxe":
+                device_type = "cisco_iosxe"
+            elif device_platform == "junos":
+                device_type = "juniper_junos"
+            else:
+                on_error(Exception("Unrecognized device platform: {device_platform}"))
+                return
+
+            # Create the client
+            client = router_client.Client(
+                auth=auth,
+                address=ip_address,
+                username=username,
+                password=password,
+                port=ssh_port,
+                device_type=device_type,
+                log_handler=log_handler
+            )
+
+            conversion_cli_client = client
+
+            # Wait for connection
+            def try_connect(attempt: int):
+                if client.is_connected():
+                    _log.info("CLI client created and stored for reuse")
+                    on_success(client)
+                elif attempt < 10:  # Retry for up to 5 seconds
+                    _log.debug("CLI client not ready, retrying", {"attempt": attempt + 1})
+                    after 0.5: try_connect(attempt + 1)
+                else:
+                    _log.error("CLI client failed to connect")
+                    conversion_cli_client = None  # Clear the failed client
+                    on_error(Exception("CLI client connection timeout"))
+
+            after 0.1: try_connect(0)
+
+    def _cleanup_conversion_clients():
+        """Clean up persistent clients at end of conversion"""
+        _log.info("Cleaning up conversion clients")
+
+        cnc = conversion_netconf_client
+        if cnc is not None:
+            try:
+                cnc.close()
+            except Exception as e:
+                _log.warning("Error closing NETCONF client", {"error": str(e)})
+            conversion_netconf_client = None
+
+        ccc = conversion_cli_client
+        if ccc is not None:
+            try:
+                ccc.disconnect()
+            except Exception as e:
+                _log.warning("Error closing CLI client", {"error": str(e)})
+            conversion_cli_client = None
+
     def convert(request: ConvertRequest, result_callback: action(?str, ?Exception) -> None):
         """Process a conversion request on this device"""
         _log.info("DeviceInstance.convert called", {"device": container_id, "input_format": request.format, "output_format": request.target_format, "module_set": request.module_set})
@@ -575,6 +700,8 @@ actor DeviceInstance(auth: WorldCap, log_handler: logging.Handler, platform_name
             # Reset state
             state = "ready"
 
+            _cleanup_conversion_clients()
+
             # Call the result callback
             if error is not None:
                 result_callback(None, error)
@@ -585,7 +712,17 @@ actor DeviceInstance(auth: WorldCap, log_handler: logging.Handler, platform_name
 
         # Start the conversion process
         _log.info("Getting base configuration")
-        _get_netconf_config_parsed(request.module_set, on_base_config_retrieved)
+
+        # For IOS XE, clear the archive log at the beginning of conversion for clean state
+        if device_platform == "cisco_iosxe":
+            def on_archive_clear_done(err: ?Exception):
+                if err is None:
+                    _get_netconf_config_parsed(request.module_set, on_base_config_retrieved)
+                else:
+                    abort("Failed to clear archive log: " + str(err))
+            _clear_iosxe_archive_log(on_archive_clear_done)
+        else:
+            _get_netconf_config_parsed(request.module_set, on_base_config_retrieved)
 
     def _handle_input(input_format: str, input_data: str, callback: action(?Exception) -> None):
         """Apply input data using the appropriate input handler"""
@@ -607,23 +744,13 @@ actor DeviceInstance(auth: WorldCap, log_handler: logging.Handler, platform_name
         """Apply configuration via NETCONF edit-config"""
         _log.info("NETCONF input handler: applying configuration")
 
-        # Get credentials
-        creds = _get_credentials()
-        if creds is not None:
-            username, password = creds
-        else:
-            callback(Exception("No credentials available"))
-            return
-        _log.info("Starting NETCONF input", {"username": username, "host": ip_address, "port": netconf_port})
-
-        def on_connect_success(client: netconf.Client):
+        def on_client_success(client: netconf.Client):
             _log.info("NETCONF client connected successfully")
 
             def on_edit_config_done(client: netconf.Client, error: ?netconf.NetconfError):
                 _log.debug("Edit-config response received")
                 if error is not None:
                     _log.error("Edit-config failed with NETCONF error", {"error": error})
-                    client.close()
                     callback(Exception(f"NETCONF edit-config error: {error}"))
                 else:
                     _log.info("Edit-config completed successfully")
@@ -636,37 +763,24 @@ actor DeviceInstance(auth: WorldCap, log_handler: logging.Handler, platform_name
                 _log.debug("Commit response received")
                 if error is not None:
                     _log.error("Commit failed with NETCONF error", {"error": error})
-                    client.close()
                     callback(Exception(f"NETCONF commit error: {error}"))
                 else:
                     _log.info("Commit completed successfully")
-                    client.close()
                     callback(None)
 
             # Apply the input configuration
             _log.debug("Sending edit-config with input", {"input_data": input_data})
             client.edit_config(input_data, on_edit_config_done if has_candidate() else on_commit_done, target_datastore())
 
-        def on_connect_failure(error: Exception):
-            _log.error("NETCONF connection failed after retries", {"error": str(error)})
+        def on_client_error(error: Exception):
+            _log.error("Failed to get NETCONF client", {"error": str(error)})
             callback(error)
 
-        # Create NETCONF client (limited retries for conversions)
-        _log.info("Creating NETCONF client connection", {"host": ip_address, "port": netconf_port, "username": username})
-        create_netconf_client_with_retry(username, password, on_connect_success, on_connect_failure, max_retries=5)
+        _get_or_create_netconf_client(on_client_success, on_client_error)
 
     def _cli_input(input_data: str, callback: action(?Exception) -> None):
         """Apply CLI configuration via router_client"""
         _log.info("CLI input handler: applying CLI configuration")
-
-        # Get credentials
-        creds = _get_credentials()
-        if creds is not None:
-            username, password = creds
-        else:
-            callback(Exception("No credentials available"))
-            return
-        _log.info("Starting CLI input", {"username": username, "host": ip_address, "port": ssh_port})
 
         # Parse CLI commands from input data (split by newlines)
         cli_commands = []
@@ -681,134 +795,63 @@ actor DeviceInstance(auth: WorldCap, log_handler: logging.Handler, platform_name
 
         _log.debug("Parsed CLI commands", {"commands": cli_commands, "count": len(cli_commands)})
 
-        def on_success(response: str):
-            _log.info("CLI configuration applied successfully")
-            _log.debug("CLI success response", {"response": response})
-            callback(None)
+        def on_client_success(client: router_client.Client):
 
-        def on_error(err: Exception, response: str):
-            _log.error("CLI configuration failed", {"error": str(err), "response": response})
-            callback(Exception("CLI configuration error: " + str(err)))
+            def on_success(response: str):
+                _log.info("CLI configuration applied successfully")
+                _log.debug("CLI success response", {"response": response})
+                callback(None)
 
+            def on_error(err: Exception, response: str):
+                _log.error("CLI configuration failed", {"error": str(err), "response": response})
+                callback(Exception("CLI configuration error: " + str(err)))
 
-        device_type = None
-        # Determine device type based on platform
-        if device_platform == "cisco_iosxr":
-            device_type = "cisco_iosxr"
-        elif device_platform == "cisco_iosxe":
-            device_type = "cisco_iosxe"
-        elif device_platform == "junos":
-            device_type = "juniper_junos"
-        else:
-            callback(Exception("Unrecognized device platform: {device_platform}"))
-            return
-
-        # Create router client
-        _log.info("Creating CLI client connection", {"host": ip_address, "port": ssh_port, "username": username, "device_type": device_type})
-        _log.debug("Password masked", {"password_length": len(password) if password is not None else 0})
-
-        client = router_client.Client(
-            auth=auth,
-            address=ip_address,
-            username=username,
-            password=password,
-            port=ssh_port,
-            device_type=device_type,
-            log_handler=log_handler
-        )
-
-        # Wait for connection and apply configuration
-        def try_configure(attempt: int):
-            if client.is_connected():
-                _log.debug("CLI client connected, sending configuration commands")
-                # For IOS XE, clear the archive log before applying config for clean diff
-                if device_platform == "cisco_iosxe":
-                    _log.debug("Clearing archive log for IOS XE before configuration")
-                    def on_clear_complete(err: ?Exception, response: ?str):
-                        if err is not None:
-                            _log.warning("Failed to clear archive log", {"error": str(err)})
-                            callback(err)
-                        else:
-                            client.configure_and_commit(on_success, on_error, cli_commands)
-                    client.cmd(on_clear_complete, "clear archive log config force")
-                else:
-                    client.configure_and_commit(on_success, on_error, cli_commands)
-            elif attempt < 10:  # Retry for up to 5 seconds (10 attempts * 500ms)
-                _log.debug("CLI client not ready, retrying", {"attempt": attempt + 1})
-                after 0.5: try_configure(attempt + 1)
+            _log.debug("CLI client connected, sending configuration commands")
+            # For IOS XE, clear the archive log before applying config for clean diff
+            if device_platform == "cisco_iosxe":
+                _log.debug("Clearing archive log for IOS XE before configuration")
+                def on_clear_complete(err: ?Exception, response: ?str):
+                    if err is not None:
+                        _log.warning("Failed to clear archive log", {"error": str(err)})
+                        callback(err)
+                    else:
+                        client.configure_and_commit(on_success, on_error, cli_commands)
+                client.cmd(on_clear_complete, "clear archive log config force")
             else:
-                _log.error("CLI client failed to connect after retries")
-                callback(Exception("CLI client failed to connect within timeout"))
+                client.configure_and_commit(on_success, on_error, cli_commands)
 
-        _log.debug("Waiting for CLI client to connect")
-        after 0.1: try_configure(0)  # Start checking after 100ms
+        def on_client_error(error: Exception):
+            _log.error("Failed to get CLI client", {"error": str(error)})
+            callback(error)
+
+        _get_or_create_cli_client(on_client_success, on_client_error)
 
     def _get_cli_config(callback: action(?str, ?Exception) -> None):
         """Utility function to get CLI config without managing conversion state"""
         _log.info("CLI config utility: retrieving configuration")
 
-        # Get credentials
-        creds = _get_credentials()
-        if creds is not None:
-            username, password = creds
-        else:
-            callback(None, Exception("No credentials available for CLI config"))
-            return
+        def on_client_success(client: router_client.Client):
 
-        _log.info("Starting CLI config retrieval", {"username": username, "host": ip_address, "port": ssh_port})
+            def on_cmd_complete(err: ?Exception, response: ?str):
+                if err is not None:
+                    _log.error("CLI config retrieval failed", {"error": str(err)})
+                    callback(None, Exception("CLI config error: " + str(err)))
+                elif response is not None:
+                    _log.info("CLI config retrieved successfully")
+                    _log.debug("CLI config response", {"response_length": len(response)})
+                    callback(response, None)
+                else:
+                    _log.error("CLI config failed - received None response")
+                    callback(None, Exception("CLI config failed"))
 
-        def on_cmd_complete(err: ?Exception, response: ?str):
-            if err is not None:
-                _log.error("CLI config retrieval failed", {"error": str(err)})
-                callback(None, Exception("CLI config error: " + str(err)))
-            elif response is not None:
-                _log.info("CLI config retrieved successfully")
-                _log.debug("CLI config response", {"response_length": len(response)})
-                callback(response, None)
-            else:
-                _log.error("CLI config failed - received None response")
-                callback(None, Exception("CLI config failed"))
+            _log.debug("CLI utility client connected, sending show config command")
+            client.cmd(on_cmd_complete, "show configuration")
 
-        # Determine device type based on platform
-        device_type = None
-        if device_platform == "cisco_iosxr":
-            device_type = "cisco_iosxr"
-        elif device_platform == "cisco_iosxe":
-            device_type = "cisco_iosxe"
-        elif device_platform == "junos":
-            device_type = "juniper_junos"
-        else:
-            callback(None, Exception("Unrecognized device platform: {device_platform}"))
-            return
+        def on_client_error(error: Exception):
+            _log.error("Failed to get CLI client", {"error": str(error)})
+            callback(None, error)
 
-        # Create router client
-        _log.info("Creating CLI utility client", {"host": ip_address, "port": ssh_port, "username": username, "device_type": device_type})
-        _log.debug("Password masked", {"password_length": len(password) if password is not None else 0})
-
-        client = router_client.Client(
-            auth=auth,
-            address=ip_address,
-            username=username,
-            password=password,
-            port=ssh_port,
-            device_type=device_type,
-            log_handler=log_handler
-        )
-
-        # Wait for connection and get config
-        def try_get_config(attempt: int):
-            if client.is_connected():
-                _log.debug("CLI utility client connected, sending show config command")
-                client.cmd(on_cmd_complete, "show configuration")
-            elif attempt < 10:  # Retry for up to 5 seconds (10 attempts * 500ms)
-                _log.debug("CLI utility client not ready, retrying", {"attempt": attempt + 1})
-                after 0.5: try_get_config(attempt + 1)
-            else:
-                _log.error("CLI utility client failed to connect after retries")
-                callback(None, Exception("CLI utility client failed to connect within timeout"))
-
-        _log.debug("Waiting for CLI utility client to connect")
-        after 0.1: try_get_config(0)  # Start checking after 100ms
+        _get_or_create_cli_client(on_client_success, on_client_error)
 
     def _get_netconf_config_parsed(module_set: str, result_callback: action(?(raw: xml.Node, gdata: yang.gdata.Node), ?Exception) -> None):
         """Get NETCONF config and parse it with schemas
@@ -818,24 +861,13 @@ actor DeviceInstance(auth: WorldCap, log_handler: logging.Handler, platform_name
         """
         _log.info("Getting NETCONF config with parsing")
 
-        # Get credentials
-        creds = _get_credentials()
-        if creds is not None:
-            username, password = creds
-        else:
-            result_callback(None, Exception("No credentials available"))
-            return
-
-        _log.info("Starting NETCONF retrieval", {"username": username, "host": ip_address, "port": netconf_port})
-
-        def on_connect_success(client: netconf.Client):
+        def on_client_success(client: netconf.Client):
             _log.info("NETCONF client connected successfully")
 
             def on_get_config_done(client: netconf.Client, response: ?xml.Node, error: ?netconf.NetconfError):
                 _log.debug("Get-config response received")
                 if error is not None:
                     _log.error("Get-config failed with NETCONF error", {"error": error})
-                    client.close()
                     result_callback(None, Exception("Get-config failed with NETCONF error: " + str(error)))
                 elif response is not None:
                     # Extract the <data> element from the RPC reply
@@ -856,195 +888,100 @@ actor DeviceInstance(auth: WorldCap, log_handler: logging.Handler, platform_name
                                 parsed_gdata = yang.gen3.from_xml(compiled_schema, config_xml, loose=True)
                                 _log.info("Successfully parsed to gdata")
 
-                                # Close connection and return results
-                                client.close()
                                 result_callback((raw=config_xml, gdata=parsed_gdata), None)
                             except Exception as e:
                                 _log.error("Failed to parse with gen3 - cannot proceed", {"error": str(e)})
-                                client.close()
                                 result_callback(None, Exception("Failed to parse with gen3: " + str(e)))
                         else:
                             _log.error("No compiled schema available - cannot proceed with conversion", {"error": serror})
-                            client.close()
                             result_callback(None, Exception("No compiled schema available - cannot proceed with conversion"))
                     else:
                         _log.error("No data element in get-config response")
-                        client.close()
                         result_callback(None, Exception("No data element in get-config response"))
                 else:
                     _log.error("Get-config failed - received None response")
-                    client.close()
                     result_callback(None, Exception("Get-config failed - received None response"))
 
             client.get_config(on_get_config_done)
 
-        def on_connect_failure(error: Exception):
-            _log.error("NETCONF connection failed after retries", {"error": str(error)})
+        def on_client_error(error: Exception):
+            _log.error("Failed to get NETCONF client", {"error": str(error)})
             result_callback(None, error)
 
-        # Create NETCONF client with retry (limited retries for conversions)
-        _log.info("Creating NETCONF client", {"host": ip_address, "port": netconf_port, "username": username})
-        create_netconf_client_with_retry(username, password, on_connect_success, on_connect_failure, max_retries=5)
+        _get_or_create_netconf_client(on_client_success, on_client_error)
 
     def _cli_output(result_callback: action(?str, ?Exception) -> None):
         """Retrieve configuration via CLI commands"""
         _log.info("CLI output handler: retrieving configuration")
 
-        # Get credentials
-        creds = _get_credentials()
-        if creds is not None:
-            username, password = creds
-        else:
+        def on_client_success(client: router_client.Client):
+            _log.debug("CLI client ready for show configuration")
+
+            def on_cmd_complete(err: ?Exception, response: ?str):
+                if err is not None:
+                    _log.error("CLI show configuration failed", {"error": str(err)})
+                    state = "ready"
+                    result_callback(None, Exception("CLI show configuration error: " + str(err)))
+                elif response is not None:
+                    _log.info("CLI show configuration completed successfully")
+                    _log.debug("CLI response", {"response_length": len(response)})
+                    state = "ready"
+                    result_callback(response, None)
+                else:
+                    _log.error("CLI show configuration failed - received None response")
+                    state = "ready"
+                    result_callback(None, Exception("CLI show configuration failed"))
+
+            _log.debug("CLI client connected, sending show configuration command")
+            client.cmd(on_cmd_complete, "show configuration")
+
+        def on_client_error(error: Exception):
+            _log.error("Failed to get CLI client", {"error": str(error)})
             state = "ready"
-            result_callback(None, Exception("No credentials available"))
-            return
+            result_callback(None, error)
 
-        _log.info("Starting CLI output", {"username": username, "host": ip_address, "port": ssh_port})
-
-        def on_success(response: str):
-            _log.info("CLI show configuration completed successfully")
-            _log.debug("CLI response", {"response_length": len(response)})
-            state = "ready"
-            result_callback(response, None)
-
-        def on_error(error: Exception, response: str):
-            _log.error("CLI show configuration failed", {"error": str(error), "response": response})
-            state = "ready"
-            result_callback(None, Exception("CLI show configuration error: " + str(error)))
-
-        # Determine device type based on platform
-        device_type = None
-        if device_platform == "cisco_iosxr":
-            device_type = "cisco_iosxr"
-        elif device_platform == "cisco_iosxe":
-            device_type = "cisco_iosxe"
-        elif device_platform == "junos":
-            device_type = "juniper_junos"
-        else:
-            result_callback(None, Exception("Unrecognized device platform: {device_platform}"))
-            return
-
-        # Create router client
-        _log.info("Creating CLI client connection", {"host": ip_address, "port": ssh_port, "username": username, "device_type": device_type})
-        _log.debug("Password masked", {"password_length": len(password) if password is not None else 0})
-
-        client = router_client.Client(
-            auth=auth,
-            address=ip_address,
-            username=username,
-            password=password,
-            port=ssh_port,
-            device_type=device_type,
-            log_handler=log_handler
-        )
-
-        # Use cmd method for show commands instead of configure_and_commit
-        def on_cmd_complete(err: ?Exception, response: ?str):
-            if err is not None:
-                _log.error("CLI show configuration failed", {"error": str(err)})
-                state = "ready"
-                result_callback(None, Exception("CLI show configuration error: " + str(err)))
-            elif response is not None:
-                _log.info("CLI show configuration completed successfully")
-                _log.debug("CLI response", {"response_length": len(response)})
-                state = "ready"
-                result_callback(response, None)
-            else:
-                _log.error("CLI show configuration failed - received None response")
-                state = "ready"
-                result_callback(None, Exception("CLI show configuration failed"))
-
-        # Wait for connection and get configuration
-        def try_show_config(attempt: int):
-            if client.is_connected():
-                _log.debug("CLI client connected, sending show configuration command")
-                client.cmd(on_cmd_complete, "show configuration")
-            elif attempt < 10:  # Retry for up to 5 seconds (10 attempts * 500ms)
-                _log.debug("CLI client not ready, retrying", {"attempt": attempt + 1})
-                after 0.5: try_show_config(attempt + 1)
-            else:
-                _log.error("CLI client failed to connect after retries")
-                state = "ready"
-                result_callback(None, Exception("CLI client failed to connect within timeout"))
-
-        _log.debug("Waiting for CLI client to connect")
-        after 0.1: try_show_config(0)  # Start checking after 100ms
+        _get_or_create_cli_client(on_client_success, on_client_error)
 
     def _get_cli_diff(result_callback: action(?str, ?Exception) -> None):
         """Get CLI diff using 'show configuration | compare rollback 1'"""
         _log.info("CLI diff handler: getting configuration differences")
 
-        # Get credentials
-        creds = _get_credentials()
-        if creds is not None:
-            username, password = creds
-        else:
-            result_callback(None, Exception("No credentials available for CLI diff"))
-            return
+        def on_client_success(client: router_client.Client):
+            _log.debug("CLI client ready for diff command")
 
-        _log.info("Starting CLI diff retrieval", {"username": username, "host": ip_address, "port": ssh_port})
-
-        def on_cmd_complete(err: ?Exception, response: ?str):
-            if err is not None:
-                _log.error("CLI diff command failed", {"error": str(err)})
-                result_callback(None, Exception("CLI diff error: " + str(err)))
-            elif response is not None:
-                _log.info("CLI diff retrieved successfully")
-                _log.debug("CLI diff response", {"response_length": len(response)})
-                result_callback(response, None)
-            else:
-                _log.error("CLI diff failed - received None response")
-                result_callback(None, Exception("CLI diff failed"))
-
-        # Determine device type and diff command based on platform
-        device_type = None
-        diff_command = None
-        if device_platform == "cisco_iosxr":
-            device_type = "cisco_iosxr"
-            diff_command = "show configuration commit changes last 1"
-        elif device_platform == "cisco_iosxe":
-            device_type = "cisco_iosxe"
-            diff_command = "show archive log config all provisioning"
-        elif device_platform == "junos":
-            device_type = "juniper_junos"
-            diff_command = "show configuration | compare rollback 1"
-        else:
-            result_callback(None, Exception("Unrecognized device platform: {device_platform}"))
-            return
-
-        # Create router client
-        _log.info("Creating CLI client for diff", {"host": ip_address, "port": ssh_port, "username": username, "device_type": device_type})
-        _log.debug("Password masked", {"password_length": len(password) if password is not None else 0})
-
-        client = router_client.Client(
-            auth=auth,
-            address=ip_address,
-            username=username,
-            password=password,
-            port=ssh_port,
-            device_type=device_type,
-            log_handler=log_handler
-        )
-
-        # Wait for connection and get diff
-        def try_get_diff(attempt: int):
-            if client.is_connected():
-                if diff_command is not None:
-                    _log.debug("CLI client connected, sending diff command", {"command": diff_command})
-                    client.cmd(on_cmd_complete, diff_command)
+            def on_cmd_complete(err: ?Exception, response: ?str):
+                if err is not None:
+                    _log.error("CLI diff command failed", {"error": str(err)})
+                    result_callback(None, Exception("CLI diff error: " + str(err)))
+                elif response is not None:
+                    _log.info("CLI diff retrieved successfully")
+                    _log.debug("CLI diff response", {"response_length": len(response)})
+                    result_callback(response, None)
                 else:
-                    # This should never happen due to early return, but the compiler can't know that (yet?)
-                    result_callback(None, Exception("Invalid diff command"))
-                    return
-            elif attempt < 10:  # Retry for up to 5 seconds (10 attempts * 500ms)
-                _log.debug("CLI client not ready for diff, retrying", {"attempt": attempt + 1})
-                after 0.5: try_get_diff(attempt + 1)
-            else:
-                _log.error("CLI client failed to connect for diff after retries")
-                result_callback(None, Exception("CLI client failed to connect for diff within timeout"))
+                    _log.error("CLI diff failed - received None response")
+                    result_callback(None, Exception("CLI diff failed"))
 
-        _log.debug("Waiting for CLI client to connect for diff")
-        after 0.1: try_get_diff(0)  # Start checking after 100ms
+            # Determine diff command based on platform
+            diff_command = None
+            if device_platform == "cisco_iosxr":
+                diff_command = "show configuration commit changes last 1"
+            elif device_platform == "cisco_iosxe":
+                diff_command = "show archive log config all provisioning"
+            elif device_platform == "junos":
+                diff_command = "show configuration | compare rollback 1"
+            else:
+                result_callback(None, Exception("Unrecognized device platform: {device_platform}"))
+                return
+
+            if diff_command is not None:
+                _log.debug("CLI client connected, sending diff command", {"command": diff_command})
+                client.cmd(on_cmd_complete, diff_command)
+
+        def on_client_error(error: Exception):
+            _log.error("Failed to get CLI client", {"error": str(error)})
+            result_callback(None, error)
+
+        _get_or_create_cli_client(on_client_success, on_client_error)
 
     def _compute_gdata_diff(base_gdata: yang.gdata.Node, final_gdata: yang.gdata.Node, target_format: str, module_set: str) -> str:
         """Compute diff between base and final gdata configs"""
@@ -1054,25 +991,25 @@ actor DeviceInstance(auth: WorldCap, log_handler: logging.Handler, platform_name
 
             if diff_result is not None:
                 # Convert diff to appropriate format based on target_format
-                        if target_format == "json":
-                            return diff_result.to_json()
-                        elif target_format == "acton-gdata":
-                            return diff_result.prsrc()
-                        elif target_format == "acton-adata":
-                            # Convert diff to adata format if schema is available
-                            compiled_schema, error = get_compiled_schema(module_set)
-                            if compiled_schema is not None:
-                                return yang.gen3.pradata(compiled_schema, diff_result, loose=True, self_name="dev")
-                            else:
-                                _log.warning("No compiled schema for adata diff conversion, using prsrc", {"error": error})
-                                return diff_result.prsrc()
-                        elif target_format in ["netconf", "xml"]:
-                            # For XML formats, return the diff as XML string
-                            return diff_result.to_xmlstr()
-                        else:
-                            # Default to prsrc format for unknown formats
-                            _log.warning("Unknown target format for diff, using prsrc", {"target_format": target_format})
-                            return diff_result.prsrc()
+                if target_format == "json":
+                    return diff_result.to_json()
+                elif target_format == "acton-gdata":
+                    return diff_result.prsrc()
+                elif target_format == "acton-adata":
+                    # Convert diff to adata format if schema is available
+                    compiled_schema, error = get_compiled_schema(module_set)
+                    if compiled_schema is not None:
+                        return yang.gen3.pradata(compiled_schema, diff_result, loose=True, self_name="dev")
+                    else:
+                        _log.warning("No compiled schema for adata diff conversion, using prsrc", {"error": error})
+                        return diff_result.prsrc()
+                elif target_format in ["netconf", "xml"]:
+                    # For XML formats, return the diff as XML string
+                    return diff_result.to_xmlstr()
+                else:
+                    # Default to prsrc format for unknown formats
+                    _log.warning("Unknown target format for diff, using prsrc", {"target_format": target_format})
+                    return diff_result.prsrc()
             else:
                 _log.info("No differences found between base and final configs")
                 return "No configuration changes"
