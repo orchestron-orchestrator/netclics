@@ -498,7 +498,7 @@ actor DeviceInstance(auth: WorldCap, log_handler: logging.Handler, platform_name
                 _log.warning("Error closing CLI client", {"error": str(e)})
             conversion_cli_client = None
 
-    def convert(request: ConvertRequest, result_callback: action(?str, ?Exception) -> None):
+    def convert(request: ConvertRequest, result_callback: action(?(base_config: str, config: str, diff: str), ?Exception) -> None):
         """Process a conversion request on this device"""
         _log.info("DeviceInstance.convert called", {"device": container_id, "input_format": request.format, "output_format": request.target_format, "module_set": request.module_set})
         _log.debug("Input data", {"device": container_id, "input_data": request.input})
@@ -682,20 +682,19 @@ actor DeviceInstance(auth: WorldCap, log_handler: logging.Handler, platform_name
         def complete(diff_text: str):
             """Successfully complete the conversion"""
             # Return base, final configurations and diff
-            result_dict = {
-                "base_config": base_config_formatted,
-                "config": final_config_formatted,
-                "diff": diff_text
-            }
-            combined_result = json.encode(result_dict)
-            finish(None, combined_result)
+            result = (
+                base_config=base_config_formatted,
+                config=final_config_formatted,
+                diff=diff_text
+            )
+            finish(None, result)
 
         def abort(error: str):
             """Abort the conversion due to error"""
             _log.error("Conversion aborted", {"error": error})
             finish(Exception(error), None)
 
-        def finish(error: ?Exception, result: ?str):
+        def finish(error: ?Exception, result):
             """Final cleanup and callback"""
             # Reset state
             state = "ready"
@@ -1502,7 +1501,7 @@ actor Director(auth: WorldCap, proc_cap: process.ProcessCap, log_handler: loggin
         _log.info("Director initialized")
 
 
-    def convert(request: ConvertRequest, callback: action(?str, ?Exception) -> None):
+    def convert(request: ConvertRequest, callback: action(?(base_config: str, config: str, diff: str), ?Exception) -> None):
         """Process a conversion request"""
         _log.info("Director.convert called", {"input_format": request.format, "output_format": request.target_format, "platform": request.platform, "module_set": request.module_set, "input_length": len(request.input)})
 
@@ -1682,7 +1681,7 @@ class MCPResponse(object):
 
 # MCP Server Actor
 
-actor MCPServer(convert_fn: action(ConvertRequest, action(?str, ?Exception) -> None) -> None,
+actor MCPServer(convert_fn: action(ConvertRequest, action(?(base_config: str, config: str, diff: str), ?Exception) -> None) -> None,
                 get_platforms_fn: action() -> list[dict[str, ?value]],
                 get_instances_fn: action() -> list[dict[str, ?value]],
                 log_handler: logging.Handler):
@@ -1877,45 +1876,17 @@ actor MCPServer(convert_fn: action(ConvertRequest, action(?str, ?Exception) -> N
                 return
 
             # Define callback for when conversion completes
-            def on_conversion_done(result: ?str, error: ?Exception):
+            def on_conversion_done(result: ?(base_config: str, config: str, diff: str), error: ?Exception):
                 if error is None and result is not None:
-                    # Format result for MCP
-                    try:
-                        result_dict = json.decode(result)
-                        if isinstance(result_dict, dict) and "base_config" in result_dict and "config" in result_dict:
-                            # Include before/after configs and diff
-                            mcp_result = {
-                                "content": [
-                                    {
-                                        "type": "text",
-                                        "text": "Conversion successful!\n\nConverted configuration:\n{result_dict['config']}"
-                                    }
-                                ]
+                    # Format result for MCP using tuple fields directly
+                    mcp_result = {
+                        "content": [
+                            {
+                                "type": "text",
+                                "text": "Conversion successful!\n\nConverted configuration:\n{result.config}\n\nConfiguration diff:\n{result.diff}"
                             }
-                            if "diff" in result_dict and result_dict["diff"]:
-                                mcp_result["content"].append({
-                                    "type": "text",
-                                    "text": "\nConfiguration diff:\n{result_dict['diff']}"
-                                })
-                        else:
-                            mcp_result = {
-                                "content": [
-                                    {
-                                        "type": "text",
-                                        "text": "Conversion successful!\n\n{result}"
-                                    }
-                                ]
-                            }
-                    except Exception:
-                        # Fallback for non-JSON results
-                        mcp_result = {
-                            "content": [
-                                {
-                                    "type": "text",
-                                    "text": "Conversion successful!\n\n{result}"
-                                }
-                            ]
-                        }
+                        ]
+                    }
 
                     _send_success_response(request_id, mcp_result, respond, "convert_config-success")
                 else:
@@ -2032,44 +2003,20 @@ actor WebServ(listen_cap: net.TCPListenCap, port, director, log_handler: logging
                 _log.info("ConvertRequest created", {"input_format": convert_req.format, "output_format": convert_req.target_format, "platform": convert_req.platform})
 
                 # Define callback for when conversion completes
-                def on_conversion_done(result: ?str, error: ?Exception):
+                def on_conversion_done(result: ?(base_config: str, config: str, diff: str), error: ?Exception):
                     _log.debug("Conversion completed, preparing HTTP response")
                     if error is None and result is not None:
-                        _log.info("Conversion successful", {"result_length": len(result)})
+                        _log.info("Conversion successful")
 
-                        # Try to parse the result as JSON (base_config + config format)
-                        try:
-                            result_dict = json.decode(result)
-                            if isinstance(result_dict, dict) and "base_config" in result_dict and "config" in result_dict:
-                                # New format with before/after configs and diff
-                                response = {
-                                    "success": True,
-                                    "base_config": result_dict["base_config"],
-                                    "config": result_dict["config"],
-                                    "platform": convert_req.platform,
-                                    "platform_version": "1.0"
-                                }
-                                # Add diff field if it exists in result_dict
-                                if "diff" in result_dict:
-                                    response["diff"] = result_dict["diff"]
-                                else:
-                                    response["diff"] = ""
-                            else:
-                                # Fallback to old format
-                                response = {
-                                    "success": True,
-                                    "output": result,
-                                    "platform": convert_req.platform,
-                                    "platform_version": "1.0"
-                                }
-                        except Exception:
-                            # If JSON parsing fails, use old format
-                            response = {
-                                "success": True,
-                                "output": result,
-                                "platform": convert_req.platform,
-                                "platform_version": "1.0"
-                            }
+                        # Access tuple fields directly
+                        response = {
+                            "success": True,
+                            "base_config": result.base_config,
+                            "config": result.config,
+                            "diff": result.diff,
+                            "platform": convert_req.platform,
+                            "platform_version": "1.0"
+                        }
                     else:
                         error_msg = str(error) if error is not None else "Conversion failed"
                         _log.error("Conversion failed", {"error": error_msg})
