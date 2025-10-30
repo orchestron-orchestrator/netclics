@@ -498,21 +498,26 @@ actor DeviceInstance(auth: WorldCap, log_handler: logging.Handler, platform_name
                 _log.warning("Error closing CLI client", {"error": str(e)})
             conversion_cli_client = None
 
-    def convert(request: ConvertRequest, result_callback: action(?(base_config: str, config: str, diff: str), ?Exception) -> None):
+    def convert(request: ConvertRequest, result_callback: action(?(base_config: str, steps: list[(input: str, config: str, diff: str)]), ?Exception) -> None):
         """Process a conversion request on this device"""
-        _log.info("DeviceInstance.convert called", {"device": container_id, "input_format": request.format, "output_format": request.target_format, "module_set": request.module_set})
-        _log.debug("Input data", {"device": container_id, "input_data": request.input})
+        _log.info("DeviceInstance.convert called", {"device": container_id, "input_format": request.format, "output_format": request.target_format, "module_set": request.module_set, "steps": len(request.input)})
+        _log.debug("Input steps", {"device": container_id, "input_steps": request.input})
 
         state = "busy"
 
         # Local variables for this conversion only
         base_gdata: ?yang.gdata.Node = None
-        final_gdata: ?yang.gdata.Node = None
         base_xml: ?xml.Node = None
 
-        # Variables to hold formatted configs
+        # Variables to hold formatted base config
         base_config_formatted = ""
-        final_config_formatted = ""
+
+        # List to store formatted results for each step (for API response)
+        steps_results: list[(input: str, config: str, diff: str)] = []
+
+        # List to store gdata for each step (for rollback and diffs)
+        steps_gdata: list[yang.gdata.Node] = []
+
 
         # Helper function to format gdata output based on target format
         def format_gdata_output(gdata: yang.gdata.Node, target_format: str) -> str:
@@ -580,119 +585,188 @@ actor DeviceInstance(auth: WorldCap, log_handler: logging.Handler, platform_name
             on_base_formatted()
 
         def on_base_formatted():
-            """Step 2: Base config is formatted, now apply input"""
-            _log.info("Base configuration formatted, applying input")
-            _handle_input(request.format, request.input, on_input_applied)
+            """Step 2: Base config is formatted, now process input steps"""
+            _log.info("Base configuration formatted, starting sequential input processing")
 
-        def on_input_applied(error: ?Exception):
-            """Step 3: Input has been applied, now get final config"""
-            if error is not None:
-                _log.error("Input application failed", {"error": str(error)})
-                abort(str(error))
+            # Start processing first step
+            process_next_step(0)
+
+        def process_next_step(current_step_index: int):
+            """Process the next configuration step"""
+            if current_step_index >= len(request.input):
+                # All steps completed, now rollback and finalize
+                _log.info("All steps completed, starting rollback")
+                on_all_steps_complete()
                 return
 
-            _log.info("Input applied successfully, getting final configuration")
-            _get_netconf_config_parsed(request.module_set, on_final_config_retrieved)
+            _log.info("Processing step", {"step": current_step_index + 1, "of": len(request.input)})
 
-        def on_final_config_retrieved(config_tuple: ?(raw: xml.Node, gdata: yang.gdata.Node), error: ?Exception):
-            """Step 4: Process the retrieved final configuration"""
+            # For IOS XE, clear the archive log before each step because we rely
+            # on "show archive log ..." to compute the CLI diff. This works for
+            # both CLI and NETCONF inputs
+            if device_platform == "cisco_iosxe":
+                def on_step_archive_cleared(err: ?Exception):
+                    if err is not None:
+                        _log.error("Failed to clear archive log before step", {"step": current_step_index + 1, "error": str(err)})
+                        abort(f"Failed to clear archive log before step {current_step_index + 1}: {str(err)}")
+                    else:
+                        _log.debug("Archive log cleared before step", {"step": current_step_index + 1})
+                        # Apply current step's configuration
+                        current_input = request.input[current_step_index]
+                        _handle_input(request.format, current_input, lambda error: on_step_input_applied(current_step_index, error))
+                _clear_iosxe_archive_log(on_step_archive_cleared)
+            else:
+                # Apply current step's configuration
+                current_input = request.input[current_step_index]
+                _handle_input(request.format, current_input, lambda error: on_step_input_applied(current_step_index, error))
+
+        def on_step_input_applied(current_step_index: int, error: ?Exception):
+            """Called after a step's input has been applied"""
             if error is not None:
-                _log.error("Failed to retrieve final configuration", {"error": str(error)})
-                abort("Failed to retrieve final configuration: " + str(error))
+                _log.error("Step input application failed", {"step": current_step_index + 1, "error": str(error)})
+                abort(f"Failed at step {current_step_index + 1}: {str(error)}")
                 return
 
-            if config_tuple is None:
-                _log.error("No final configuration tuple returned")
-                abort("No final configuration returned")
+            _log.info("Step input applied successfully, retrieving configuration", {"step": current_step_index + 1})
+            _get_netconf_config_parsed(request.module_set, lambda config_tuple, error: on_step_config_retrieved(current_step_index, config_tuple, error))
+
+        def on_step_config_retrieved(current_step_index: int, config_tuple: ?(raw: xml.Node, gdata: yang.gdata.Node), error: ?Exception):
+            """Process the configuration after a step"""
+            if error is not None:
+                _log.error("Failed to retrieve step configuration", {"step": current_step_index + 1, "error": str(error)})
+                abort(f"Failed to retrieve configuration at step {current_step_index + 1}: {str(error)}")
                 return
 
             if config_tuple is not None:
-                final_raw_xml: xml.Node = config_tuple.raw
-                final_parsed_gdata: yang.gdata.Node = config_tuple.gdata
+                step_raw_xml: xml.Node = config_tuple.raw
+                step_gdata: yang.gdata.Node = config_tuple.gdata
 
-                _log.info("Final configuration retrieved and parsed successfully")
+                _log.info("Step configuration retrieved", {"step": current_step_index + 1})
 
-                # Store final gdata for diff
-                final_gdata = final_parsed_gdata
+                # Store gdata for this step
+                steps_gdata.append(step_gdata)
 
-                # Format final config for response
+                # Format config for this step
                 if request.target_format == "cli":
-                    # CLI needs special handling
-                    _get_cli_config(on_final_cli_retrieved)
+                    _get_cli_config(lambda cli_config, error: on_step_cli_retrieved(current_step_index, cli_config, error))
                 else:
-                    # Format gdata for response
-                    final_config_formatted = format_gdata_output(final_parsed_gdata, request.target_format)
-                    on_final_formatted()
-
-        def on_final_cli_retrieved(cli_config: ?str, error: ?Exception):
-            """Handle CLI format for final configuration"""
-            if error is not None:
-                _log.error("Failed to get CLI final config", {"error": str(error)})
-                abort("Failed to get CLI final config: " + str(error))
-                return
-            if cli_config is None:
-                _log.error("CLI config is None")
-                abort("CLI config is None")
-                return
-            final_config_formatted = cli_config
-            on_final_formatted()
-
-        def on_final_formatted():
-            """Step 5: Final config is formatted, now compute diff"""
-            _log.info("Final configuration formatted successfully, computing diff")
-
-            # Get diff based on target format
-            if request.target_format == "cli":
-                _log.info("Getting CLI diff using compare rollback")
-                _get_cli_diff(on_diff_computed)
-            elif base_gdata is not None and final_gdata is not None:
-                # Use gdata diff for schema-aware formats
-                _log.info("Computing gdata-based diff")
-                diff_text = _compute_gdata_diff(base_gdata, final_gdata, request.target_format, request.module_set)
-                on_diff_computed(diff_text, None)
+                    step_config_formatted = format_gdata_output(step_gdata, request.target_format)
+                    on_step_formatted(current_step_index, step_config_formatted)
             else:
-                _log.info("Diff not available")
-                on_diff_computed("", None)  # Empty diff
+                _log.error("No configuration returned for step", {"step": current_step_index + 1})
+                abort(f"No configuration returned for step {current_step_index + 1}")
 
-        def on_diff_computed(diff_text: ?str, error: ?Exception):
-            """Step 6: Diff computed, now rollback to clean state"""
-            _log.info("Diff computed, starting rollback to clean device state")
+        def on_step_cli_retrieved(current_step_index: int, cli_config: ?str, error: ?Exception):
+            """Handle CLI format for step configuration"""
+            if error is not None:
+                _log.error("Failed to get CLI config for step", {"step": current_step_index + 1, "error": str(error)})
+                abort(f"Failed to get CLI config for step {current_step_index + 1}: {str(error)}")
+                return
+            elif cli_config is not None:
+                on_step_formatted(current_step_index, cli_config)
+                return
+            else:
+                _log.error("CLI config is None for step", {"step": current_step_index + 1})
+                abort(f"CLI config is None for step {current_step_index + 1}")
+                return
 
-            # Store diff for response (use empty string if failed)
+        def on_step_formatted(current_step_index: int, step_config: str):
+            """Step config formatted, compute diff and store results"""
+            _log.info("Computing diff for step", {"step": current_step_index + 1})
+
+            # Define callback with closure over step_config and index
+            def on_step_diff_computed_with_config(diff_text: ?str, error: ?Exception):
+                on_step_diff_computed(current_step_index, step_config, diff_text, error)
+
+            # Compute incremental diff
+            if request.target_format == "cli":
+                # For CLI, we'll use the CLI diff command
+                _get_cli_diff(on_step_diff_computed_with_config)
+            else:
+                # Compute gdata diff
+                current_gdata = steps_gdata[current_step_index]
+                if current_step_index == 0:
+                    # First step - diff from base
+                    diff_text = _compute_gdata_diff(base_gdata, current_gdata, request.target_format, request.module_set) if base_gdata is not None else ""
+                else:
+                    # Subsequent steps - diff from previous step
+                    previous_step_gdata = steps_gdata[current_step_index - 1]
+                    diff_text = _compute_gdata_diff(previous_step_gdata, current_gdata, request.target_format, request.module_set)
+                on_step_diff_computed_with_config(diff_text, None)
+
+        def on_step_diff_computed(current_step_index: int, step_config: str, diff_text: ?str, error: ?Exception):
+            """Store step results and move to next step"""
             computed_diff = diff_text if diff_text is not None else ""
 
-            # Start rollback process using saved XML
-            if base_xml is not None and base_gdata is not None:
-                _log.info("Starting automatic rollback to clean device state using NETCONF")
-                _rollback_to_config(base_xml, base_gdata, final_gdata, lambda error: on_rollback_complete(computed_diff, error))
-            else:
-                _log.error("No base XML available")
-                on_rollback_complete(computed_diff, Exception("No base XML available"))
+            # Store this step's results as a named tuple
+            step_result = (
+                input=request.input[current_step_index],
+                config=step_config,
+                diff=computed_diff
+            )
+            steps_results.append(step_result)
 
-        def on_rollback_complete(diff_text: str, rollback_error: ?Exception):
-            """Step 7: Rollback complete, finish the conversion"""
+            # Move to next step
+            process_next_step(current_step_index + 1)
+
+        def on_all_steps_complete():
+            """All steps completed, perform rollback"""
+            _log.info("All configuration steps completed, starting rollback")
+
+            # Get final gdata (last step's gdata) for rollback
+            final_gdata = steps_gdata[-1] if len(steps_gdata) > 0 else None
+
+            # Start rollback process
+            if base_xml is not None and base_gdata is not None and final_gdata is not None:
+                _log.info("Starting automatic rollback to clean device state using NETCONF")
+                _rollback_to_config(base_xml, base_gdata, final_gdata, on_rollback_complete)
+            else:
+                _log.error("Missing data for rollback")
+                on_rollback_complete(Exception("Missing data for rollback"))
+
+
+        def on_rollback_complete(rollback_error: ?Exception):
+            """Rollback complete, finish the conversion"""
             if rollback_error is None:
                 _log.info("Device successfully rolled back to clean state")
             else:
                 _log.warning("Rollback failed but conversion succeeded", {"error": str(rollback_error)})
 
             # Complete successfully with results
-            complete(diff_text)
+            complete()
 
-        def complete(diff_text: str):
+        def complete():
             """Successfully complete the conversion"""
-            # Return base, final configurations and diff
+            # Return base config and steps as a named tuple
             result = (
                 base_config=base_config_formatted,
-                config=final_config_formatted,
-                diff=diff_text
+                steps=steps_results
             )
             finish(None, result)
 
         def abort(error: str):
-            """Abort the conversion due to error"""
-            _log.error("Conversion aborted", {"error": error})
-            finish(Exception(error), None)
+            """Abort the conversion due to error and rollback to initial state"""
+            _log.error("Conversion aborted, attempting rollback", {"error": error})
+
+            # Only rollback if we have made changes (base_xml exists means we got past initial config)
+            if base_xml is not None and base_gdata is not None and len(steps_gdata) > 0:
+                # We have applied at least one step, need to rollback
+                current_gdata = steps_gdata[-1]
+                _log.info("Rolling back to initial state after error")
+                _rollback_to_config(base_xml, base_gdata, current_gdata, lambda rollback_error: on_abort_rollback_complete(error, rollback_error))
+            else:
+                # Either no base config (failed early) or no steps applied - nothing to rollback
+                _log.info("No rollback needed - no changes were applied")
+                finish(Exception(error), None)
+
+        def on_abort_rollback_complete(original_error: str, rollback_error: ?Exception):
+            """Handle rollback completion after abort"""
+            if rollback_error is None:
+                _log.info("Successfully rolled back to initial state after abort")
+            else:
+                _log.error("Failed to rollback after abort", {"rollback_error": str(rollback_error)})
+            # Always finish with the original error that caused the abort
+            finish(Exception(original_error), None)
 
         def finish(error: ?Exception, result):
             """Final cleanup and callback"""
@@ -806,18 +880,7 @@ actor DeviceInstance(auth: WorldCap, log_handler: logging.Handler, platform_name
                 callback(Exception("CLI configuration error: " + str(err)))
 
             _log.debug("CLI client connected, sending configuration commands")
-            # For IOS XE, clear the archive log before applying config for clean diff
-            if device_platform == "cisco_iosxe":
-                _log.debug("Clearing archive log for IOS XE before configuration")
-                def on_clear_complete(err: ?Exception, response: ?str):
-                    if err is not None:
-                        _log.warning("Failed to clear archive log", {"error": str(err)})
-                        callback(err)
-                    else:
-                        client.configure_and_commit(on_success, on_error, cli_commands)
-                client.cmd(on_clear_complete, "clear archive log config force")
-            else:
-                client.configure_and_commit(on_success, on_error, cli_commands)
+            client.configure_and_commit(on_success, on_error, cli_commands)
 
         def on_client_error(error: Exception):
             _log.error("Failed to get CLI client", {"error": str(error)})
@@ -1455,7 +1518,7 @@ class SystemConfig(object):
         return None
 
 class ConvertRequest(object):
-    def __init__(self, input: str, format: str, target_format: str, platform: str, module_set: str, cb: ?action(str) -> None = None):
+    def __init__(self, input: list[str], format: str, target_format: str, platform: str, module_set: str, cb: ?action(str) -> None = None):
         self.input = input
         self.format = format
         self.target_format = target_format
@@ -1482,10 +1545,14 @@ class ConvertRequest(object):
         platform_val = data["platform"]
         module_set_val =  data.get_def("module_set", ALL_MODULE_SET)
 
-        # Type check all at once
-        if isinstance(input_val, str) and isinstance(format_val, str) and isinstance(target_format_val, str) and isinstance(platform_val, str) and isinstance(module_set_val, str):
-            return ConvertRequest(input_val, format_val, target_format_val, platform_val, module_set_val, None)
-        raise ValueError("All fields must be strings")
+        # Type check - input must be a list of strings (Acton lists are homogenous)
+        if isinstance(input_val, list) and len(input_val) > 0 and isinstance(input_val[0], str):
+            if isinstance(format_val, str) and isinstance(target_format_val, str) and isinstance(platform_val, str) and isinstance(module_set_val, str):
+                return ConvertRequest(input_val, format_val, target_format_val, platform_val, module_set_val, None)
+            else:
+                raise ValueError("format, target_format, platform, and module_set must be strings")
+        else:
+            raise ValueError("input must be a non-empty list of strings")
 
 actor Director(auth: WorldCap, proc_cap: process.ProcessCap, log_handler: logging.Handler):
     var device_manager: ?DeviceManager = None
@@ -1501,9 +1568,9 @@ actor Director(auth: WorldCap, proc_cap: process.ProcessCap, log_handler: loggin
         _log.info("Director initialized")
 
 
-    def convert(request: ConvertRequest, callback: action(?(base_config: str, config: str, diff: str), ?Exception) -> None):
+    def convert(request: ConvertRequest, callback: action(?(base_config: str, steps: list[(input: str, config: str, diff: str)]), ?Exception) -> None):
         """Process a conversion request"""
-        _log.info("Director.convert called", {"input_format": request.format, "output_format": request.target_format, "platform": request.platform, "module_set": request.module_set, "input_length": len(request.input)})
+        _log.info("Director.convert called", {"input_format": request.format, "output_format": request.target_format, "platform": request.platform, "module_set": request.module_set, "input_count": len(request.input)})
 
         dm = device_manager
         if dm is not None:
@@ -1681,7 +1748,7 @@ class MCPResponse(object):
 
 # MCP Server Actor
 
-actor MCPServer(convert_fn: action(ConvertRequest, action(?(base_config: str, config: str, diff: str), ?Exception) -> None) -> None,
+actor MCPServer(convert_fn: action(ConvertRequest, action(?(base_config: str, steps: list[(input: str, config: str, diff: str)]), ?Exception) -> None) -> None,
                 get_platforms_fn: action() -> list[dict[str, ?value]],
                 get_instances_fn: action() -> list[dict[str, ?value]],
                 log_handler: logging.Handler):
@@ -1779,7 +1846,7 @@ actor MCPServer(convert_fn: action(ConvertRequest, action(?(base_config: str, co
                     "inputSchema": {
                         "type": "object",
                         "properties": {
-                            "input_config": {"type": "string", "description": "The configuration to convert"},
+                            "input_config": {"type": "array", "items": {"type": "string"}, "description": "List of configuration snippets to apply sequentially"},
                             "format": {"type": "string", "description": "Input format (cli, netconf, json)"},
                             "target_format": {"type": "string", "description": "Target format (cli, netconf, json, acton-adata, acton-gdata)"},
                             "platform": {"type": "string", "description": "Platform identifier"},
@@ -1867,25 +1934,35 @@ actor MCPServer(convert_fn: action(ConvertRequest, action(?(base_config: str, co
                 platform = args["platform"]
             module_set = args.get_def("module_set", ALL_MODULE_SET)
 
-            # Type checking
-            if isinstance(input_config, str) and isinstance(format_val, str) and isinstance(target_format, str) and isinstance(platform, str) and isinstance(module_set, str):
-                # All parameters are valid strings, create conversion request
+            # Type checking - input_config must be a list of strings
+            if isinstance(input_config, list) and len(input_config) > 0 and isinstance(input_config[0], str) and isinstance(format_val, str) and isinstance(target_format, str) and isinstance(platform, str) and isinstance(module_set, str):
+                # All parameters are valid, create conversion request
                 convert_req = ConvertRequest(input_config, format_val, target_format, platform, module_set, None)
             else:
-                _send_error_response(request_id, MCP_INVALID_PARAMS, "All parameters must be strings", respond, "convert_config-validation")
+                _send_error_response(request_id, MCP_INVALID_PARAMS, "input_config must be a non-empty list of strings, and other parameters must be strings", respond, "convert_config-validation")
                 return
 
             # Define callback for when conversion completes
-            def on_conversion_done(result: ?(base_config: str, config: str, diff: str), error: ?Exception):
+            def on_conversion_done(result: ?(base_config: str, steps: list[(input: str, config: str, diff: str)]), error: ?Exception):
                 if error is None and result is not None:
-                    # Format result for MCP using tuple fields directly
+                    content_parts = []
+
+                    # Add base configuration
+                    content_parts.append({
+                        "type": "text",
+                        "text": f"Conversion successful! Processed {len(result.steps)} configuration steps.\n\nBase configuration:\n{result.base_config}"
+                    })
+
+                    # Add each step's results
+                    for i, step in enumerate(result.steps):
+                        step_text = f"\n\n=== Step {i+1} ===\nInput: {step.input}\n\nConfiguration after step:\n{step.config}\n\nDiff from previous step:\n{step.diff}"
+                        content_parts.append({
+                            "type": "text",
+                            "text": step_text
+                        })
+
                     mcp_result = {
-                        "content": [
-                            {
-                                "type": "text",
-                                "text": "Conversion successful!\n\nConverted configuration:\n{result.config}\n\nConfiguration diff:\n{result.diff}"
-                            }
-                        ]
+                        "content": content_parts
                     }
 
                     _send_success_response(request_id, mcp_result, respond, "convert_config-success")
@@ -2003,17 +2080,16 @@ actor WebServ(listen_cap: net.TCPListenCap, port, director, log_handler: logging
                 _log.info("ConvertRequest created", {"input_format": convert_req.format, "output_format": convert_req.target_format, "platform": convert_req.platform})
 
                 # Define callback for when conversion completes
-                def on_conversion_done(result: ?(base_config: str, config: str, diff: str), error: ?Exception):
+                def on_conversion_done(result: ?(base_config: str, steps: list[(input: str, config: str, diff: str)]), error: ?Exception):
                     _log.debug("Conversion completed, preparing HTTP response")
                     if error is None and result is not None:
                         _log.info("Conversion successful")
 
-                        # Access tuple fields directly
+                        steps = [{"input": step.input, "config": step.config, "diff": step.diff} for step in result.steps]
                         response = {
                             "success": True,
                             "base_config": result.base_config,
-                            "config": result.config,
-                            "diff": result.diff,
+                            "steps": steps,
                             "platform": convert_req.platform,
                             "platform_version": "1.0"
                         }

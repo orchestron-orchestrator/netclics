@@ -77,7 +77,7 @@ test-xml-to-xml-crpd:
     RESULT=$(curl -s -X POST http://localhost:8080/api/v1/convert \
       -H "Content-Type: application/json" \
       -d '{
-        "input": "<configuration xmlns:junos=\"http://xml.juniper.net/junos/24.4R0/junos\"><interfaces><interface><name>eth-0/1/2</name><description>XML to XML test</description><unit><name>0</name><family><inet><address><name>10.1.1.1/24</name></address></inet></family></unit></interface></interfaces></configuration>",
+        "input": ["<configuration xmlns:junos=\"http://xml.juniper.net/junos/24.4R0/junos\"><interfaces><interface><name>eth-0/1/2</name><description>XML to XML test</description><unit><name>0</name><family><inet><address><name>10.1.1.1/24</name></address></inet></family></unit></interface></interfaces></configuration>"],
         "format": "netconf",
         "target_format": "netconf",
         "platform": "crpd 24.4R1.9-local"
@@ -86,7 +86,7 @@ test-xml-to-xml-crpd:
 
     echo ""
     echo "=== Configuration Diff ==="
-    echo "$RESULT" | jq -r '.diff'
+    echo "$RESULT" | jq -r '.steps[0].diff'
 
 # Test with malformed NETCONF input
 test-netconf-error:
@@ -94,7 +94,7 @@ test-netconf-error:
     curl -X POST http://localhost:8080/api/v1/convert \
       -H "Content-Type: application/json" \
       -d '{
-        "input": "<configuration xmlns:junos=\"http://xml.juniper.net/junos/24.4R0/junos\"><interfaces><interface><name>ge-0/0/0</name><unit><name>0</name><family><inet><address><name>INVALID_IP</name></address></inet></family></unit></interface></interfaces></configuration>",
+        "input": ["<configuration xmlns:junos=\"http://xml.juniper.net/junos/24.4R0/junos\"><interfaces><interface><name>ge-0/0/0</name><unit><name>0</name><family><inet><address><name>INVALID_IP</name></address></inet></family></unit></interface></interfaces></configuration>"],
         "format": "netconf",
         "target_format": "netconf",
         "platform": "crpd 24.4R1.9-local"
@@ -110,7 +110,7 @@ test-cli-to-netconf:
     RESULT=$(curl -s -X POST http://localhost:8080/api/v1/convert \
       -H "Content-Type: application/json" \
       -d '{
-        "input": "set interfaces ge-0/0/1 description \"CLI test interface\"\nset interfaces ge-0/0/1 unit 0 family inet address 10.1.1.1/24",
+        "input": ["set interfaces ge-0/0/1 description \"CLI test interface\"", "set interfaces ge-0/0/1 unit 0 family inet address 10.1.1.1/24"],
         "format": "cli",
         "target_format": "netconf",
         "platform": "crpd 24.4R1.9-local"
@@ -119,7 +119,7 @@ test-cli-to-netconf:
 
     echo ""
     echo "=== Configuration Diff ==="
-    echo "$RESULT" | jq -r '.diff'
+    echo "$RESULT" | jq -r '.steps[0].diff'
 
 # Test NETCONF to CLI conversion
 test-netconf-to-cli:
@@ -127,7 +127,7 @@ test-netconf-to-cli:
     RESULT=$(curl -s -X POST http://localhost:8080/api/v1/convert \
       -H "Content-Type: application/json" \
       -d '{
-        "input": "<configuration xmlns:junos=\"http://xml.juniper.net/junos/24.4R0/junos\"><interfaces><interface><name>ge-0/0/2</name><description>XML test interface</description><unit><name>0</name><family><inet><address><name>10.2.2.1/24</name></address></inet></family></unit></interface></interfaces></configuration>",
+        "input": ["<configuration xmlns:junos=\"http://xml.juniper.net/junos/24.4R0/junos\"><interfaces><interface><name>ge-0/0/2</name><description>XML test interface</description><unit><name>0</name><family><inet><address><name>10.2.2.1/24</name></address></inet></family></unit></interface></interfaces></configuration>"],
         "format": "netconf",
         "target_format": "cli",
         "platform": "crpd 24.4R1.9-local"
@@ -136,7 +136,7 @@ test-netconf-to-cli:
 
     echo ""
     echo "=== Configuration Diff ==="
-    echo "$RESULT" | jq -r '.diff'
+    echo "$RESULT" | jq -r '.steps[0].diff'
 
 # Test CLI to CLI roundtrip (should normalize configuration)
 test-cli-to-cli:
@@ -144,7 +144,7 @@ test-cli-to-cli:
     RESULT=$(curl -s -X POST http://localhost:8080/api/v1/convert \
       -H "Content-Type: application/json" \
       -d '{
-        "input": "set interfaces ge-0/0/3 description \"CLI roundtrip test\"\nset interfaces ge-0/0/3 unit 0 family inet address 10.3.3.1/24",
+        "input": ["set interfaces ge-0/0/3 description \"CLI roundtrip test\"", "set interfaces ge-0/0/3 unit 0 family inet address 10.3.3.1/24"],
         "format": "cli",
         "target_format": "cli",
         "platform": "crpd 24.4R1.9-local"
@@ -153,7 +153,7 @@ test-cli-to-cli:
 
     echo ""
     echo "=== Configuration Diff ==="
-    echo "$RESULT" | jq -r '.diff'
+    echo "$RESULT" | jq -r '.steps[0].diff'
 
 # Test CLI to Acton adata conversion
 test-cli-to-acton-adata:
@@ -161,7 +161,7 @@ test-cli-to-acton-adata:
     RESULT=$(curl -s -X POST http://localhost:8080/api/v1/convert \
       -H "Content-Type: application/json" \
       -d '{
-        "input": "set interfaces ge-0/0/4 description \"CLI to adata test\"\nset interfaces ge-0/0/4 unit 0 family inet address 10.4.4.1/24",
+        "input": ["set interfaces ge-0/0/4 description \"CLI to adata test\"", "set interfaces ge-0/0/4 unit 0 family inet address 10.4.4.1/24"],
         "format": "cli",
         "target_format": "acton-adata",
         "platform": "crpd 24.4R1.9-local"
@@ -170,7 +170,7 @@ test-cli-to-acton-adata:
 
     echo ""
     echo "=== Configuration Diff ==="
-    echo "$RESULT" | jq -r '.diff'
+    echo "$RESULT" | jq -r '.steps[0].diff'
 
 # Test CLI to Acton gdata conversion
 test-cli-to-acton-gdata:
@@ -178,7 +178,7 @@ test-cli-to-acton-gdata:
     RESULT=$(curl -s -X POST http://localhost:8080/api/v1/convert \
       -H "Content-Type: application/json" \
       -d '{
-        "input": "set interfaces ge-0/0/5 description \"CLI to gdata test\"\nset interfaces ge-0/0/5 unit 0 family inet address 10.5.5.1/24",
+        "input": ["set interfaces ge-0/0/5 description \"CLI to gdata test\"", "set interfaces ge-0/0/5 unit 0 family inet address 10.5.5.1/24"],
         "format": "cli",
         "target_format": "acton-gdata",
         "platform": "crpd 24.4R1.9-local"
@@ -187,7 +187,7 @@ test-cli-to-acton-gdata:
 
     echo ""
     echo "=== Configuration Diff ==="
-    echo "$RESULT" | jq -r '.diff'
+    echo "$RESULT" | jq -r '.steps[0].diff'
 
 # Test CLI to JSON conversion
 test-cli-to-json:
@@ -195,7 +195,7 @@ test-cli-to-json:
     RESULT=$(curl -s -X POST http://localhost:8080/api/v1/convert \
       -H "Content-Type: application/json" \
       -d '{
-        "input": "set interfaces ge-0/0/6 description \"CLI to JSON test\"\nset interfaces ge-0/0/6 unit 0 family inet address 10.6.6.1/24",
+        "input": ["set interfaces ge-0/0/6 description \"CLI to JSON test\"", "set interfaces ge-0/0/6 unit 0 family inet address 10.6.6.1/24"],
         "format": "cli",
         "target_format": "json",
         "platform": "crpd 24.4R1.9-local"
@@ -204,7 +204,7 @@ test-cli-to-json:
 
     echo ""
     echo "=== Configuration Diff ==="
-    echo "$RESULT" | jq -r '.diff' | jq .
+    echo "$RESULT" | jq -r '.steps[0].diff' | jq .
 
 # MCP: Initialize connection
 test-mcp-initialize:
@@ -252,7 +252,7 @@ test-mcp-convert:
         "params": {
           "name": "convert_config",
           "arguments": {
-            "input_config": "set interfaces ge-0/0/7 description \"MCP test interface\"\nset interfaces ge-0/0/7 unit 0 family inet address 10.7.7.1/24",
+            "input_config": ["set interfaces ge-0/0/7 description \"MCP test interface\"", "set interfaces ge-0/0/7 unit 0 family inet address 10.7.7.1/24"],
             "format": "cli",
             "target_format": "netconf",
             "platform": "crpd 24.4R1.9-local"
@@ -301,7 +301,7 @@ test-iosxrd-cli-to-acton-adata:
     RESULT=$(curl -s -X POST http://localhost:8080/api/v1/convert \
       -H "Content-Type: application/json" \
       -d '{
-        "input": "interface GigabitEthernet0/0/0/1\n description \"IOS XRd test interface\"\n ipv4 address 10.1.1.1 255.255.255.0\n no shutdown",
+        "input": ["interface GigabitEthernet0/0/0/1\n description \"IOS XRd test interface\"\n ipv4 address 10.1.1.1 255.255.255.0\n no shutdown"],
         "format": "cli",
         "target_format": "acton-adata",
         "platform": "iosxrd 24.1.1-local"
@@ -310,7 +310,7 @@ test-iosxrd-cli-to-acton-adata:
 
     echo ""
     echo "=== Configuration Diff ==="
-    echo "$RESULT" | jq -r '.diff'
+    echo "$RESULT" | jq -r '.steps[0].diff'
 
 # Test IOS XRd CLI to CLI roundtrip
 test-iosxrd-cli-to-cli:
@@ -318,7 +318,7 @@ test-iosxrd-cli-to-cli:
     RESULT=$(curl -s -X POST http://localhost:8080/api/v1/convert \
       -H "Content-Type: application/json" \
       -d '{
-        "input": "interface GigabitEthernet0/0/0/2\n description \"IOS XRd CLI roundtrip\"\n ipv4 address 10.2.2.1 255.255.255.0\n no shutdown",
+        "input": ["interface GigabitEthernet0/0/0/2\n description \"IOS XRd CLI roundtrip\"\n ipv4 address 10.2.2.1 255.255.255.0\n no shutdown"],
         "format": "cli",
         "target_format": "cli",
         "platform": "iosxrd 24.1.1-local"
@@ -327,7 +327,7 @@ test-iosxrd-cli-to-cli:
 
     echo ""
     echo "=== Configuration Diff ==="
-    echo "$RESULT" | jq -r '.diff'
+    echo "$RESULT" | jq -r '.steps[0].diff'
 
 # Test IOS XRd NETCONF to CLI conversion
 test-iosxrd-netconf-to-cli:
@@ -335,7 +335,7 @@ test-iosxrd-netconf-to-cli:
     RESULT=$(curl -s -X POST http://localhost:8080/api/v1/convert \
       -H "Content-Type: application/json" \
       -d '{
-        "input": "<interfaces xmlns=\"http://cisco.com/ns/yang/Cisco-IOS-XR-um-interface-cfg\"><interface><interface-name>GigabitEthernet0/0/0/3</interface-name><description>IOS XRd NETCONF to CLI test</description><ipv4><addresses xmlns=\"http://cisco.com/ns/yang/Cisco-IOS-XR-um-if-ip-address-cfg\"><address><address>10.1.1.1</address><netmask>255.255.255.0</netmask></address></addresses></ipv4></interface></interfaces>",
+        "input": ["<interfaces xmlns=\"http://cisco.com/ns/yang/Cisco-IOS-XR-um-interface-cfg\"><interface><interface-name>GigabitEthernet0/0/0/3</interface-name><description>IOS XRd NETCONF to CLI test</description><ipv4><addresses xmlns=\"http://cisco.com/ns/yang/Cisco-IOS-XR-um-if-ip-address-cfg\"><address><address>10.1.1.1</address><netmask>255.255.255.0</netmask></address></addresses></ipv4></interface></interfaces>"],
         "format": "netconf",
         "target_format": "cli",
         "platform": "iosxrd 24.1.1-local"
@@ -344,7 +344,7 @@ test-iosxrd-netconf-to-cli:
 
     echo ""
     echo "=== Configuration Diff ==="
-    echo "$RESULT" | jq -r '.diff'
+    echo "$RESULT" | jq -r '.steps[0].diff'
 
 # Test IOS XRd CLI to NETCONF conversion
 test-iosxrd-cli-to-netconf:
@@ -352,7 +352,7 @@ test-iosxrd-cli-to-netconf:
     RESULT=$(curl -s -X POST http://localhost:8080/api/v1/convert \
       -H "Content-Type: application/json" \
       -d '{
-        "input": "interface GigabitEthernet0/0/0/4\n description \"IOS XRd to NETCONF\"\n ipv4 address 10.4.4.1 255.255.255.0\n no shutdown",
+        "input": ["interface GigabitEthernet0/0/0/4\n description \"IOS XRd to NETCONF\"\n ipv4 address 10.4.4.1 255.255.255.0\n no shutdown"],
         "format": "cli",
         "target_format": "netconf",
         "platform": "iosxrd 24.1.1-local"
@@ -361,7 +361,7 @@ test-iosxrd-cli-to-netconf:
 
     echo ""
     echo "=== Configuration Diff ==="
-    echo "$RESULT" | jq -r '.diff'
+    echo "$RESULT" | jq -r '.steps[0].diff'
 
 # Test IOS XRd CLI to JSON conversion
 test-iosxrd-cli-to-json:
@@ -369,7 +369,7 @@ test-iosxrd-cli-to-json:
     RESULT=$(curl -s -X POST http://localhost:8080/api/v1/convert \
       -H "Content-Type: application/json" \
       -d '{
-        "input": "interface GigabitEthernet0/0/0/5\n description \"IOS XRd to JSON\"\n ipv4 address 10.5.5.1 255.255.255.0\n no shutdown",
+        "input": ["interface GigabitEthernet0/0/0/5\n description \"IOS XRd to JSON\"\n ipv4 address 10.5.5.1 255.255.255.0\n no shutdown"],
         "format": "cli",
         "target_format": "json",
         "platform": "iosxrd 24.1.1-local"
@@ -378,7 +378,7 @@ test-iosxrd-cli-to-json:
 
     echo ""
     echo "=== Configuration Diff ==="
-    echo "$RESULT" | jq -r '.diff' | jq .
+    echo "$RESULT" | jq -r '.steps[0].diff' | jq .
 
 # Test IOS XRd CLI to Acton adata conversion with unified-model module-set
 test-iosxrd-cli-to-acton-adata-unified-model:
@@ -386,7 +386,7 @@ test-iosxrd-cli-to-acton-adata-unified-model:
     RESULT=$(curl -s -X POST http://localhost:8080/api/v1/convert \
       -H "Content-Type: application/json" \
       -d '{
-        "input": "interface GigabitEthernet0/0/0/6\n description \"IOS XRd unified-model test\"\n ipv4 address 10.6.6.1 255.255.255.0\n no shutdown",
+        "input": ["interface GigabitEthernet0/0/0/6\n description \"IOS XRd unified-model test\"\n ipv4 address 10.6.6.1 255.255.255.0\n no shutdown"],
         "format": "cli",
         "target_format": "acton-adata",
         "platform": "iosxrd 24.1.1-local",
@@ -396,7 +396,7 @@ test-iosxrd-cli-to-acton-adata-unified-model:
 
     echo ""
     echo "=== Configuration Diff ==="
-    echo "$RESULT" | jq -r '.diff'
+    echo "$RESULT" | jq -r '.steps[0].diff'
 
 # Run all IOS XRd tests
 test-iosxrd-all: test-iosxrd-cli-to-acton-adata test-iosxrd-cli-to-cli test-iosxrd-netconf-to-cli test-iosxrd-cli-to-netconf test-iosxrd-cli-to-json
@@ -407,7 +407,7 @@ test-iosxe-cli-to-acton-adata:
     RESULT=$(curl -s -X POST http://localhost:8080/api/v1/convert \
       -H "Content-Type: application/json" \
       -d '{
-        "input": "interface GigabitEthernet2\n description \"IOS XE test interface\"\n ip address 10.1.1.1 255.255.255.0\n no shutdown",
+        "input": ["interface GigabitEthernet2\n description \"IOS XE test interface\"\n ip address 10.1.1.1 255.255.255.0\n no shutdown"],
         "format": "cli",
         "target_format": "acton-adata",
         "platform": "iosxe 17.15.03a-local",
@@ -417,7 +417,7 @@ test-iosxe-cli-to-acton-adata:
 
     echo ""
     echo "=== Configuration Diff ==="
-    echo "$RESULT" | jq -r '.diff'
+    echo "$RESULT" | jq -r '.steps[0].diff'
 
 # Test IOS XE CLI to CLI roundtrip
 test-iosxe-cli-to-cli:
@@ -425,7 +425,7 @@ test-iosxe-cli-to-cli:
     RESULT=$(curl -s -X POST http://localhost:8080/api/v1/convert \
       -H "Content-Type: application/json" \
       -d '{
-        "input": "interface GigabitEthernet2\n description \"IOS XE CLI roundtrip\"\n ip address 10.2.2.1 255.255.255.0\n no shutdown",
+        "input": ["interface GigabitEthernet2\n description \"IOS XE CLI roundtrip\"\n ip address 10.2.2.1 255.255.255.0\n no shutdown"],
         "format": "cli",
         "target_format": "cli",
         "platform": "iosxe 17.15.03a-local",
@@ -435,7 +435,7 @@ test-iosxe-cli-to-cli:
 
     echo ""
     echo "=== Configuration Diff ==="
-    echo "$RESULT" | jq -r '.diff'
+    echo "$RESULT" | jq -r '.steps[0].diff'
 
 # Test IOS XE NETCONF to CLI conversion
 test-iosxe-netconf-to-cli:
@@ -443,7 +443,7 @@ test-iosxe-netconf-to-cli:
     RESULT=$(curl -s -X POST http://localhost:8080/api/v1/convert \
       -H "Content-Type: application/json" \
       -d '{
-        "input": "<native xmlns=\"http://cisco.com/ns/yang/Cisco-IOS-XE-native\"><interface><GigabitEthernet><name>2</name><description>IOS XE NETCONF to CLI</description><ip><address><primary><address>10.1.1.1</address><mask>255.255.255.0</mask></primary></address></ip></GigabitEthernet></interface></native>",
+        "input": ["<native xmlns=\"http://cisco.com/ns/yang/Cisco-IOS-XE-native\"><interface><GigabitEthernet><name>2</name><description>IOS XE NETCONF to CLI</description><ip><address><primary><address>10.1.1.1</address><mask>255.255.255.0</mask></primary></address></ip></GigabitEthernet></interface></native>"],
         "format": "netconf",
         "target_format": "cli",
         "platform": "iosxe 17.15.03a-local",
@@ -453,7 +453,7 @@ test-iosxe-netconf-to-cli:
 
     echo ""
     echo "=== Configuration Diff ==="
-    echo "$RESULT" | jq -r '.diff'
+    echo "$RESULT" | jq -r '.steps[0].diff'
 
 # Test IOS XE CLI to NETCONF conversion
 test-iosxe-cli-to-netconf:
@@ -461,7 +461,7 @@ test-iosxe-cli-to-netconf:
     RESULT=$(curl -s -X POST http://localhost:8080/api/v1/convert \
       -H "Content-Type: application/json" \
       -d '{
-        "input": "interface GigabitEthernet2\n description \"IOS XE CLI to NETCONF\"\n ip address 10.4.4.1 255.255.255.0\n no shutdown",
+        "input": ["interface GigabitEthernet2\n description \"IOS XE CLI to NETCONF\"\n ip address 10.4.4.1 255.255.255.0\n no shutdown"],
         "format": "cli",
         "target_format": "netconf",
         "platform": "iosxe 17.15.03a-local",
@@ -471,7 +471,7 @@ test-iosxe-cli-to-netconf:
 
     echo ""
     echo "=== Configuration Diff ==="
-    echo "$RESULT" | jq -r '.diff'
+    echo "$RESULT" | jq -r '.steps[0].diff'
 
 # Test IOS XE CLI to JSON conversion
 test-iosxe-cli-to-json:
@@ -479,7 +479,7 @@ test-iosxe-cli-to-json:
     RESULT=$(curl -s -X POST http://localhost:8080/api/v1/convert \
       -H "Content-Type: application/json" \
       -d '{
-        "input": "interface GigabitEthernet2\n description \"IOS XE CLI to JSON\"\n ip address 10.5.5.1 255.255.255.0\n no shutdown",
+        "input": ["interface GigabitEthernet2\n description \"IOS XE CLI to JSON\"\n ip address 10.5.5.1 255.255.255.0\n no shutdown"],
         "format": "cli",
         "target_format": "json",
         "platform": "iosxe 17.15.03a-local",
@@ -489,7 +489,7 @@ test-iosxe-cli-to-json:
 
     echo ""
     echo "=== Configuration Diff ==="
-    echo "$RESULT" | jq -r '.diff' | jq .
+    echo "$RESULT" | jq -r '.steps[0].diff' | jq .
 
 # Run all IOS XE tests
 test-iosxe-all: test-iosxe-cli-to-acton-adata test-iosxe-cli-to-cli test-iosxe-netconf-to-cli test-iosxe-cli-to-netconf test-iosxe-cli-to-json
@@ -568,6 +568,129 @@ wait-for-schemas timeout="180":
 wait-for-all instances_timeout="180" schemas_timeout="180":
     just wait-for-instances {{instances_timeout}}
     just wait-for-schemas {{schemas_timeout}}
+
+# Test multi-step configuration
+test-multi-step:
+    #!/usr/bin/env bash
+    echo "=== Multi-Step Configuration Test ==="
+    RESULT=$(curl -s -X POST http://localhost:8080/api/v1/convert \
+      -H "Content-Type: application/json" \
+      -d '{
+        "input": [
+          "set policy-options prefix-list RFC1918 10.0.0.0/8",
+          "set policy-options policy-statement REJECT-PRIVATE term 1 from prefix-list RFC1918"
+        ],
+        "format": "cli",
+        "target_format": "netconf",
+        "platform": "crpd 24.4R1.9-local"
+      }')
+    echo "$RESULT" | jq .
+
+    echo ""
+    echo "=== Step-by-Step Summary ==="
+    echo "$RESULT" | jq -r '.steps[] | "Step: \(.input)\nHas diff: \(if .diff == "" then "No" else "Yes" end)\n"'
+
+# Test multi-step CLI -> NETCONF for IOS XE
+test-multi-step-iosxe:
+    #!/usr/bin/env bash
+    echo "=== Multi-Step IOS XE Configuration Test (CLI -> NETCONF) ==="
+    RESULT=$(curl -s -X POST http://localhost:8080/api/v1/convert \
+      -H "Content-Type: application/json" \
+      -d '{
+        "input": [
+          "interface GigabitEthernet2\n description Test Interface",
+          "interface GigabitEthernet2\n ip address 192.168.1.1 255.255.255.0"
+        ],
+        "format": "cli",
+        "target_format": "netconf",
+        "platform": "iosxe 17.15.03a-local"
+      }')
+    echo "$RESULT" | jq .
+
+# Test multi-step CLI -> NETCONF for IOS XR
+test-multi-step-iosxr:
+    #!/usr/bin/env bash
+    echo "=== Multi-Step IOS XR Configuration Test (CLI -> NETCONF) ==="
+    RESULT=$(curl -s -X POST http://localhost:8080/api/v1/convert \
+      -H "Content-Type: application/json" \
+      -d '{
+        "input": [
+          "interface GigabitEthernet0/0/0/1\n description XR Test Interface",
+          "interface GigabitEthernet0/0/0/1\n ipv4 address 10.1.1.1 255.255.255.0"
+        ],
+        "format": "cli",
+        "target_format": "netconf",
+        "platform": "iosxrd 24.1.1-local"
+      }')
+    echo "$RESULT" | jq .
+
+# Test multi-step CLI -> CLI (useful for verifying CLI normalization)
+test-multi-step-cli-to-cli:
+    #!/usr/bin/env bash
+    echo "=== Multi-Step CLI -> CLI Test (cRPD) ==="
+    RESULT=$(curl -s -X POST http://localhost:8080/api/v1/convert \
+      -H "Content-Type: application/json" \
+      -d '{
+        "input": [
+          "set interfaces ge-0/0/1 description \"Test Port\"",
+          "set interfaces ge-0/0/1 unit 0 family inet address 10.0.0.1/24"
+        ],
+        "format": "cli",
+        "target_format": "cli",
+        "platform": "crpd 24.4R1.9-local"
+      }')
+    echo "$RESULT" | jq .
+
+    echo ""
+    echo "=== Checking CLI diffs ==="
+    echo "$RESULT" | jq -r '.steps[] | "Input: \(.input)\nDiff:\n\(.diff)\n---"'
+
+# Test multi-step NETCONF -> CLI
+test-multi-step-netconf-to-cli:
+    #!/usr/bin/env bash
+    echo "=== Multi-Step NETCONF -> CLI Test (cRPD) ==="
+    RESULT=$(curl -s -X POST http://localhost:8080/api/v1/convert \
+      -H "Content-Type: application/json" \
+      -d '{
+        "input": [
+          "<configuration><interfaces><interface><name>ge-0/0/2</name><description>NETCONF Test</description></interface></interfaces></configuration>",
+          "<configuration><interfaces><interface><name>ge-0/0/2</name><unit><name>0</name><family><inet><address><name>172.16.0.1/24</name></address></inet></family></unit></interface></interfaces></configuration>"
+        ],
+        "format": "netconf",
+        "target_format": "cli",
+        "platform": "crpd 24.4R1.9-local"
+      }')
+    echo "$RESULT" | jq .
+
+    echo ""
+    echo "=== Checking CLI diffs ==="
+    echo "$RESULT" | jq -r '.steps[] | "Input: \(.input)\nDiff:\n\(.diff)\n---"'
+
+# Test multi-step CLI -> CLI for IOS XE (verifies archive cleaning)
+test-multi-step-iosxe-cli-to-cli:
+    #!/usr/bin/env bash
+    echo "=== Multi-Step CLI -> CLI Test (IOS XE) ==="
+    RESULT=$(curl -s -X POST http://localhost:8080/api/v1/convert \
+      -H "Content-Type: application/json" \
+      -d '{
+        "input": [
+          "interface GigabitEthernet3\n description \"First step - description only\"",
+          "interface GigabitEthernet3\n ip address 192.168.10.1 255.255.255.0",
+          "interface GigabitEthernet3\n no shutdown"
+        ],
+        "format": "cli",
+        "target_format": "cli",
+        "platform": "iosxe 17.15.03a-local"
+      }')
+    echo "$RESULT" | jq .
+
+    echo ""
+    echo "=== Checking CLI diffs for each step ==="
+    echo "$RESULT" | jq -r '.steps[] | "Step Input:\n\(.input)\n\nResulting Diff:\n\(.diff)\n================================"'
+
+# Test all multi-step scenarios across all platforms and format combinations
+test-multi-step-all: test-multi-step test-multi-step-iosxe test-multi-step-iosxr test-multi-step-cli-to-cli test-multi-step-netconf-to-cli test-multi-step-iosxe-cli-to-cli
+    @echo "All multi-step tests completed"
 
 # Clean up build artifacts
 clean:
