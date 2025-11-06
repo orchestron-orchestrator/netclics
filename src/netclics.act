@@ -947,7 +947,7 @@ actor DeviceInstance(auth: WorldCap, log_handler: logging.Handler, platform_name
                         if compiled_schema is not None:
                             try:
                                 _log.info("Parsing XML with gen3 schemas")
-                                parsed_gdata = yang.gen3.from_xml(compiled_schema, config_xml, loose=True)
+                                parsed_gdata = yang.gen3.from_data(compiled_schema, config_xml, loose=True)
                                 _log.info("Successfully parsed to gdata")
 
                                 result_callback((raw=config_xml, gdata=parsed_gdata), None)
