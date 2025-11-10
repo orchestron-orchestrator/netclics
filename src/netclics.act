@@ -307,15 +307,15 @@ actor DeviceInstance(auth: WorldCap, log_handler: logging.Handler, platform_name
         if platform == "cisco_iosxe":
             backward_diff = yang.gdata.diff(final_gdata, base_gdata)
             if backward_diff is not None:
-                target_config = backward_diff.to_xmlstr()
+                target_config = backward_diff.to_xml()
             else:
                 result_callback()
                 return
         else:
             # Extract children without <data> wrapper for rollback
-            target_config = "\n".join([xml.encode(c) for c in base_xml.children])
-        config_preview = target_config[:200] if len(target_config) > 200 else target_config
-        _log.debug("Extracted config for rollback", {"config_preview": config_preview, "config_length": len(target_config)})
+            target_config = base_xml.children
+        config_preview = xml.encode_nodes(target_config)[:200]
+        _log.debug("Extracted config for rollback", {"config_preview": config_preview})
 
         state = "busy"
 
@@ -534,10 +534,10 @@ actor DeviceInstance(auth: WorldCap, log_handler: logging.Handler, platform_name
                     _log.warning("No compiled schema for adata conversion, using gdata", {"error": compiled_schema})
                     return gdata.prsrc()
             elif target_format in ["netconf", "xml"]:
-                return gdata.to_xmlstr(name="configuration", pretty=True)
+                return gdata.to_xmlstr(pretty=True)
             else:
                 _log.warning("Unknown target format, using XML", {"target_format": target_format})
-                return gdata.to_xmlstr(name="configuration", pretty=True)
+                return gdata.to_xmlstr(pretty=True)
 
 
         def on_base_config_retrieved(config_tuple: ?(raw: xml.Node, gdata: yang.gdata.Node), error: ?Exception):
@@ -843,7 +843,8 @@ actor DeviceInstance(auth: WorldCap, log_handler: logging.Handler, platform_name
 
             # Apply the input configuration
             _log.debug("Sending edit-config with input", {"input_data": input_data})
-            client.edit_config(input_data, on_edit_config_done if has_candidate() else on_commit_done, target_datastore())
+            input_xml = xml.decode("<data>{input_data}</data>")
+            client.edit_config(input_xml.children, on_edit_config_done if has_candidate() else on_commit_done, target_datastore())
 
         def on_client_error(error: Exception):
             _log.error("Failed to get NETCONF client", {"error": str(error)})
@@ -1099,7 +1100,7 @@ actor DeviceInstance(auth: WorldCap, log_handler: logging.Handler, platform_name
             _log.error("No InstanceSpec available for device", {"device": container_id})
             return None
 
-    def apply_netconf_config(config_xml: str, config_name: str):
+    def apply_netconf_config(config: str, config_name: str):
         """Generic method to apply NETCONF configuration to device"""
         _log.info("Applying NETCONF configuration", {"device": container_id, "config": config_name})
 
@@ -1132,7 +1133,8 @@ actor DeviceInstance(auth: WorldCap, log_handler: logging.Handler, platform_name
 
             # Parse and apply the config XML
             try:
-                client.edit_config(config_xml, on_edit_config_done if has_candidate() else on_commit_done, target_datastore())
+                config_xml =  xml.decode("<data>{config}</data>")
+                client.edit_config(config_xml.children, on_edit_config_done if has_candidate() else on_commit_done, target_datastore())
             except Exception as e:
                 _log.error("Failed to parse configuration", {"error": str(e), "config": config_name})
                 client.close()
