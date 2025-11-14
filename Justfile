@@ -53,6 +53,20 @@ start-static-instances-xrd:
         docker exec xrd1 ip link add Gi0-0-0-${port} type dummy
     done
 
+    docker run -td --name xrd2 --rm --privileged \
+        --publish 45830:830 --publish 45022:22 \
+        -v ./test/xrd-startup.conf:/etc/xrd/first-boot.cfg \
+        --env XR_FIRST_BOOT_CONFIG=/etc/xrd/first-boot.cfg \
+        --env XR_MGMT_INTERFACES="linux:eth0,xr_name=Mg0/RP0/CPU0/0,chksum,snoop_v4,snoop_v4_default_route,snoop_v6,snoop_v6_default_route" \
+        --env XR_INTERFACES="$XR_INTERFACES" \
+        {{IMAGE_PATH}}ios-xr/xrd-control-plane:25.3.1
+
+    sleep 1
+    # Create GigabitEthernet dummy interfaces (48 ports on slot 0)
+    for port in {0..23}; do
+        docker exec xrd2 ip link add Gi0-0-0-${port} type dummy
+    done
+
 start-static-instances-xe:
     docker run -td --name xe1 --rm --privileged --publish 44830:830 --publish 44022:22 {{IMAGE_PATH}}vrnetlab/vr-c8000v:17.15.03a --trace
 
@@ -60,7 +74,7 @@ start-static-instances-xe:
 start-static-instances: start-static-instances-crpd start-static-instances-xrd start-static-instances-xe
 
 stop-static-instances:
-    docker stop crpd1 xrd1 xe1 || true
+    docker stop crpd1 xrd1 xrd2 xe1 || true
 
 # Show available platforms
 platforms:

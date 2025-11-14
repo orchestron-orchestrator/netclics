@@ -48,15 +48,14 @@ class ModuleSet:
 CISCO_XR_CLASSIC = ModuleSet(
     "cisco-xr-classic",
     "Cisco IOS XR Classic configuration models",
-    include_patterns=["^Cisco-IOS-XR-", "^tailf-", "^cisco-semver", "^ietf-"],
-    exclude_patterns=["^ietf-interfaces", "^Cisco-IOS-XR-um-", "^Cisco-IOS-XR-openconfig"]
+    include_patterns=["^Cisco-IOS-XR-", "^tailf-", "^cisco-semver", "^ietf-inet-types", "^ietf-syslog-types", "^ietf-yang-types", "^iana-tls-cipher-suite"],
+    exclude_patterns=["^Cisco-IOS-XR-um-", "^Cisco-IOS-XR-openconfig"]
 )
 
 CISCO_XR_UNIFIED_MODEL = ModuleSet(
     "cisco-xr-unified-model",
     "Cisco IOS XR Unified Model with base types",
-    include_patterns=["^Cisco-IOS-XR-um-", "^Cisco-IOS-XR-types", "^Cisco-IOS-XR-.*-datatypes", "^ietf-", "^tailf-", "^cisco-semver"],
-    exclude_patterns=["^ietf-interfaces"]
+    include_patterns=["^Cisco-IOS-XR-um-", "^Cisco-IOS-XR-types", "^Cisco-IOS-XR-.*-datatypes", "^ietf-inet-types", "^ietf-yang-types", "^iana-tls-cipher-suite-algs", "^tailf-", "^cisco-semver"]
 )
 
 CISCO_XE_NATIVE = ModuleSet(

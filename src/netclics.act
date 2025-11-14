@@ -2221,6 +2221,23 @@ def get_default_config() -> SystemConfig:
                 )
             ]
         ),
+        PlatformConfig(
+            name="iosxrd 25.3.1-local",
+            platform="cisco_iosxr",
+            module_sets=["cisco-xr-classic", "cisco-xr-unified-model"],
+            instances=[
+                InstanceSpec(
+                    id="local-iosxrd",
+                    host="127.0.0.1",
+                    netconf_port=45830,
+                    ssh_port=45022,
+                    restconf_port=32775,
+                    username="clab",
+                    password="clab@123",
+                    description="Local IOS XRd instance"
+                )
+            ]
+        ),
         # Local Cisco IOS XE static instance
         PlatformConfig(
             name="iosxe 17.15.03a-local",
