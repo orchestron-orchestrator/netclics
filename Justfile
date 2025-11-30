@@ -540,8 +540,8 @@ wait-for-instances timeout="180":
 
 # Wait for all schemas to be compiled
 # Usage: just wait-for-schemas [timeout_seconds]
-# Default timeout: 180 seconds
-wait-for-schemas timeout="180":
+# Default timeout: 360 seconds
+wait-for-schemas timeout="360":
     #!/usr/bin/env bash
     echo "Waiting for all schemas to be compiled..."
 
