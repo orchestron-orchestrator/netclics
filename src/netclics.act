@@ -523,7 +523,7 @@ actor DeviceInstance(auth: WorldCap, log_handler: logging.Handler, platform_name
         def format_gdata_output(gdata: yang.gdata.Node, target_format: str) -> str:
             """Format parsed gdata to the requested output format"""
             if target_format == "json":
-                return gdata.to_json()
+                return gdata.to_jsonstr()
             elif target_format == "acton-gdata":
                 return gdata.prsrc()
             elif target_format == "acton-adata":
@@ -1055,7 +1055,7 @@ actor DeviceInstance(auth: WorldCap, log_handler: logging.Handler, platform_name
             if diff_result is not None:
                 # Convert diff to appropriate format based on target_format
                 if target_format == "json":
-                    return diff_result.to_json()
+                    return diff_result.to_jsonstr()
                 elif target_format == "acton-gdata":
                     return diff_result.prsrc()
                 elif target_format == "acton-adata":
