@@ -156,6 +156,8 @@ actor DeviceInstance(auth: WorldCap, log_handler: logging.Handler, platform_name
     var last_used_at = 0  # Timestamp of last use
     var device_platform = platform  # Store platform type for use in methods
     var retry_delay = 5  # Retry delay in seconds for NETCONF connections
+    var edit_config_retry_delay = 5  # Retry delay in seconds for NETCONF edit-config locked errors
+    var edit_config_retry_attempts = 5  # Max attempts for edit-config retries on locked errors
 
     var capabilities: list[str] = []
     # Map module-sets which are include and exclude patterns to expanded YANG module names
@@ -301,6 +303,25 @@ actor DeviceInstance(auth: WorldCap, log_handler: logging.Handler, platform_name
             return "Invalid module_set: '{module_set}'. Available module sets: {', '.join(available_sets)}"
         return None
 
+    def _is_locked_edit_config_error(error: netconf.NetconfError) -> bool:
+        rpc_error = error.rpc_error
+        if rpc_error is not None:
+            for re in rpc_error:
+                if re.error_tag == "in-use" or re.error_app_tag == "locked":
+                    return True
+        return False
+
+    def _edit_config_with_retry(client: netconf.Client, config: list[xml.Node], cb: action(netconf.Client, ?netconf.NetconfError) -> None, datastore: str="running", default_operation: ?str=None):
+        def attempt_edit(attempt: int):
+            def on_edit_done(c: netconf.Client, error: ?netconf.NetconfError):
+                if error is not None and _is_locked_edit_config_error(error) and attempt < edit_config_retry_attempts:
+                    _log.warning("Edit-config locked; retrying", {"attempt": attempt, "max_attempts": edit_config_retry_attempts, "delay_seconds": edit_config_retry_delay, "error": error})
+                    after float(edit_config_retry_delay): attempt_edit(attempt + 1)
+                    return
+                cb(c, error)
+            client.edit_config(config, on_edit_done, datastore, default_operation=default_operation)
+        attempt_edit(1)
+
     def _rollback_to_config(base_xml, base_gdata, final_gdata, result_callback: action(?Exception) -> None):
         """Rollback device configuration to a previous state"""
         _log.info("DeviceInstance.rollback called", {"device": container_id})
@@ -366,7 +387,7 @@ actor DeviceInstance(auth: WorldCap, log_handler: logging.Handler, platform_name
             else:
                 # On all other platforms we replace the config with base
                 op = "replace"
-            client.edit_config(target_config, on_edit_config_done if has_candidate() else on_commit_done, target_datastore(), default_operation=op)
+            _edit_config_with_retry(client, target_config, on_edit_config_done if has_candidate() else on_commit_done, target_datastore(), default_operation=op)
 
         def on_connect_failure(error: Exception):
             _log.error("NETCONF rollback connection failed after retries", {"error": str(error)})
@@ -844,7 +865,7 @@ actor DeviceInstance(auth: WorldCap, log_handler: logging.Handler, platform_name
             # Apply the input configuration
             _log.debug("Sending edit-config with input", {"input_data": input_data})
             input_xml = xml.decode("<data>{input_data}</data>")
-            client.edit_config(input_xml.children, on_edit_config_done if has_candidate() else on_commit_done, target_datastore())
+            _edit_config_with_retry(client, input_xml.children, on_edit_config_done if has_candidate() else on_commit_done, target_datastore())
 
         def on_client_error(error: Exception):
             _log.error("Failed to get NETCONF client", {"error": str(error)})
@@ -1134,7 +1155,7 @@ actor DeviceInstance(auth: WorldCap, log_handler: logging.Handler, platform_name
             # Parse and apply the config XML
             try:
                 config_xml =  xml.decode("<data>{config}</data>")
-                client.edit_config(config_xml.children, on_edit_config_done if has_candidate() else on_commit_done, target_datastore())
+                _edit_config_with_retry(client, config_xml.children, on_edit_config_done if has_candidate() else on_commit_done, target_datastore())
             except Exception as e:
                 _log.error("Failed to parse configuration", {"error": str(e), "config": config_name})
                 client.close()
