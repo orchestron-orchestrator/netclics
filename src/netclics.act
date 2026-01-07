@@ -319,25 +319,15 @@ actor DeviceInstance(auth: WorldCap, log_handler: logging.Handler, platform_name
 
         state = "busy"
 
-        # Get credentials
-        creds = _get_credentials()
-        if creds is not None:
-            username, password = creds
-        else:
-            state = "ready"
-            result_callback(Exception("No credentials available"))
-            return
+        _log.info("Starting NETCONF rollback", {"host": ip_address, "port": netconf_port})
 
-        _log.info("Starting NETCONF rollback", {"username": username, "host": ip_address, "port": netconf_port})
-
-        def on_connect_success(client: netconf.Client):
-            _log.info("NETCONF client connected successfully for rollback")
+        def on_client_success(client: netconf.Client):
+            _log.info("NETCONF client ready for rollback")
 
             def on_edit_config_done(client: netconf.Client, error: ?netconf.NetconfError):
                 _log.debug("Rollback edit-config response received")
                 if error is not None:
                     _log.error("Rollback edit-config failed with NETCONF error", {"error": error})
-                    client.close()
                     state = "ready"
                     result_callback(Exception(f"NETCONF rollback edit-config error: {error}"))
                 else:
@@ -351,12 +341,10 @@ actor DeviceInstance(auth: WorldCap, log_handler: logging.Handler, platform_name
                 _log.debug("Rollback commit response received")
                 if error is not None:
                     _log.error("Rollback commit failed with NETCONF error", {"error": error})
-                    client.close()
                     state = "ready"
                     result_callback(Exception(f"NETCONF rollback commit error: {error}"))
                 else:
                     _log.info("Rollback commit completed successfully")
-                    client.close()
                     state = "ready"
                     result_callback(None)
 
@@ -368,14 +356,14 @@ actor DeviceInstance(auth: WorldCap, log_handler: logging.Handler, platform_name
                 op = "replace"
             client.edit_config(target_config, on_edit_config_done if has_candidate() else on_commit_done, target_datastore(), default_operation=op)
 
-        def on_connect_failure(error: Exception):
-            _log.error("NETCONF rollback connection failed after retries", {"error": str(error)})
+        def on_client_error(error: Exception):
+            _log.error("NETCONF rollback client error", {"error": str(error)})
             state = "ready"
             result_callback(error)
 
-        # Create NETCONF client for rollback (limited retries)
-        _log.info("Creating NETCONF client connection for rollback")
-        create_netconf_client_with_retry(username, password, on_connect_success, on_connect_failure, max_retries=5)
+        # Reuse existing NETCONF client for rollback (avoids locking conflicts)
+        _log.info("Getting NETCONF client for rollback")
+        _get_or_create_netconf_client(on_client_success, on_client_error)
 
     def _clear_iosxe_archive_log(callback: action(?Exception) -> None):
         """Clear the IOS XE archive log to ensure clean configuration state"""
@@ -713,16 +701,30 @@ actor DeviceInstance(auth: WorldCap, log_handler: logging.Handler, platform_name
             """All steps completed, perform rollback"""
             _log.info("All configuration steps completed, starting rollback")
 
+            # Close CLI client before rollback to release any IOS-XE locks
+            ccc = conversion_cli_client
+            if ccc is not None:
+                _log.info("Closing CLI client before rollback to release locks")
+                try:
+                    ccc.disconnect()
+                except Exception as e:
+                    _log.warning("Error closing CLI client before rollback", {"error": str(e)})
+                conversion_cli_client = None
+
             # Get final gdata (last step's gdata) for rollback
             final_gdata = steps_gdata[-1] if len(steps_gdata) > 0 else None
 
-            # Start rollback process
-            if base_xml is not None and base_gdata is not None and final_gdata is not None:
-                _log.info("Starting automatic rollback to clean device state using NETCONF")
-                _rollback_to_config(base_xml, base_gdata, final_gdata, on_rollback_complete)
-            else:
-                _log.error("Missing data for rollback")
-                on_rollback_complete(Exception("Missing data for rollback"))
+            def do_rollback():
+                # Start rollback process
+                if base_xml is not None and base_gdata is not None and final_gdata is not None:
+                    _log.info("Starting automatic rollback to clean device state using NETCONF")
+                    _rollback_to_config(base_xml, base_gdata, final_gdata, on_rollback_complete)
+                else:
+                    _log.error("Missing data for rollback")
+                    on_rollback_complete(Exception("Missing data for rollback"))
+
+            # Delay rollback to allow IOS-XE to release locks after CLI session closes
+            after 3: do_rollback()
 
 
         def on_rollback_complete(rollback_error: ?Exception):
