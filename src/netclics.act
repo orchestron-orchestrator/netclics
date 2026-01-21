@@ -293,6 +293,26 @@ actor DeviceInstance(auth: WorldCap, log_handler: logging.Handler, platform_name
         # Start the first connection attempt
         attempt_connection()
 
+    def _get_credentials() -> ?(str, str):
+        """Get device credentials, returns (username, password) tuple or None"""
+        _log.debug("Checking device credentials")
+        if instance_spec is not None:
+            _log.debug("InstanceSpec found")
+            _username = instance_spec.username
+            _password = instance_spec.password
+            _log.debug("Checking username and password")
+            if _username is not None and _password is not None:
+                username = _username
+                password = _password
+                _log.info("Credentials found", {"username": username})
+                return (username, password)
+            else:
+                _log.error("Missing username or password for device", {"device": container_id, "username": str(_username), "password_set": str(True if _password is not None else False)})
+                return None
+        else:
+            _log.error("No InstanceSpec available for device", {"device": container_id})
+            return None
+
     def validate_module_set(module_set: str) -> ?str:
         """Validate if the requested module_set is available. Returns error message if invalid, None if valid."""
         if module_set == "":
@@ -499,6 +519,97 @@ actor DeviceInstance(auth: WorldCap, log_handler: logging.Handler, platform_name
 
             after 0.1: try_connect(0)
 
+    # IOS-XE cisco-ia namespace for sync operations
+    CISCO_IA_NS = "http://cisco.com/yang/cisco-ia"
+
+    def _iosxe_sync_from(callback: action(?Exception) -> None):
+        """Force IOS-XE to sync CLI config to NETCONF datastore via cisco-ia:sync-from RPC"""
+        _log.info("Triggering IOS-XE sync-from RPC")
+
+        def on_client_success(client: netconf.Client):
+            def on_rpc_done(client: netconf.Client, response: ?xml.Node, error: ?netconf.NetconfError):
+                if error is not None:
+                    _log.error("IOS-XE sync-from RPC failed", {"error": str(error)})
+                    callback(Exception(f"sync-from RPC failed: {error}"))
+                else:
+                    _log.info("IOS-XE sync-from RPC completed successfully")
+                    callback(None)
+
+            # Build cisco-ia:sync-from RPC
+            sync_from_node = xml.Node("sync-from", [(None, CISCO_IA_NS)], children=[])
+            client.rpc(sync_from_node, on_rpc_done)
+
+        def on_client_error(error: Exception):
+            _log.error("Failed to get NETCONF client for sync-from", {"error": str(error)})
+            callback(error)
+
+        _get_or_create_netconf_client(on_client_success, on_client_error)
+
+    def _iosxe_poll_sync_complete(callback: action(?Exception) -> None, max_attempts: int=30, poll_interval: float=1.0):
+        """Poll cisco-ia:is-syncing until sync is complete"""
+        _log.info("Polling IOS-XE is-syncing status")
+
+        def poll(attempt: int):
+            if attempt >= max_attempts:
+                _log.error("IOS-XE sync polling timed out", {"max_attempts": max_attempts})
+                callback(Exception(f"Sync polling timed out after {max_attempts} attempts"))
+                return
+
+            def on_client_success(client: netconf.Client):
+                def on_rpc_done(client: netconf.Client, response: ?xml.Node, error: ?netconf.NetconfError):
+                    if error is not None:
+                        _log.error("IOS-XE is-syncing RPC failed", {"error": str(error), "attempt": attempt + 1})
+                        callback(Exception(f"is-syncing RPC failed: {error}"))
+                        return
+
+                    # Parse response - look for <syncing> element with true/false value
+                    is_syncing: bool = False
+                    if response is not None:
+                        for child in response.children:
+                            if child.tag == "syncing":
+                                ct = child.text
+                                if ct is not None:
+                                    is_syncing = ct.lower() == "true"
+                                    _log.debug("is-syncing result", {"syncing": ct, "is_syncing": str(is_syncing)})
+                                break
+
+                    if is_syncing:
+                        _log.debug("IOS-XE still syncing, polling again", {"attempt": attempt + 1})
+                        after poll_interval: poll(attempt + 1)
+                    else:
+                        _log.info("IOS-XE sync complete", {"attempts": attempt + 1})
+                        callback(None)
+
+                # Build cisco-ia:is-syncing RPC
+                is_syncing_node = xml.Node("is-syncing", [(None, CISCO_IA_NS)], children=[])
+                client.rpc(is_syncing_node, on_rpc_done)
+
+            def on_client_error(error: Exception):
+                _log.error("Failed to get NETCONF client for is-syncing poll", {"error": str(error)})
+                callback(error)
+
+            _get_or_create_netconf_client(on_client_success, on_client_error)
+
+        poll(0)
+
+    def _iosxe_sync_and_get_config(module_set: str, callback: action(?(raw: xml.Node, gdata: yang.gdata.Node), ?Exception) -> None):
+        """Full IOS-XE sync workflow: sync-from -> poll is-syncing -> get-config"""
+        _log.info("Starting IOS-XE sync and config retrieval")
+
+        def on_sync_from_done(error: ?Exception):
+            if error is not None:
+                _log.warning("sync-from failed, continuing with poll", {"error": str(error)})
+            _iosxe_poll_sync_complete(on_poll_complete)
+
+        def on_poll_complete(error: ?Exception):
+            if error is not None:
+                _log.warning("Sync poll failed, attempting config retrieval anyway", {"error": str(error)})
+            _get_netconf_config_parsed(module_set, callback)
+
+        _iosxe_sync_from(on_sync_from_done)
+
+
+
     def _cleanup_conversion_clients():
         """Clean up persistent clients at end of conversion"""
         _log.info("Cleaning up conversion clients")
@@ -649,7 +760,13 @@ actor DeviceInstance(auth: WorldCap, log_handler: logging.Handler, platform_name
                 return
 
             _log.info("Step input applied successfully, retrieving configuration", {"step": current_step_index + 1})
-            _get_netconf_config_parsed(request.module_set, lambda config_tuple, error: on_step_config_retrieved(current_step_index, config_tuple, error))
+
+            # IOS-XE has a delay between CLI commit and NETCONF visibility.
+            # Use sync-from RPC and poll is-syncing to ensure consistency.
+            if device_platform == "cisco_iosxe" and request.format == "cli":
+                _iosxe_sync_and_get_config(request.module_set, lambda config_tuple, error: on_step_config_retrieved(current_step_index, config_tuple, error))
+            else:
+                _get_netconf_config_parsed(request.module_set, lambda config_tuple, error: on_step_config_retrieved(current_step_index, config_tuple, error))
 
         def on_step_config_retrieved(current_step_index: int, config_tuple: ?(raw: xml.Node, gdata: yang.gdata.Node), error: ?Exception):
             """Process the configuration after a step"""
@@ -1100,26 +1217,6 @@ actor DeviceInstance(auth: WorldCap, log_handler: logging.Handler, platform_name
         except Exception as e:
             _log.error("Failed to compute gdata diff", {"error": str(e)})
             return ""
-
-    def _get_credentials() -> ?(str, str):
-        """Get device credentials, returns (username, password) tuple or None"""
-        _log.debug("Checking device credentials")
-        if instance_spec is not None:
-            _log.debug("InstanceSpec found")
-            _username = instance_spec.username
-            _password = instance_spec.password
-            _log.debug("Checking username and password")
-            if _username is not None and _password is not None:
-                username = _username
-                password = _password
-                _log.info("Credentials found", {"username": username})
-                return (username, password)
-            else:
-                _log.error("Missing username or password for device", {"device": container_id, "username": str(_username), "password_set": str(True if _password is not None else False)})
-                return None
-        else:
-            _log.error("No InstanceSpec available for device", {"device": container_id})
-            return None
 
     def apply_netconf_config(config: str, config_name: str):
         """Generic method to apply NETCONF configuration to device"""
