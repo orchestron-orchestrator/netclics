@@ -9,9 +9,10 @@ import time
 import process
 import xml
 import yang
-import yang.gen3
+import yang.data
 import yang.gdata
 import yang.schema
+import yang.xml
 import schema_filter
 
 
@@ -661,7 +662,7 @@ actor DeviceInstance(auth: WorldCap, log_handler: logging.Handler, platform_name
             elif target_format == "acton-adata":
                 compiled_schema, error = get_compiled_schema(request.module_set)
                 if compiled_schema is not None:
-                    return yang.gen3.pradata(compiled_schema, gdata, loose=True, self_name="dev")
+                    return yang.data.pradata(compiled_schema, gdata, loose=True, self_name="dev")
                 else:
                     _log.warning("No compiled schema for adata conversion, using gdata", {"error": compiled_schema})
                     return gdata.prsrc()
@@ -1085,14 +1086,14 @@ actor DeviceInstance(auth: WorldCap, log_handler: logging.Handler, platform_name
                         compiled_schema, serror = get_compiled_schema(module_set)
                         if compiled_schema is not None:
                             try:
-                                _log.info("Parsing XML with gen3 schemas")
-                                parsed_gdata = yang.gen3.from_data(compiled_schema, config_xml, loose=True)
+                                _log.info("Parsing XML with compiled schemas")
+                                parsed_gdata = yang.xml.from_xml(compiled_schema, config_xml, loose=True)
                                 _log.info("Successfully parsed to gdata")
 
                                 result_callback((raw=config_xml, gdata=parsed_gdata), None)
                             except Exception as e:
-                                _log.error("Failed to parse with gen3 - cannot proceed", {"error": str(e)})
-                                result_callback(None, Exception("Failed to parse with gen3: " + str(e)))
+                                _log.error("Failed to parse with compiled schemas - cannot proceed", {"error": str(e)})
+                                result_callback(None, Exception("Failed to parse with compiled schemas: " + str(e)))
                         else:
                             _log.error("No compiled schema available - cannot proceed with conversion", {"error": serror})
                             result_callback(None, Exception("No compiled schema available - cannot proceed with conversion"))
@@ -1200,7 +1201,7 @@ actor DeviceInstance(auth: WorldCap, log_handler: logging.Handler, platform_name
                     # Convert diff to adata format if schema is available
                     compiled_schema, error = get_compiled_schema(module_set)
                     if compiled_schema is not None:
-                        return yang.gen3.pradata(compiled_schema, diff_result, loose=True, self_name="dev")
+                        return yang.data.pradata(compiled_schema, diff_result, loose=True, self_name="dev")
                     else:
                         _log.warning("No compiled schema for adata diff conversion, using prsrc", {"error": error})
                         return diff_result.prsrc()
