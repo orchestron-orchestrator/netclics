@@ -1,9 +1,9 @@
 {
     "dependencies": {
         "netcli": {
-            "hash": "N-V-__8AADLTAQC7JDaMwuxfiSz96hcgjTwCDguse4O_CAnR",
+            "hash": "N-V-__8AALbgAQCs4mUKDE0RdKdB71fmBH2sNRZZ0CNav3qh",
             "repo_url": "https://github.com/orchestron-orchestrator/netcli.git",
-            "url": "https://github.com/orchestron-orchestrator/netcli/archive/7b108fe0277350fb1b8d351840915a5cc3816d57.zip"
+            "url": "https://github.com/orchestron-orchestrator/netcli/archive/fec9f293e1230dc52c53ab86a8b5fa2c7e676558.zip"
         },
         "netconf": {
             "hash": "N-V-__8AAOL3AQD7Oy0qj2nAbYZ0u3dGWSGfvqABuALB3K0y",
