@@ -109,6 +109,9 @@ start-static-instances-ci: start-static-instances-crpd start-static-instances-xr
 stop-static-instances:
     docker stop crpd1 xrd1 xrd2 xe1 || true
 
+stop-dynamic-instances:
+    docker ps -aqf name=netclics | xargs docker stop
+
 # Show available platforms
 platforms:
     curl {{NETCLICS_CURL_OPTS}} -s {{NETCLICS_BASE_URL}}/api/v1/platforms | jq .
