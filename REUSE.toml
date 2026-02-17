@@ -21,7 +21,8 @@ path = [
     ".gitignore",
     "README.md",
     "REUSE.toml",
-    ".github/**"
+    ".github/**",
+    "certs/*",
 ]
 SPDX-FileCopyrightText = "Deutsche Telekom AG"
 SPDX-License-Identifier = "CC0-1.0"
