@@ -1,3 +1,4 @@
+import argparse
 import file
 import http
 import json
@@ -18,6 +19,12 @@ import schema_filter
 
 # Constant for the wildcard (all modules) default module-set
 ALL_MODULE_SET = "all"
+
+
+def expect[T](a: ?T, ctx: str) -> T:
+    if a is not None:
+        return a
+    raise ValueError("expected value (not None) for: {ctx}")
 
 
 actor ContainerManager(proc_cap: process.ProcessCap, log_handler: logging.Handler):
@@ -2175,7 +2182,8 @@ actor MCPServer(convert_fn: action(ConvertRequest, action(?(base_config: str, st
         except Exception as e:
             _send_error_response(request_id, MCP_INTERNAL_ERROR, str(e), respond, "list_instances")
 
-actor WebServ(listen_cap: net.TCPListenCap, port, director, log_handler: logging.Handler):
+actor WebServ(listen_cap: net.TCPListenCap, http_port: ?int, director, log_handler: logging.Handler,
+              https_port: ?int = None, tls_cert_pem: ?bytes = None, tls_key_pem: ?bytes = None):
     logh = logging.Handler("WebServ")
     logh.set_handler(log_handler)
     _log = logging.Logger(logh)
@@ -2186,7 +2194,10 @@ actor WebServ(listen_cap: net.TCPListenCap, port, director, log_handler: logging
     def _on_http_accept(server):
         server.cb_install(_on_http_server_request, _on_http_server_error)
 
-    def _on_http_server_request(server, request, respond):
+    def _on_https_accept(server):
+        server.cb_install(_on_https_server_request, _on_https_server_error)
+
+    def _handle_request(request, respond):
         _log.info("HTTP request received", {"method": request.method, "path": request.path})
         if request.path == "/api/v1/convert" and request.method == "POST":
             _log.info("Processing conversion request")
@@ -2289,10 +2300,43 @@ actor WebServ(listen_cap: net.TCPListenCap, port, director, log_handler: logging
         else:
             respond(404, {"Content-Type": "application/json"}, json.encode({"error": "Not found"}))
 
+    def _on_http_server_request(server, request, respond):
+        _handle_request(request, respond)
+
+    def _on_https_server_request(server, request, respond):
+        _handle_request(request, respond)
+
     def _on_http_server_error(server, error):
         _log.error("HTTP server error", {"error": error})
 
-    server = http.Listener(listen_cap, "0.0.0.0", port, _on_http_accept)
+    def _on_https_server_error(server, error):
+        _log.error("HTTPS server error", {"error": error})
+
+    def _on_http_listen_error(listener, error):
+        _log.error("HTTP listen error", {"error": error})
+
+    def _on_https_listen_error(listener, error):
+        _log.error("HTTPS listen error", {"error": error})
+
+    var http_server: ?http.Listener = None
+    if http_port is not None:
+        http_server = http.Listener(listen_cap, "0.0.0.0", http_port, _on_http_accept, _on_http_listen_error)
+    else:
+        _log.warning("HTTP endpoint disabled")
+
+    var https_server: ?http.TLSListener = None
+    if https_port is not None and tls_cert_pem is not None and tls_key_pem is not None:
+        https_server = http.TLSListener(
+            listen_cap,
+            "0.0.0.0",
+            https_port,
+            tls_cert_pem,
+            tls_key_pem,
+            _on_https_accept,
+            _on_https_listen_error
+        )
+    else:
+        _log.warning("HTTPS endpoint disabled")
 
 
 def get_default_config() -> SystemConfig:
@@ -2403,7 +2447,31 @@ def get_default_config() -> SystemConfig:
 actor main(env: Env):
     listen_cap = net.TCPListenCap(net.TCPCap(net.NetCap(env.cap)))
     proc_cap = process.ProcessCap(env.cap)
-    port = 8080
+
+    def _parse_args():
+        p = argparse.Parser()
+        p.add_option("http-port", "int", default=8080, help="HTTP listen port (set to 0 to disable)")
+        p.add_option("https-port", "int", default=0, help="HTTPS listen port (set to 0 to disable)")
+        p.add_option("tls-cert", "str", default="", help="Path to TLS certificate PEM file")
+        p.add_option("tls-key", "str", default="", help="Path to TLS private key PEM file")
+        return p.parse(env.argv)
+
+    maybe_args = None
+    try:
+        maybe_args = _parse_args()
+    except argparse.PrintUsage as exc:
+        print(exc.error_message)
+        await async env.exit(0)
+    except argparse.ArgumentError as exc:
+        print(exc.error_message, err=True)
+        await async env.exit(1)
+
+    args = expect(maybe_args, "parsed args")
+
+    http_port = args.get_int("http-port")
+    https_port = args.get_int("https-port")
+    tls_cert_path = args.get_str("tls-cert")
+    tls_key_path = args.get_str("tls-key")
 
     # Load configuration
     config = get_default_config()
@@ -2417,9 +2485,33 @@ actor main(env: Env):
     logh.set_handler(log_handler)
     _log = logging.Logger(logh)
 
+    tls_cert_pem: ?bytes = None
+    tls_key_pem: ?bytes = None
+    if https_port is not None:
+        if tls_cert_path != "" and tls_key_path != "":
+            file_cap = file.FileCap(env.cap)
+            read_cap = file.ReadFileCap(file_cap)
+            try:
+                cert_reader = file.ReadFile(read_cap, tls_cert_path)
+                tls_cert_pem = cert_reader.read()
+                cert_reader.close()
+                key_reader = file.ReadFile(read_cap, tls_key_path)
+                tls_key_pem = key_reader.read()
+                key_reader.close()
+                _log.info("Loaded TLS certificate and key", {"https_port": https_port, "cert_path": tls_cert_path, "key_path": tls_key_path})
+            except Exception as e:
+                print("ERROR: Failed to load TLS certificate/key (cert: {tls_cert_path}, key: {tls_key_path}): {str(e)}", err=True)
+                env.exit(1)
+        else:
+            print("ERROR: HTTPS port {https_port} configured but --tls-cert and --tls-key were not both provided", err=True)
+            env.exit(1)
+
     _log.info("Loaded platform configurations", {"platform_count": len(config.platforms)})
 
     director = Director(env.cap, proc_cap, log_handler)
     director.set_config(config)
-    webs = WebServ(listen_cap, port, director, log_handler)
-    _log.info("NETCLICS started", {"port": port})
+    webs = WebServ(listen_cap, http_port if http_port > 0 else None, director, log_handler, https_port if https_port > 0 else None, tls_cert_pem, tls_key_pem)
+    if https_port is not None and tls_cert_pem is not None and tls_key_pem is not None:
+        _log.info("NETCLICS started", {"http_port": http_port, "https_port": https_port})
+    else:
+        _log.info("NETCLICS started", {"http_port": http_port})

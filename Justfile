@@ -9,6 +9,12 @@ default:
 run:
     out/bin/netclics
 
+# Start NETCLICS with both HTTP and HTTPS endpoints
+# Example:
+#   just run-https TLS_CERT=./certs/server.crt TLS_KEY=./certs/server.key HTTPS_PORT=8443
+run-https TLS_CERT='certs/server.crt' TLS_KEY='certs/server.key' HTTPS_PORT='8443' HTTP_PORT='8080':
+    out/bin/netclics --port {{HTTP_PORT}} --https-port {{HTTPS_PORT}} --tls-cert {{TLS_CERT}} --tls-key {{TLS_KEY}}
+
 # Build the project
 build:
     acton build
@@ -117,6 +123,10 @@ test-netconf-error:
 # Quick test to verify server is running
 ping:
     curl -s http://localhost:8080/api/v1/platforms > /dev/null && echo "✅ Server is running" || echo "❌ Server is not responding"
+
+# Quick HTTPS health check (self-signed cert friendly)
+ping-https HTTPS_PORT='8443':
+    curl -sk https://localhost:{{HTTPS_PORT}}/api/v1/platforms > /dev/null && echo "✅ HTTPS endpoint is running" || echo "❌ HTTPS endpoint is not responding"
 
 # Test CLI input with set commands
 test-cli-to-netconf:
