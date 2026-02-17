@@ -9,6 +9,12 @@ default:
 run:
     out/bin/netclics
 
+# Start NETCLICS with both HTTP and HTTPS endpoints
+# Example:
+#   just run-https TLS_CERT=./certs/server.crt TLS_KEY=./certs/server.key HTTPS_PORT=8443
+run-https TLS_CERT='certs/server.crt' TLS_KEY='certs/server.key' HTTPS_PORT='8443' HTTP_PORT='8080':
+    out/bin/netclics --port {{HTTP_PORT}} --https-port {{HTTPS_PORT}} --tls-cert {{TLS_CERT}} --tls-key {{TLS_KEY}}
+
 # Build the project
 build:
     acton build
@@ -17,6 +23,13 @@ build-ldep:
     acton build --dep yang=../acton-yang --dep netconf=../netconf --dep netcli=../netcli
 
 IMAGE_PATH := env_var_or_default("IMAGE_PATH", "ghcr.io/orchestron-orchestrator/")
+# Base URL used by API/MCP test recipes.
+# Defaults to HTTP on 8080, override for HTTPS:
+#   NETCLICS_BASE_URL=https://localhost:8443 just test-cli-to-netconf
+NETCLICS_BASE_URL := env_var_or_default("NETCLICS_BASE_URL", "http://localhost:8080")
+# Extra curl options used by API/MCP test recipes.
+# Default includes -k for self-signed HTTPS certificates.
+NETCLICS_CURL_OPTS := env_var_or_default("NETCLICS_CURL_OPTS", "-k")
 
 start-static-instances-crpd:
     docker run -td --name crpd1 --rm --privileged --publish 42830:830 --publish 42022:22 -v ./test/crpd-startup.conf:/juniper.conf -v ./router-licenses/juniper_crpd24.lic:/config/license/juniper_crpd24.lic {{IMAGE_PATH}}crpd:24.4R1.9
@@ -78,17 +91,17 @@ stop-static-instances:
 
 # Show available platforms
 platforms:
-    curl -s http://localhost:8080/api/v1/platforms | jq .
+    curl {{NETCLICS_CURL_OPTS}} -s {{NETCLICS_BASE_URL}}/api/v1/platforms | jq .
 
 # Show running instances
 instances:
-    curl -s http://localhost:8080/api/v1/instances | jq .
+    curl {{NETCLICS_CURL_OPTS}} -s {{NETCLICS_BASE_URL}}/api/v1/instances | jq .
 
 # Convert NETCONF/XML to NETCONF/XML, roundtrip via crpd
 test-xml-to-xml-crpd:
     #!/usr/bin/env bash
     echo "=== Conversion with before/after configs ==="
-    RESULT=$(curl -s -X POST http://localhost:8080/api/v1/convert \
+    RESULT=$(curl {{NETCLICS_CURL_OPTS}} -s -X POST {{NETCLICS_BASE_URL}}/api/v1/convert \
       -H "Content-Type: application/json" \
       -d '{
         "input": ["<configuration xmlns:junos=\"http://xml.juniper.net/junos/24.4R0/junos\"><interfaces><interface><name>eth-0/1/2</name><description>XML to XML test</description><unit><name>0</name><family><inet><address><name>10.1.1.1/24</name></address></inet></family></unit></interface></interfaces></configuration>"],
@@ -105,7 +118,7 @@ test-xml-to-xml-crpd:
 # Test with malformed NETCONF input
 test-netconf-error:
     #!/usr/bin/env bash
-    curl -X POST http://localhost:8080/api/v1/convert \
+    curl {{NETCLICS_CURL_OPTS}} -X POST {{NETCLICS_BASE_URL}}/api/v1/convert \
       -H "Content-Type: application/json" \
       -d '{
         "input": ["<configuration xmlns:junos=\"http://xml.juniper.net/junos/24.4R0/junos\"><interfaces><interface><name>ge-0/0/0</name><unit><name>0</name><family><inet><address><name>INVALID_IP</name></address></inet></family></unit></interface></interfaces></configuration>"],
@@ -116,12 +129,16 @@ test-netconf-error:
 
 # Quick test to verify server is running
 ping:
-    curl -s http://localhost:8080/api/v1/platforms > /dev/null && echo "✅ Server is running" || echo "❌ Server is not responding"
+    curl {{NETCLICS_CURL_OPTS}} -s {{NETCLICS_BASE_URL}}/api/v1/platforms > /dev/null && echo "✅ Server is running" || echo "❌ Server is not responding"
+
+# Quick HTTPS health check (self-signed cert friendly)
+ping-https HTTPS_PORT='8443':
+    curl -sk https://localhost:{{HTTPS_PORT}}/api/v1/platforms > /dev/null && echo "✅ HTTPS endpoint is running" || echo "❌ HTTPS endpoint is not responding"
 
 # Test CLI input with set commands
 test-cli-to-netconf:
     #!/usr/bin/env bash
-    RESULT=$(curl -s -X POST http://localhost:8080/api/v1/convert \
+    RESULT=$(curl {{NETCLICS_CURL_OPTS}} -s -X POST {{NETCLICS_BASE_URL}}/api/v1/convert \
       -H "Content-Type: application/json" \
       -d '{
         "input": ["set interfaces ge-0/0/1 description \"CLI test interface\"", "set interfaces ge-0/0/1 unit 0 family inet address 10.1.1.1/24"],
@@ -138,7 +155,7 @@ test-cli-to-netconf:
 # Test NETCONF to CLI conversion
 test-netconf-to-cli:
     #!/usr/bin/env bash
-    RESULT=$(curl -s -X POST http://localhost:8080/api/v1/convert \
+    RESULT=$(curl {{NETCLICS_CURL_OPTS}} -s -X POST {{NETCLICS_BASE_URL}}/api/v1/convert \
       -H "Content-Type: application/json" \
       -d '{
         "input": ["<configuration xmlns:junos=\"http://xml.juniper.net/junos/24.4R0/junos\"><interfaces><interface><name>ge-0/0/2</name><description>XML test interface</description><unit><name>0</name><family><inet><address><name>10.2.2.1/24</name></address></inet></family></unit></interface></interfaces></configuration>"],
@@ -155,7 +172,7 @@ test-netconf-to-cli:
 # Test CLI to CLI roundtrip (should normalize configuration)
 test-cli-to-cli:
     #!/usr/bin/env bash
-    RESULT=$(curl -s -X POST http://localhost:8080/api/v1/convert \
+    RESULT=$(curl {{NETCLICS_CURL_OPTS}} -s -X POST {{NETCLICS_BASE_URL}}/api/v1/convert \
       -H "Content-Type: application/json" \
       -d '{
         "input": ["set interfaces ge-0/0/3 description \"CLI roundtrip test\"", "set interfaces ge-0/0/3 unit 0 family inet address 10.3.3.1/24"],
@@ -172,7 +189,7 @@ test-cli-to-cli:
 # Test CLI to Acton adata conversion
 test-cli-to-acton-adata:
     #!/usr/bin/env bash
-    RESULT=$(curl -s -X POST http://localhost:8080/api/v1/convert \
+    RESULT=$(curl {{NETCLICS_CURL_OPTS}} -s -X POST {{NETCLICS_BASE_URL}}/api/v1/convert \
       -H "Content-Type: application/json" \
       -d '{
         "input": ["set interfaces ge-0/0/4 description \"CLI to adata test\"", "set interfaces ge-0/0/4 unit 0 family inet address 10.4.4.1/24"],
@@ -189,7 +206,7 @@ test-cli-to-acton-adata:
 # Test CLI to Acton gdata conversion
 test-cli-to-acton-gdata:
     #!/usr/bin/env bash
-    RESULT=$(curl -s -X POST http://localhost:8080/api/v1/convert \
+    RESULT=$(curl {{NETCLICS_CURL_OPTS}} -s -X POST {{NETCLICS_BASE_URL}}/api/v1/convert \
       -H "Content-Type: application/json" \
       -d '{
         "input": ["set interfaces ge-0/0/5 description \"CLI to gdata test\"", "set interfaces ge-0/0/5 unit 0 family inet address 10.5.5.1/24"],
@@ -206,7 +223,7 @@ test-cli-to-acton-gdata:
 # Test CLI to JSON conversion
 test-cli-to-json:
     #!/usr/bin/env bash
-    RESULT=$(curl -s -X POST http://localhost:8080/api/v1/convert \
+    RESULT=$(curl {{NETCLICS_CURL_OPTS}} -s -X POST {{NETCLICS_BASE_URL}}/api/v1/convert \
       -H "Content-Type: application/json" \
       -d '{
         "input": ["set interfaces ge-0/0/6 description \"CLI to JSON test\"", "set interfaces ge-0/0/6 unit 0 family inet address 10.6.6.1/24"],
@@ -224,7 +241,7 @@ test-cli-to-json:
 test-mcp-initialize:
     #!/usr/bin/env bash
     echo "=== MCP Initialize ==="
-    curl -s -X POST http://localhost:8080/mcp \
+    curl {{NETCLICS_CURL_OPTS}} -s -X POST {{NETCLICS_BASE_URL}}/mcp \
       -H "Content-Type: application/json" \
       -d '{
         "jsonrpc": "2.0",
@@ -244,7 +261,7 @@ test-mcp-initialize:
 test-mcp-tools-list:
     #!/usr/bin/env bash
     echo "=== MCP Tools List ==="
-    curl -s -X POST http://localhost:8080/mcp \
+    curl {{NETCLICS_CURL_OPTS}} -s -X POST {{NETCLICS_BASE_URL}}/mcp \
       -H "Content-Type: application/json" \
       -d '{
         "jsonrpc": "2.0",
@@ -257,7 +274,7 @@ test-mcp-tools-list:
 test-mcp-convert:
     #!/usr/bin/env bash
     echo "=== MCP Convert Config Tool ==="
-    curl -s -X POST http://localhost:8080/mcp \
+    curl {{NETCLICS_CURL_OPTS}} -s -X POST {{NETCLICS_BASE_URL}}/mcp \
       -H "Content-Type: application/json" \
       -d '{
         "jsonrpc": "2.0",
@@ -278,7 +295,7 @@ test-mcp-convert:
 test-mcp-platforms:
     #!/usr/bin/env bash
     echo "=== MCP List Platforms Tool ==="
-    curl -s -X POST http://localhost:8080/mcp \
+    curl {{NETCLICS_CURL_OPTS}} -s -X POST {{NETCLICS_BASE_URL}}/mcp \
       -H "Content-Type: application/json" \
       -d '{
         "jsonrpc": "2.0",
@@ -294,7 +311,7 @@ test-mcp-platforms:
 test-mcp-instances:
     #!/usr/bin/env bash
     echo "=== MCP List Instances Tool ==="
-    curl -s -X POST http://localhost:8080/mcp \
+    curl {{NETCLICS_CURL_OPTS}} -s -X POST {{NETCLICS_BASE_URL}}/mcp \
       -H "Content-Type: application/json" \
       -d '{
         "jsonrpc": "2.0",
@@ -312,7 +329,7 @@ test-mcp-all: test-mcp-initialize test-mcp-tools-list test-mcp-platforms test-mc
 # Test IOS XRd CLI to Acton adata conversion
 test-iosxrd-cli-to-acton-adata:
     #!/usr/bin/env bash
-    RESULT=$(curl -s -X POST http://localhost:8080/api/v1/convert \
+    RESULT=$(curl {{NETCLICS_CURL_OPTS}} -s -X POST {{NETCLICS_BASE_URL}}/api/v1/convert \
       -H "Content-Type: application/json" \
       -d '{
         "input": ["interface GigabitEthernet0/0/0/1\n description \"IOS XRd test interface\"\n ipv4 address 10.1.1.1 255.255.255.0\n no shutdown"],
@@ -329,7 +346,7 @@ test-iosxrd-cli-to-acton-adata:
 # Test IOS XRd CLI to CLI roundtrip
 test-iosxrd-cli-to-cli:
     #!/usr/bin/env bash
-    RESULT=$(curl -s -X POST http://localhost:8080/api/v1/convert \
+    RESULT=$(curl {{NETCLICS_CURL_OPTS}} -s -X POST {{NETCLICS_BASE_URL}}/api/v1/convert \
       -H "Content-Type: application/json" \
       -d '{
         "input": ["interface GigabitEthernet0/0/0/2\n description \"IOS XRd CLI roundtrip\"\n ipv4 address 10.2.2.1 255.255.255.0\n no shutdown"],
@@ -346,7 +363,7 @@ test-iosxrd-cli-to-cli:
 # Test IOS XRd NETCONF to CLI conversion
 test-iosxrd-netconf-to-cli:
     #!/usr/bin/env bash
-    RESULT=$(curl -s -X POST http://localhost:8080/api/v1/convert \
+    RESULT=$(curl {{NETCLICS_CURL_OPTS}} -s -X POST {{NETCLICS_BASE_URL}}/api/v1/convert \
       -H "Content-Type: application/json" \
       -d '{
         "input": ["<interfaces xmlns=\"http://cisco.com/ns/yang/Cisco-IOS-XR-um-interface-cfg\"><interface><interface-name>GigabitEthernet0/0/0/3</interface-name><description>IOS XRd NETCONF to CLI test</description><ipv4><addresses xmlns=\"http://cisco.com/ns/yang/Cisco-IOS-XR-um-if-ip-address-cfg\"><address><address>10.1.1.1</address><netmask>255.255.255.0</netmask></address></addresses></ipv4></interface></interfaces>"],
@@ -363,7 +380,7 @@ test-iosxrd-netconf-to-cli:
 # Test IOS XRd CLI to NETCONF conversion
 test-iosxrd-cli-to-netconf:
     #!/usr/bin/env bash
-    RESULT=$(curl -s -X POST http://localhost:8080/api/v1/convert \
+    RESULT=$(curl {{NETCLICS_CURL_OPTS}} -s -X POST {{NETCLICS_BASE_URL}}/api/v1/convert \
       -H "Content-Type: application/json" \
       -d '{
         "input": ["interface GigabitEthernet0/0/0/4\n description \"IOS XRd to NETCONF\"\n ipv4 address 10.4.4.1 255.255.255.0\n no shutdown"],
@@ -380,7 +397,7 @@ test-iosxrd-cli-to-netconf:
 # Test IOS XRd CLI to JSON conversion
 test-iosxrd-cli-to-json:
     #!/usr/bin/env bash
-    RESULT=$(curl -s -X POST http://localhost:8080/api/v1/convert \
+    RESULT=$(curl {{NETCLICS_CURL_OPTS}} -s -X POST {{NETCLICS_BASE_URL}}/api/v1/convert \
       -H "Content-Type: application/json" \
       -d '{
         "input": ["interface GigabitEthernet0/0/0/5\n description \"IOS XRd to JSON\"\n ipv4 address 10.5.5.1 255.255.255.0\n no shutdown"],
@@ -397,7 +414,7 @@ test-iosxrd-cli-to-json:
 # Test IOS XRd CLI to Acton adata conversion with unified-model module-set
 test-iosxrd-cli-to-acton-adata-unified-model:
     #!/usr/bin/env bash
-    RESULT=$(curl -s -X POST http://localhost:8080/api/v1/convert \
+    RESULT=$(curl {{NETCLICS_CURL_OPTS}} -s -X POST {{NETCLICS_BASE_URL}}/api/v1/convert \
       -H "Content-Type: application/json" \
       -d '{
         "input": ["interface GigabitEthernet0/0/0/6\n description \"IOS XRd unified-model test\"\n ipv4 address 10.6.6.1 255.255.255.0\n no shutdown"],
@@ -418,7 +435,7 @@ test-iosxrd-all: test-iosxrd-cli-to-acton-adata test-iosxrd-cli-to-cli test-iosx
 # Test IOS XE CLI to Acton adata conversion
 test-iosxe-cli-to-acton-adata:
     #!/usr/bin/env bash
-    RESULT=$(curl -s -X POST http://localhost:8080/api/v1/convert \
+    RESULT=$(curl {{NETCLICS_CURL_OPTS}} -s -X POST {{NETCLICS_BASE_URL}}/api/v1/convert \
       -H "Content-Type: application/json" \
       -d '{
         "input": ["interface GigabitEthernet2\n description \"IOS XE test interface\"\n ip address 10.1.1.1 255.255.255.0\n no shutdown"],
@@ -436,7 +453,7 @@ test-iosxe-cli-to-acton-adata:
 # Test IOS XE CLI to CLI roundtrip
 test-iosxe-cli-to-cli:
     #!/usr/bin/env bash
-    RESULT=$(curl -s -X POST http://localhost:8080/api/v1/convert \
+    RESULT=$(curl {{NETCLICS_CURL_OPTS}} -s -X POST {{NETCLICS_BASE_URL}}/api/v1/convert \
       -H "Content-Type: application/json" \
       -d '{
         "input": ["interface GigabitEthernet2\n description \"IOS XE CLI roundtrip\"\n ip address 10.2.2.1 255.255.255.0\n no shutdown"],
@@ -454,7 +471,7 @@ test-iosxe-cli-to-cli:
 # Test IOS XE NETCONF to CLI conversion
 test-iosxe-netconf-to-cli:
     #!/usr/bin/env bash
-    RESULT=$(curl -s -X POST http://localhost:8080/api/v1/convert \
+    RESULT=$(curl {{NETCLICS_CURL_OPTS}} -s -X POST {{NETCLICS_BASE_URL}}/api/v1/convert \
       -H "Content-Type: application/json" \
       -d '{
         "input": ["<native xmlns=\"http://cisco.com/ns/yang/Cisco-IOS-XE-native\"><interface><GigabitEthernet><name>2</name><description>IOS XE NETCONF to CLI</description><ip><address><primary><address>10.1.1.1</address><mask>255.255.255.0</mask></primary></address></ip></GigabitEthernet></interface></native>"],
@@ -472,7 +489,7 @@ test-iosxe-netconf-to-cli:
 # Test IOS XE CLI to NETCONF conversion
 test-iosxe-cli-to-netconf:
     #!/usr/bin/env bash
-    RESULT=$(curl -s -X POST http://localhost:8080/api/v1/convert \
+    RESULT=$(curl {{NETCLICS_CURL_OPTS}} -s -X POST {{NETCLICS_BASE_URL}}/api/v1/convert \
       -H "Content-Type: application/json" \
       -d '{
         "input": ["interface GigabitEthernet2\n description \"IOS XE CLI to NETCONF\"\n ip address 10.4.4.1 255.255.255.0\n no shutdown"],
@@ -490,7 +507,7 @@ test-iosxe-cli-to-netconf:
 # Test IOS XE CLI to JSON conversion
 test-iosxe-cli-to-json:
     #!/usr/bin/env bash
-    RESULT=$(curl -s -X POST http://localhost:8080/api/v1/convert \
+    RESULT=$(curl {{NETCLICS_CURL_OPTS}} -s -X POST {{NETCLICS_BASE_URL}}/api/v1/convert \
       -H "Content-Type: application/json" \
       -d '{
         "input": ["interface GigabitEthernet2\n description \"IOS XE CLI to JSON\"\n ip address 10.5.5.1 255.255.255.0\n no shutdown"],
@@ -519,7 +536,7 @@ wait-for-instances timeout="180":
     ELAPSED=0
 
     while [ $ELAPSED -lt $MAX_WAIT ]; do
-        INSTANCES=$(curl -s http://localhost:8080/api/v1/instances)
+        INSTANCES=$(curl {{NETCLICS_CURL_OPTS}} -s {{NETCLICS_BASE_URL}}/api/v1/instances)
 
         # Check if any instances are not ready
         NOT_READY=$(echo "$INSTANCES" | jq -r '.instances[] | select(.state != "ready") | "\(.instance_id): \(.state)"')
@@ -549,7 +566,7 @@ wait-for-schemas timeout="360":
     ELAPSED=0
 
     while [ $ELAPSED -lt $MAX_WAIT ]; do
-        INSTANCES=$(curl -s http://localhost:8080/api/v1/instances)
+        INSTANCES=$(curl {{NETCLICS_CURL_OPTS}} -s {{NETCLICS_BASE_URL}}/api/v1/instances)
 
         # First check if there are any instances
         INSTANCE_COUNT=$(echo "$INSTANCES" | jq '.instances | length')
@@ -587,7 +604,7 @@ wait-for-all instances_timeout="180" schemas_timeout="180":
 test-multi-step:
     #!/usr/bin/env bash
     echo "=== Multi-Step Configuration Test ==="
-    RESULT=$(curl -s -X POST http://localhost:8080/api/v1/convert \
+    RESULT=$(curl {{NETCLICS_CURL_OPTS}} -s -X POST {{NETCLICS_BASE_URL}}/api/v1/convert \
       -H "Content-Type: application/json" \
       -d '{
         "input": [
@@ -608,7 +625,7 @@ test-multi-step:
 test-multi-step-iosxe:
     #!/usr/bin/env bash
     echo "=== Multi-Step IOS XE Configuration Test (CLI -> NETCONF) ==="
-    RESULT=$(curl -s -X POST http://localhost:8080/api/v1/convert \
+    RESULT=$(curl {{NETCLICS_CURL_OPTS}} -s -X POST {{NETCLICS_BASE_URL}}/api/v1/convert \
       -H "Content-Type: application/json" \
       -d '{
         "input": [
@@ -625,7 +642,7 @@ test-multi-step-iosxe:
 test-multi-step-iosxr:
     #!/usr/bin/env bash
     echo "=== Multi-Step IOS XR Configuration Test (CLI -> NETCONF) ==="
-    RESULT=$(curl -s -X POST http://localhost:8080/api/v1/convert \
+    RESULT=$(curl {{NETCLICS_CURL_OPTS}} -s -X POST {{NETCLICS_BASE_URL}}/api/v1/convert \
       -H "Content-Type: application/json" \
       -d '{
         "input": [
@@ -642,7 +659,7 @@ test-multi-step-iosxr:
 test-multi-step-cli-to-cli:
     #!/usr/bin/env bash
     echo "=== Multi-Step CLI -> CLI Test (cRPD) ==="
-    RESULT=$(curl -s -X POST http://localhost:8080/api/v1/convert \
+    RESULT=$(curl {{NETCLICS_CURL_OPTS}} -s -X POST {{NETCLICS_BASE_URL}}/api/v1/convert \
       -H "Content-Type: application/json" \
       -d '{
         "input": [
@@ -663,7 +680,7 @@ test-multi-step-cli-to-cli:
 test-multi-step-netconf-to-cli:
     #!/usr/bin/env bash
     echo "=== Multi-Step NETCONF -> CLI Test (cRPD) ==="
-    RESULT=$(curl -s -X POST http://localhost:8080/api/v1/convert \
+    RESULT=$(curl {{NETCLICS_CURL_OPTS}} -s -X POST {{NETCLICS_BASE_URL}}/api/v1/convert \
       -H "Content-Type: application/json" \
       -d '{
         "input": [
@@ -684,7 +701,7 @@ test-multi-step-netconf-to-cli:
 test-multi-step-iosxe-cli-to-cli:
     #!/usr/bin/env bash
     echo "=== Multi-Step CLI -> CLI Test (IOS XE) ==="
-    RESULT=$(curl -s -X POST http://localhost:8080/api/v1/convert \
+    RESULT=$(curl {{NETCLICS_CURL_OPTS}} -s -X POST {{NETCLICS_BASE_URL}}/api/v1/convert \
       -H "Content-Type: application/json" \
       -d '{
         "input": [
