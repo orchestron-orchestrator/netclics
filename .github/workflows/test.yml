@@ -8,6 +8,7 @@ jobs:
     runs-on: ubuntu-latest
     env:
       IMAGE_PATH: ${{ secrets.IMAGE_PATH || format('ghcr.io/{0}/', github.repository) }}
+      NETCLICS_BASE_URL: https://localhost:8443
     steps:
       - uses: actonlang/setup-acton@v1
         with:
@@ -73,7 +74,7 @@ jobs:
 
       - name: "Start NETCLICS server in background"
         run: |
-          just run > netclics.log 2>&1 &
+          just run-https > netclics.log 2>&1 &
           echo $! > netclics.pid
           echo "NETCLICS server started with PID $(cat netclics.pid)"
 
