@@ -2487,7 +2487,7 @@ actor main(env: Env):
 
     tls_cert_pem: ?bytes = None
     tls_key_pem: ?bytes = None
-    if https_port is not None:
+    if https_port != 0:
         if tls_cert_path != "" and tls_key_path != "":
             file_cap = file.FileCap(env.cap)
             read_cap = file.ReadFileCap(file_cap)
