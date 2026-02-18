@@ -81,7 +81,7 @@ start-static-instances-xrd:
     done
 
 start-static-instances-xe:
-    docker run -td --name xe1 --rm --privileged --publish 44830:830 --publish 44022:22 {{IMAGE_PATH}}vrnetlab/vr-c8000v:17.15.03a --trace
+    docker run -td --name xe1 --rm --privileged --publish 44830:830 --publish 44022:22 {{IMAGE_PATH}}vrnetlab/vr-c8000v:17.18.02 --trace
 
 # Start all static instances
 start-static-instances: start-static-instances-crpd start-static-instances-xrd start-static-instances-xe
@@ -441,7 +441,7 @@ test-iosxe-cli-to-acton-adata:
         "input": ["interface GigabitEthernet2\n description \"IOS XE test interface\"\n ip address 10.1.1.1 255.255.255.0\n no shutdown"],
         "format": "cli",
         "target_format": "acton-adata",
-        "platform": "iosxe 17.15.03a-local",
+        "platform": "iosxe 17.18.02-local",
         "module_set": "cisco-xe-native"
       }')
     echo "$RESULT" | jq .
@@ -459,7 +459,7 @@ test-iosxe-cli-to-cli:
         "input": ["interface GigabitEthernet2\n description \"IOS XE CLI roundtrip\"\n ip address 10.2.2.1 255.255.255.0\n no shutdown"],
         "format": "cli",
         "target_format": "cli",
-        "platform": "iosxe 17.15.03a-local",
+        "platform": "iosxe 17.18.02-local",
         "module_set": "cisco-xe-native"
       }')
     echo "$RESULT" | jq .
@@ -477,7 +477,7 @@ test-iosxe-netconf-to-cli:
         "input": ["<native xmlns=\"http://cisco.com/ns/yang/Cisco-IOS-XE-native\"><interface><GigabitEthernet><name>2</name><description>IOS XE NETCONF to CLI</description><ip><address><primary><address>10.1.1.1</address><mask>255.255.255.0</mask></primary></address></ip></GigabitEthernet></interface></native>"],
         "format": "netconf",
         "target_format": "cli",
-        "platform": "iosxe 17.15.03a-local",
+        "platform": "iosxe 17.18.02-local",
         "module_set": "cisco-xe-native"
       }')
     echo "$RESULT" | jq .
@@ -495,7 +495,7 @@ test-iosxe-cli-to-netconf:
         "input": ["interface GigabitEthernet2\n description \"IOS XE CLI to NETCONF\"\n ip address 10.4.4.1 255.255.255.0\n no shutdown"],
         "format": "cli",
         "target_format": "netconf",
-        "platform": "iosxe 17.15.03a-local",
+        "platform": "iosxe 17.18.02-local",
         "module_set": "cisco-xe-native"
       }')
     echo "$RESULT" | jq .
@@ -513,7 +513,7 @@ test-iosxe-cli-to-json:
         "input": ["interface GigabitEthernet2\n description \"IOS XE CLI to JSON\"\n ip address 10.5.5.1 255.255.255.0\n no shutdown"],
         "format": "cli",
         "target_format": "json",
-        "platform": "iosxe 17.15.03a-local",
+        "platform": "iosxe 17.18.02-local",
         "module_set": "cisco-xe-native"
       }')
     echo "$RESULT" | jq .
@@ -634,7 +634,7 @@ test-multi-step-iosxe:
         ],
         "format": "cli",
         "target_format": "netconf",
-        "platform": "iosxe 17.15.03a-local"
+        "platform": "iosxe 17.18.02-local"
       }')
     echo "$RESULT" | jq .
 
@@ -711,7 +711,7 @@ test-multi-step-iosxe-cli-to-cli:
         ],
         "format": "cli",
         "target_format": "cli",
-        "platform": "iosxe 17.15.03a-local"
+        "platform": "iosxe 17.18.02-local"
       }')
     echo "$RESULT" | jq .
 

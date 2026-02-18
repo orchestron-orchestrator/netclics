@@ -2403,7 +2403,7 @@ def get_default_config() -> SystemConfig:
         ),
         # Local Cisco IOS XE static instance
         PlatformConfig(
-            name="iosxe 17.15.03a-local",
+            name="iosxe 17.18.02-local",
             platform="cisco_iosxe",
             module_sets=["cisco-xe-native"],
             instances=[
