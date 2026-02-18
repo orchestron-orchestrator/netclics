@@ -647,7 +647,9 @@ actor DeviceInstance(auth: WorldCap, log_handler: logging.Handler, platform_name
 
         # Local variables for this conversion only
         base_gdata: ?yang.gdata.Node = None
+        base_gdata_all: ?yang.gdata.Node = None
         base_xml: ?xml.Node = None
+        latest_gdata_all: ?yang.gdata.Node = None
 
         # Variables to hold formatted base config
         base_config_formatted = ""
@@ -679,7 +681,6 @@ actor DeviceInstance(auth: WorldCap, log_handler: logging.Handler, platform_name
                 _log.warning("Unknown target format, using XML", {"target_format": target_format})
                 return gdata.to_xmlstr(pretty=True)
 
-
         def on_base_config_retrieved(config_tuple: ?(raw: xml.Node, gdata: yang.gdata.Node), error: ?Exception):
             """Step 1: Process the retrieved base configuration"""
             if error is not None:
@@ -701,6 +702,12 @@ actor DeviceInstance(auth: WorldCap, log_handler: logging.Handler, platform_name
                 # Store for later use
                 base_xml = raw_xml  # Save raw XML node for rollback
                 base_gdata = parsed_gdata  # Save parsed data for diff
+                base_gdata_all_parsed = _parse_gdata(raw_xml, ALL_MODULE_SET, "base config")
+                if base_gdata_all_parsed.gdata is None:
+                    err_msg = base_gdata_all_parsed.error
+                    abort(err_msg if err_msg is not None else "Failed to parse base config (full module-set)")
+                    return
+                base_gdata_all = base_gdata_all_parsed.gdata
 
                 # Format base config for response
                 if request.target_format == "cli":
@@ -791,6 +798,12 @@ actor DeviceInstance(auth: WorldCap, log_handler: logging.Handler, platform_name
 
                 # Store gdata for this step
                 steps_gdata.append(step_gdata)
+                step_gdata_all_parsed = _parse_gdata(step_raw_xml, ALL_MODULE_SET, f"step {current_step_index + 1} config")
+                if step_gdata_all_parsed.gdata is None:
+                    err_msg = step_gdata_all_parsed.error
+                    abort(err_msg if err_msg is not None else f"Failed to parse step {current_step_index + 1} config (full module-set)")
+                    return
+                latest_gdata_all = step_gdata_all_parsed.gdata
 
                 # Format config for this step
                 if request.target_format == "cli":
@@ -855,30 +868,76 @@ actor DeviceInstance(auth: WorldCap, log_handler: logging.Handler, platform_name
             # Move to next step
             process_next_step(current_step_index + 1)
 
+        def verify_restored_config(expected_base_gdata: yang.gdata.Node, callback: action(?Exception) -> None):
+            """Verify device configuration matches base after rollback (full module-set)"""
+            _log.info("Verifying device configuration matches base state after rollback", {"module_set": ALL_MODULE_SET})
+
+            def on_verify_config_retrieved(config_tuple: ?(raw: xml.Node, gdata: yang.gdata.Node), error: ?Exception):
+                if error is not None:
+                    _log.error("Failed to retrieve config for rollback verification", {"error": str(error)})
+                    callback(Exception("Failed to verify rollback state: " + str(error)))
+                    return
+
+                if config_tuple is not None:
+                    current_gdata: yang.gdata.Node = config_tuple.gdata
+                    diff_result: ?yang.gdata.Node = yang.gdata.diff(expected_base_gdata, current_gdata)
+                    if diff_result is not None:
+                        diff_preview = diff_result.prsrc()
+                        _log.error("Rollback verification failed: device differs from base state", {"diff_preview": diff_preview[:1000]})
+                        callback(Exception("Rollback verification failed: device configuration does not match base state"))
+                    else:
+                        _log.info("Rollback verification succeeded: device matches base state")
+                        callback(None)
+                else:
+                    _log.error("No configuration returned for rollback verification")
+                    callback(Exception("Failed to verify rollback state: no configuration returned"))
+
+            _get_netconf_config_parsed(ALL_MODULE_SET, on_verify_config_retrieved)
+
         def on_all_steps_complete():
             """All steps completed, perform rollback"""
             _log.info("All configuration steps completed, starting rollback")
 
             # Get final gdata (last step's gdata) for rollback
             final_gdata = steps_gdata[-1] if len(steps_gdata) > 0 else None
+            final_gdata_all = latest_gdata_all
 
             # Start rollback process
             if base_xml is not None and base_gdata is not None and final_gdata is not None:
-                _log.info("Starting automatic rollback to clean device state using NETCONF")
-                _rollback_to_config(base_xml, base_gdata, final_gdata, on_rollback_complete)
+                if base_gdata_all is not None and final_gdata_all is not None:
+                    _log.info("Starting automatic rollback to clean device state using NETCONF", {"module_set": ALL_MODULE_SET})
+                    _rollback_to_config(base_xml, base_gdata_all, final_gdata_all, on_rollback_complete)
+                else:
+                    _log.error("Full module-set gdata missing for rollback; falling back to request module-set", {"base_gdata_all": base_gdata_all is not None, "final_gdata_all": final_gdata_all is not None})
+                    _rollback_to_config(base_xml, base_gdata, final_gdata, on_rollback_complete)
             else:
                 _log.error("Missing data for rollback")
                 on_rollback_complete(Exception("Missing data for rollback"))
 
 
         def on_rollback_complete(rollback_error: ?Exception):
-            """Rollback complete, finish the conversion"""
-            if rollback_error is None:
-                _log.info("Device successfully rolled back to clean state")
-            else:
-                _log.warning("Rollback failed but conversion succeeded", {"error": str(rollback_error)})
+            """Rollback complete, verify and finish the conversion"""
+            if rollback_error is not None:
+                _log.error("Rollback failed after successful conversion", {"error": str(rollback_error)})
+                state = "error"
+                finish(Exception("Rollback failed after successful conversion: " + str(rollback_error)), None)
+                return
 
-            # Complete successfully with results
+            if base_gdata_all is not None:
+                verify_restored_config(base_gdata_all, on_success_rollback_verified)
+            else:
+                state = "error"
+                finish(Exception("Missing base configuration for rollback verification"), None)
+
+        def on_success_rollback_verified(verification_error: ?Exception):
+            """Handle rollback verification for successful conversion"""
+            if verification_error is not None:
+                _log.error("Rollback verification failed after successful conversion", {"error": str(verification_error)})
+                state = "error"
+                finish(verification_error, None)
+                return
+
+            _log.info("Device successfully rolled back to clean state")
             complete()
 
         def complete():
@@ -899,7 +958,11 @@ actor DeviceInstance(auth: WorldCap, log_handler: logging.Handler, platform_name
                 # We have applied at least one step, need to rollback
                 current_gdata = steps_gdata[-1]
                 _log.info("Rolling back to initial state after error")
-                _rollback_to_config(base_xml, base_gdata, current_gdata, lambda rollback_error: on_abort_rollback_complete(error, rollback_error))
+                if base_gdata_all is not None and latest_gdata_all is not None:
+                    _rollback_to_config(base_xml, base_gdata_all, latest_gdata_all, lambda rollback_error: on_abort_rollback_complete(error, rollback_error))
+                else:
+                    _log.error("Full module-set gdata missing for rollback after abort; falling back to request module-set", {"base_gdata_all": base_gdata_all is not None, "current_gdata_all": latest_gdata_all is not None})
+                    _rollback_to_config(base_xml, base_gdata, current_gdata, lambda rollback_error: on_abort_rollback_complete(error, rollback_error))
             else:
                 # Either no base config (failed early) or no steps applied - nothing to rollback
                 _log.info("No rollback needed - no changes were applied")
@@ -907,17 +970,35 @@ actor DeviceInstance(auth: WorldCap, log_handler: logging.Handler, platform_name
 
         def on_abort_rollback_complete(original_error: str, rollback_error: ?Exception):
             """Handle rollback completion after abort"""
-            if rollback_error is None:
-                _log.info("Successfully rolled back to initial state after abort")
-            else:
+            if rollback_error is not None:
                 _log.error("Failed to rollback after abort", {"rollback_error": str(rollback_error)})
+                state = "error"
+                finish(Exception(original_error + "; rollback failed: " + str(rollback_error)), None)
+                return
+
+            if base_gdata_all is not None:
+                verify_restored_config(base_gdata_all, lambda verification_error: on_abort_rollback_verified(original_error, verification_error))
+            else:
+                state = "error"
+                finish(Exception(original_error + "; missing base configuration for rollback verification"), None)
+
+        def on_abort_rollback_verified(original_error: str, verification_error: ?Exception):
+            """Handle rollback verification after abort"""
+            if verification_error is not None:
+                _log.error("Rollback verification failed after abort", {"error": str(verification_error)})
+                state = "error"
+                finish(Exception(original_error + "; " + str(verification_error)), None)
+                return
+
+            _log.info("Successfully rolled back to initial state after abort")
             # Always finish with the original error that caused the abort
             finish(Exception(original_error), None)
 
         def finish(error: ?Exception, result):
             """Final cleanup and callback"""
-            # Reset state
-            state = "ready"
+            # Reset state unless an irrecoverable failure has already marked this device as error
+            if state != "error":
+                state = "ready"
 
             _cleanup_conversion_clients()
 
@@ -1062,6 +1143,21 @@ actor DeviceInstance(auth: WorldCap, log_handler: logging.Handler, platform_name
 
         _get_or_create_cli_client(on_client_success, on_client_error)
 
+    def _parse_gdata(raw_xml: xml.Node, module_set: str, context: str) -> (gdata: ?yang.gdata.Node, error: ?str):
+        """Parse XML into gdata with the specified module-set"""
+        compiled_schema, serror = get_compiled_schema(module_set)
+        if compiled_schema is not None:
+            try:
+                _log.debug("Parsing raw XML with compiled schemas", {"module_set": module_set, "context": context})
+                parsed_gdata = yang.xml.from_xml(compiled_schema, raw_xml, loose=True)
+                return (gdata=parsed_gdata, error=None)
+            except Exception as e:
+                _log.error("Failed to parse raw XML with compiled schemas", {"module_set": module_set, "context": context, "error": str(e)})
+                return (gdata=None, error="Parse failed: " + str(e))
+
+        _log.error("No compiled schema for parsing", {"module_set": module_set, "context": context, "error": serror})
+        return (gdata=None, error="No compiled schema available")
+
     def _get_netconf_config_parsed(module_set: str, result_callback: action(?(raw: xml.Node, gdata: yang.gdata.Node), ?Exception) -> None):
         """Get NETCONF config and parse it with schemas
 
@@ -1090,20 +1186,14 @@ actor DeviceInstance(auth: WorldCap, log_handler: logging.Handler, platform_name
                         _log.debug("Got raw XML", {"length": len(xml.encode(config_xml))})
 
                         # Parse with schemas - this is required for conversion
-                        compiled_schema, serror = get_compiled_schema(module_set)
-                        if compiled_schema is not None:
-                            try:
-                                _log.info("Parsing XML with compiled schemas")
-                                parsed_gdata = yang.xml.from_xml(compiled_schema, config_xml, loose=True)
-                                _log.info("Successfully parsed to gdata")
-
-                                result_callback((raw=config_xml, gdata=parsed_gdata), None)
-                            except Exception as e:
-                                _log.error("Failed to parse with compiled schemas - cannot proceed", {"error": str(e)})
-                                result_callback(None, Exception("Failed to parse with compiled schemas: " + str(e)))
+                        parsed = _parse_gdata(config_xml, module_set, "netconf get-config")
+                        parsed_gdata = parsed.gdata
+                        if parsed_gdata is not None:
+                            _log.info("Successfully parsed to gdata")
+                            result_callback((raw=config_xml, gdata=parsed_gdata), None)
                         else:
-                            _log.error("No compiled schema available - cannot proceed with conversion", {"error": serror})
-                            result_callback(None, Exception("No compiled schema available - cannot proceed with conversion"))
+                            err_msg = parsed.error
+                            result_callback(None, Exception(err_msg if err_msg is not None else "Parse failed"))
                     else:
                         _log.error("No data element in get-config response")
                         result_callback(None, Exception("No data element in get-config response"))
