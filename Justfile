@@ -32,6 +32,10 @@ NETCLICS_BASE_URL := env_var_or_default("NETCLICS_BASE_URL", "http://localhost:8
 # Extra curl options used by API/MCP test recipes.
 # Default includes -k for self-signed HTTPS certificates.
 NETCLICS_CURL_OPTS := env_var_or_default("NETCLICS_CURL_OPTS", "-k")
+# Default platform names for tests (override with env vars if needed).
+CRPD_PLATFORM := env_var_or_default("CRPD_PLATFORM", "crpd 24.4R1.9-dynamic")
+IOSXRD_PLATFORM := env_var_or_default("IOSXRD_PLATFORM", "iosxrd 24.3.1-dynamic")
+IOSXE_PLATFORM := env_var_or_default("IOSXE_PLATFORM", "iosxe 17.18.02-dynamic")
 
 start-static-instances-crpd:
     docker run -td --name crpd1 --rm --privileged --publish 42830:830 --publish 42022:22 -v ./test/crpd-startup.conf:/juniper.conf -v ./router-licenses/juniper_crpd24.lic:/config/license/juniper_crpd24.lic {{IMAGE_PATH}}crpd:24.4R1.9
@@ -134,7 +138,7 @@ test-xml-to-xml-crpd:
         "input": ["<configuration xmlns:junos=\"http://xml.juniper.net/junos/24.4R0/junos\"><interfaces><interface><name>eth-0/1/2</name><description>XML to XML test</description><unit><name>0</name><family><inet><address><name>10.1.1.1/24</name></address></inet></family></unit></interface></interfaces></configuration>"],
         "format": "netconf",
         "target_format": "netconf",
-        "platform": "crpd 24.4R1.9-local"
+        "platform": "{{CRPD_PLATFORM}}"
       }')
     echo "$RESULT" | jq .
 
@@ -151,7 +155,7 @@ test-netconf-error:
         "input": ["<configuration xmlns:junos=\"http://xml.juniper.net/junos/24.4R0/junos\"><interfaces><interface><name>ge-0/0/0</name><unit><name>0</name><family><inet><address><name>INVALID_IP</name></address></inet></family></unit></interface></interfaces></configuration>"],
         "format": "netconf",
         "target_format": "netconf",
-        "platform": "crpd 24.4R1.9-local"
+        "platform": "{{CRPD_PLATFORM}}"
       }' | jq .
 
 # Quick test to verify server is running
@@ -171,7 +175,7 @@ test-cli-to-netconf:
         "input": ["set interfaces ge-0/0/1 description \"CLI test interface\"", "set interfaces ge-0/0/1 unit 0 family inet address 10.1.1.1/24"],
         "format": "cli",
         "target_format": "netconf",
-        "platform": "crpd 24.4R1.9-local"
+        "platform": "{{CRPD_PLATFORM}}"
       }')
     echo "$RESULT" | jq .
 
@@ -188,7 +192,7 @@ test-netconf-to-cli:
         "input": ["<configuration xmlns:junos=\"http://xml.juniper.net/junos/24.4R0/junos\"><interfaces><interface><name>ge-0/0/2</name><description>XML test interface</description><unit><name>0</name><family><inet><address><name>10.2.2.1/24</name></address></inet></family></unit></interface></interfaces></configuration>"],
         "format": "netconf",
         "target_format": "cli",
-        "platform": "crpd 24.4R1.9-local"
+        "platform": "{{CRPD_PLATFORM}}"
       }')
     echo "$RESULT" | jq .
 
@@ -205,7 +209,7 @@ test-cli-to-cli:
         "input": ["set interfaces ge-0/0/3 description \"CLI roundtrip test\"", "set interfaces ge-0/0/3 unit 0 family inet address 10.3.3.1/24"],
         "format": "cli",
         "target_format": "cli",
-        "platform": "crpd 24.4R1.9-local"
+        "platform": "{{CRPD_PLATFORM}}"
       }')
     echo "$RESULT" | jq .
 
@@ -222,7 +226,7 @@ test-cli-to-acton-adata:
         "input": ["set interfaces ge-0/0/4 description \"CLI to adata test\"", "set interfaces ge-0/0/4 unit 0 family inet address 10.4.4.1/24"],
         "format": "cli",
         "target_format": "acton-adata",
-        "platform": "crpd 24.4R1.9-local"
+        "platform": "{{CRPD_PLATFORM}}"
       }')
     echo "$RESULT" | jq .
 
@@ -239,7 +243,7 @@ test-cli-to-acton-gdata:
         "input": ["set interfaces ge-0/0/5 description \"CLI to gdata test\"", "set interfaces ge-0/0/5 unit 0 family inet address 10.5.5.1/24"],
         "format": "cli",
         "target_format": "acton-gdata",
-        "platform": "crpd 24.4R1.9-local"
+        "platform": "{{CRPD_PLATFORM}}"
       }')
     echo "$RESULT" | jq .
 
@@ -256,7 +260,7 @@ test-cli-to-json:
         "input": ["set interfaces ge-0/0/6 description \"CLI to JSON test\"", "set interfaces ge-0/0/6 unit 0 family inet address 10.6.6.1/24"],
         "format": "cli",
         "target_format": "json",
-        "platform": "crpd 24.4R1.9-local"
+        "platform": "{{CRPD_PLATFORM}}"
       }')
     echo "$RESULT" | jq .
 
@@ -313,7 +317,7 @@ test-mcp-convert:
             "input_config": ["set interfaces ge-0/0/7 description \"MCP test interface\"", "set interfaces ge-0/0/7 unit 0 family inet address 10.7.7.1/24"],
             "format": "cli",
             "target_format": "netconf",
-            "platform": "crpd 24.4R1.9-local"
+            "platform": "{{CRPD_PLATFORM}}"
           }
         }
       }' | jq .
@@ -362,7 +366,7 @@ test-iosxrd-cli-to-acton-adata:
         "input": ["interface GigabitEthernet0/0/0/1\n description \"IOS XRd test interface\"\n ipv4 address 10.1.1.1 255.255.255.0\n no shutdown"],
         "format": "cli",
         "target_format": "acton-adata",
-        "platform": "iosxrd 25.3.1-local"
+        "platform": "{{IOSXRD_PLATFORM}}"
       }')
     echo "$RESULT" | jq .
 
@@ -379,7 +383,7 @@ test-iosxrd-cli-to-cli:
         "input": ["interface GigabitEthernet0/0/0/2\n description \"IOS XRd CLI roundtrip\"\n ipv4 address 10.2.2.1 255.255.255.0\n no shutdown"],
         "format": "cli",
         "target_format": "cli",
-        "platform": "iosxrd 25.3.1-local"
+        "platform": "{{IOSXRD_PLATFORM}}"
       }')
     echo "$RESULT" | jq .
 
@@ -396,7 +400,7 @@ test-iosxrd-netconf-to-cli:
         "input": ["<interfaces xmlns=\"http://cisco.com/ns/yang/Cisco-IOS-XR-um-interface-cfg\"><interface><interface-name>GigabitEthernet0/0/0/3</interface-name><description>IOS XRd NETCONF to CLI test</description><ipv4><addresses xmlns=\"http://cisco.com/ns/yang/Cisco-IOS-XR-um-if-ip-address-cfg\"><address><address>10.1.1.1</address><netmask>255.255.255.0</netmask></address></addresses></ipv4></interface></interfaces>"],
         "format": "netconf",
         "target_format": "cli",
-        "platform": "iosxrd 25.3.1-local"
+        "platform": "{{IOSXRD_PLATFORM}}"
       }')
     echo "$RESULT" | jq .
 
@@ -413,7 +417,7 @@ test-iosxrd-cli-to-netconf:
         "input": ["interface GigabitEthernet0/0/0/4\n description \"IOS XRd to NETCONF\"\n ipv4 address 10.4.4.1 255.255.255.0\n no shutdown"],
         "format": "cli",
         "target_format": "netconf",
-        "platform": "iosxrd 25.3.1-local"
+        "platform": "{{IOSXRD_PLATFORM}}"
       }')
     echo "$RESULT" | jq .
 
@@ -430,7 +434,7 @@ test-iosxrd-cli-to-json:
         "input": ["interface GigabitEthernet0/0/0/5\n description \"IOS XRd to JSON\"\n ipv4 address 10.5.5.1 255.255.255.0\n no shutdown"],
         "format": "cli",
         "target_format": "json",
-        "platform": "iosxrd 25.3.1-local"
+        "platform": "{{IOSXRD_PLATFORM}}"
       }')
     echo "$RESULT" | jq .
 
@@ -447,7 +451,7 @@ test-iosxrd-cli-to-acton-adata-unified-model:
         "input": ["interface GigabitEthernet0/0/0/6\n description \"IOS XRd unified-model test\"\n ipv4 address 10.6.6.1 255.255.255.0\n no shutdown"],
         "format": "cli",
         "target_format": "acton-adata",
-        "platform": "iosxrd 25.3.1-local",
+        "platform": "{{IOSXRD_PLATFORM}}",
         "module_set": "cisco-xr-unified-model"
       }')
     echo "$RESULT" | jq .
@@ -468,7 +472,7 @@ test-iosxe-cli-to-acton-adata:
         "input": ["interface GigabitEthernet2\n description \"IOS XE test interface\"\n ip address 10.1.1.1 255.255.255.0\n no shutdown"],
         "format": "cli",
         "target_format": "acton-adata",
-        "platform": "iosxe 17.18.02-local",
+        "platform": "{{IOSXE_PLATFORM}}",
         "module_set": "cisco-xe-native"
       }')
     echo "$RESULT" | jq .
@@ -486,7 +490,7 @@ test-iosxe-cli-to-cli:
         "input": ["interface GigabitEthernet2\n description \"IOS XE CLI roundtrip\"\n ip address 10.2.2.1 255.255.255.0\n no shutdown"],
         "format": "cli",
         "target_format": "cli",
-        "platform": "iosxe 17.18.02-local",
+        "platform": "{{IOSXE_PLATFORM}}",
         "module_set": "cisco-xe-native"
       }')
     echo "$RESULT" | jq .
@@ -504,7 +508,7 @@ test-iosxe-netconf-to-cli:
         "input": ["<native xmlns=\"http://cisco.com/ns/yang/Cisco-IOS-XE-native\"><interface><GigabitEthernet><name>2</name><description>IOS XE NETCONF to CLI</description><ip><address><primary><address>10.1.1.1</address><mask>255.255.255.0</mask></primary></address></ip></GigabitEthernet></interface></native>"],
         "format": "netconf",
         "target_format": "cli",
-        "platform": "iosxe 17.18.02-local",
+        "platform": "{{IOSXE_PLATFORM}}",
         "module_set": "cisco-xe-native"
       }')
     echo "$RESULT" | jq .
@@ -522,7 +526,7 @@ test-iosxe-cli-to-netconf:
         "input": ["interface GigabitEthernet2\n description \"IOS XE CLI to NETCONF\"\n ip address 10.4.4.1 255.255.255.0\n no shutdown"],
         "format": "cli",
         "target_format": "netconf",
-        "platform": "iosxe 17.18.02-local",
+        "platform": "{{IOSXE_PLATFORM}}",
         "module_set": "cisco-xe-native"
       }')
     echo "$RESULT" | jq .
@@ -540,7 +544,7 @@ test-iosxe-cli-to-json:
         "input": ["interface GigabitEthernet2\n description \"IOS XE CLI to JSON\"\n ip address 10.5.5.1 255.255.255.0\n no shutdown"],
         "format": "cli",
         "target_format": "json",
-        "platform": "iosxe 17.18.02-local",
+        "platform": "{{IOSXE_PLATFORM}}",
         "module_set": "cisco-xe-native"
       }')
     echo "$RESULT" | jq .
@@ -640,7 +644,7 @@ test-multi-step:
         ],
         "format": "cli",
         "target_format": "netconf",
-        "platform": "crpd 24.4R1.9-local"
+        "platform": "{{CRPD_PLATFORM}}"
       }')
     echo "$RESULT" | jq .
 
@@ -661,7 +665,7 @@ test-multi-step-iosxe:
         ],
         "format": "cli",
         "target_format": "netconf",
-        "platform": "iosxe 17.18.02-local"
+        "platform": "{{IOSXE_PLATFORM}}"
       }')
     echo "$RESULT" | jq .
 
@@ -678,7 +682,7 @@ test-multi-step-iosxr:
         ],
         "format": "cli",
         "target_format": "netconf",
-        "platform": "iosxrd 25.3.1-local"
+        "platform": "{{IOSXRD_PLATFORM}}"
       }')
     echo "$RESULT" | jq .
 
@@ -695,7 +699,7 @@ test-multi-step-cli-to-cli:
         ],
         "format": "cli",
         "target_format": "cli",
-        "platform": "crpd 24.4R1.9-local"
+        "platform": "{{CRPD_PLATFORM}}"
       }')
     echo "$RESULT" | jq .
 
@@ -716,7 +720,7 @@ test-multi-step-netconf-to-cli:
         ],
         "format": "netconf",
         "target_format": "cli",
-        "platform": "crpd 24.4R1.9-local"
+        "platform": "{{CRPD_PLATFORM}}"
       }')
     echo "$RESULT" | jq .
 
@@ -738,7 +742,7 @@ test-multi-step-iosxe-cli-to-cli:
         ],
         "format": "cli",
         "target_format": "cli",
-        "platform": "iosxe 17.18.02-local"
+        "platform": "{{IOSXE_PLATFORM}}"
       }')
     echo "$RESULT" | jq .
 

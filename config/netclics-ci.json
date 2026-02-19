@@ -1,58 +1,37 @@
 {
   "platforms": [
     {
-      "name": "crpd 24.4R1.9-local",
+      "name": "crpd 24.4R1.9-dynamic",
       "platform": "junos",
-      "instances": [
-        {
-          "id": "local-crpd",
-          "host": "127.0.0.1",
-          "netconf_port": 42830,
-          "ssh_port": 42022,
-          "restconf_port": 32774,
-          "username": "clab",
-          "password": "clab@123",
-          "description": "Local cRPD instance"
-        }
-      ]
+      "container_image": "ghcr.io/orchestron-orchestrator/crpd:24.4R1.9",
+      "min_instances": 1,
+      "max_instances": 1,
+      "username": "clab",
+      "password": "clab@123"
     },
     {
-      "name": "iosxrd 25.3.1-local",
+      "name": "iosxrd 25.3.1-dynamic",
       "platform": "cisco_iosxr",
+      "container_image": "ghcr.io/orchestron-orchestrator/ios-xr/xrd-control-plane:25.3.1",
+      "min_instances": 1,
+      "max_instances": 1,
+      "username": "clab",
+      "password": "clab@123",
       "module_sets": [
         "cisco-xr-classic",
         "cisco-xr-unified-model"
-      ],
-      "instances": [
-        {
-          "id": "local-iosxrd",
-          "host": "127.0.0.1",
-          "netconf_port": 45830,
-          "ssh_port": 45022,
-          "restconf_port": 32775,
-          "username": "clab",
-          "password": "clab@123",
-          "description": "Local IOS XRd instance"
-        }
       ]
     },
     {
-      "name": "iosxe 17.18.02-local",
+      "name": "iosxe 17.18.02-dynamic",
       "platform": "cisco_iosxe",
+      "container_image": "ghcr.io/orchestron-orchestrator/vrnetlab/vr-c8000v:17.18.02",
+      "min_instances": 1,
+      "max_instances": 1,
+      "username": "vrnetlab",
+      "password": "VR-netlab9",
       "module_sets": [
         "cisco-xe-native"
-      ],
-      "instances": [
-        {
-          "id": "local-iosxe",
-          "host": "127.0.0.1",
-          "netconf_port": 44830,
-          "ssh_port": 44022,
-          "restconf_port": 32776,
-          "username": "vrnetlab",
-          "password": "VR-netlab9",
-          "description": "Local IOS XE instance"
-        }
       ]
     }
   ]

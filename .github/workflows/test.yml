@@ -58,20 +58,8 @@ jobs:
         run: |
           echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
 
-      - name: "Start static instances (cRPD, latest XRd container, XE VM)"
-        run: just start-static-instances-ci
-
       - name: "Build NETCLICS"
         run: just build
-
-      - name: "Wait for cRPD to be ready"
-        run: |
-          echo "Waiting for cRPD container to be ready..."
-          for i in {1..30}; do
-            docker exec crpd1 cli -c "show version" && break
-            echo "Waiting for cRPD to start... ($i/30)"
-            sleep 2
-          done
 
       - name: "Start NETCLICS server in background"
         run: |
@@ -86,7 +74,7 @@ jobs:
         run: just instances
 
       - name: "Wait for all instances to be ready"
-        run: just wait-for-instances 600
+        run: just wait-for-instances 900
 
       - name: "Wait for all schemas to be compiled"
         run: just wait-for-schemas
@@ -200,6 +188,6 @@ jobs:
           name: netclics-logs
           path: netclics.log
 
-      - name: "Stop static instances"
+      - name: "Stop dynamic instances"
         if: always()
-        run: just stop-static-instances || true
+        run: just stop-dynamic-instances || true
