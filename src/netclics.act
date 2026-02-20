@@ -2410,7 +2410,7 @@ actor WebServ(listen_cap: net.TCPListenCap, http_port: ?int, director, log_handl
 
     var http_server: ?http.Listener = None
     if http_port is not None:
-        http_server = http.Listener(listen_cap, "0.0.0.0", http_port, _on_http_accept, _on_http_listen_error)
+        http_server = http.Listener(listen_cap, "::", http_port, _on_http_accept, _on_http_listen_error)
     else:
         _log.warning("HTTP endpoint disabled")
 
@@ -2418,7 +2418,7 @@ actor WebServ(listen_cap: net.TCPListenCap, http_port: ?int, director, log_handl
     if https_port is not None and tls_cert_pem is not None and tls_key_pem is not None:
         https_server = http.TLSListener(
             listen_cap,
-            "0.0.0.0",
+            "::",
             https_port,
             tls_cert_pem,
             tls_key_pem,
