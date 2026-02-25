@@ -9,6 +9,7 @@ jobs:
     env:
       IMAGE_PATH: ${{ secrets.IMAGE_PATH || format('ghcr.io/{0}/', github.repository) }}
       NETCLICS_BASE_URL: https://localhost:8443
+      NETCLICS_CONFIG: config/netclics-ci.json
     steps:
       - uses: actonlang/setup-acton@v1
         with:
@@ -57,8 +58,8 @@ jobs:
         run: |
           echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
 
-      - name: "Start static instances (cRPD and XRd containers, XE VM)"
-        run: just start-static-instances
+      - name: "Start static instances (cRPD, latest XRd container, XE VM)"
+        run: just start-static-instances-ci
 
       - name: "Build NETCLICS"
         run: just build
