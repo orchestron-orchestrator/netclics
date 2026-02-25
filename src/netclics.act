@@ -286,6 +286,9 @@ actor DeviceInstance(auth: WorldCap, log_handler: logging.Handler, platform_name
     def set_state(new_state: str):
         state = new_state
 
+    def _is_inactive() -> bool:
+        return state == "stopping" or state == "error"
+
     def _mark_error(reason: str):
         if state == "error":
             return
@@ -388,9 +391,19 @@ actor DeviceInstance(auth: WorldCap, log_handler: logging.Handler, platform_name
             max_retries: Maximum number of retries (None for unlimited)
         """
         def attempt_connection(retry_count=0):
+            if _is_inactive():
+                _log.debug("Skipping NETCONF connection attempt for inactive device", {"attempt": retry_count, "state": state})
+                return
+
             _log.info("Attempting NETCONF connection", {"attempt": retry_count, "host": ip_address, "port": netconf_port, "unlimited": True if max_retries is None else False})
 
             def on_connect(client: ?netconf.Client, error: ?Exception):
+                if _is_inactive():
+                    if client is not None:
+                        client.close()
+                    _log.debug("Ignoring NETCONF connect callback for inactive device", {"attempt": retry_count, "state": state})
+                    return
+
                 if error is not None:
                     _log.warning("NETCONF connection attempt failed", {"attempt": retry_count, "error": str(error)})
                     if max_retries is not None and retry_count >= max_retries:
@@ -398,8 +411,15 @@ actor DeviceInstance(auth: WorldCap, log_handler: logging.Handler, platform_name
                         if on_failure is not None:
                             on_failure(Exception(f"Failed to connect after {max_retries} attempts: {error}"))
                     else:
+                        if _is_inactive():
+                            _log.debug("Skipping NETCONF retry for inactive device", {"attempt": retry_count, "state": state})
+                            return
                         after float(retry_delay): attempt_connection(retry_count+1)
                 elif client is not None:
+                    if _is_inactive():
+                        client.close()
+                        _log.debug("Closing NETCONF client created for inactive device", {"attempt": retry_count, "state": state})
+                        return
                     _log.info("NETCONF connection successful", {"attempt": retry_count})
                     capabilities = client.get_capabilities()
                     on_success(client)
@@ -1500,6 +1520,9 @@ actor DeviceInstance(auth: WorldCap, log_handler: logging.Handler, platform_name
     def initialize_schemas(module_sets):
         """Initialize schemas by downloading them from the device and compiling them"""
         _log.info("Initializing YANG schemas for device", {"device": instance_id})
+        if _is_inactive():
+            _log.debug("Skipping schema initialization for inactive device", {"device": instance_id, "state": state})
+            return
 
         # Get credentials
         creds = _get_credentials()
@@ -1511,6 +1534,10 @@ actor DeviceInstance(auth: WorldCap, log_handler: logging.Handler, platform_name
             return
 
         def on_connect_success(client: netconf.Client):
+            if _is_inactive():
+                client.close()
+                _log.debug("Skipping schema initialization connect callback for inactive device", {"device": instance_id, "state": state})
+                return
             _log.info("Connected to device for schema initialization")
             sw = time.Stopwatch()
             schema_getter: ?netconf.SchemaGetter = None
@@ -1518,6 +1545,10 @@ actor DeviceInstance(auth: WorldCap, log_handler: logging.Handler, platform_name
             fetch_module_sets: set[str] = set()
 
             def on_list_schemas(c: netconf.Client, schemas: list[(identifier: str, namespace: str, version: str, format: str)], error: ?netconf.NetconfError):
+                if _is_inactive():
+                    c.close()
+                    _log.debug("Ignoring list_schemas callback for inactive device", {"device": instance_id, "state": state})
+                    return
                 if error is not None:
                     _log.error("Error: Failed to list schemas: {error}")
                     _mark_error("Schema initialization failed: list schemas error")
@@ -1586,6 +1617,9 @@ actor DeviceInstance(auth: WorldCap, log_handler: logging.Handler, platform_name
                 if len(fetch_module_sets) == 0:
                     # Close the NETCONF connection
                     client.close()
+                    if _is_inactive():
+                        _log.debug("Not setting ready state after schema initialization on inactive device", {"device": instance_id, "state": state})
+                        return
 
                     # Set state to ready immediately so device can handle requests (basic, ones that do not require schema)
                     # Schema compilation will happen in background
@@ -1620,6 +1654,10 @@ actor DeviceInstance(auth: WorldCap, log_handler: logging.Handler, platform_name
                 if schema_getter is not None and sg is not schema_getter:
                     _log.debug("Ingoring callback from old SchemaGetter")
                     return
+                if _is_inactive():
+                    client.close()
+                    _log.debug("Ignoring schema completion callback for inactive device", {"device": instance_id, "state": state})
+                    return
                 if error is not None:
                     _log.error("Error during schema download", {"error": error.error_message})
                     # Continue anyway - device can work without schemas
@@ -1645,6 +1683,9 @@ actor DeviceInstance(auth: WorldCap, log_handler: logging.Handler, platform_name
 
                 # Close the NETCONF connection
                 client.close()
+                if _is_inactive():
+                    _log.debug("Not setting ready state after schema completion on inactive device", {"device": instance_id, "state": state})
+                    return
 
                 # Set state to ready immediately so device can handle requests (basic, ones that do not require schema)
                 # Schema compilation will happen in background
@@ -1653,6 +1694,9 @@ actor DeviceInstance(auth: WorldCap, log_handler: logging.Handler, platform_name
 
             # Callback when schema is ready (either compiled by us or another actor)
             def on_schema_ready(name: str, fingerprint: str, schema: ?yang.schema.DRoot, error: ?str):
+                if _is_inactive():
+                    _log.debug("Ignoring schema ready callback for inactive device", {"device": instance_id, "module-set": name, "state": state})
+                    return
                 if schema is not None:
                     compiled_schemas[name] = fingerprint
                     _log.info("Schema ready for module-set", {"module-set": name, "fingerprint": fingerprint})
