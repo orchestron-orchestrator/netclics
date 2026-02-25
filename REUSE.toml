@@ -23,6 +23,7 @@ path = [
     "REUSE.toml",
     ".github/**",
     "certs/*",
+    "config/*",
 ]
 SPDX-FileCopyrightText = "Deutsche Telekom AG"
 SPDX-License-Identifier = "CC0-1.0"

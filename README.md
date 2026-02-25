@@ -14,5 +14,27 @@ out/bin/netclics --https-port 8443 --tls-cert /path/to/cert.pem --tls-key /path/
 ```
 
 Notes:
-- `--port 0` disables HTTP.
+- `--http-port 0` disables HTTP.
 - HTTPS is enabled only when `--https-port`, `--tls-cert`, and `--tls-key` are all provided.
+
+## Configuration File
+
+NETCLICS loads configuration from `config/netclics.json` by default.
+
+Use a different file with:
+
+```bash
+out/bin/netclics --config /path/to/netclics.json
+```
+
+After editing the config file, reload it without restarting:
+
+```bash
+curl -s -X POST http://localhost:8080/api/v1/config/reload | jq .
+```
+
+Or with Just:
+
+```bash
+just reload-config
+```

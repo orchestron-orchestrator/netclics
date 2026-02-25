@@ -15,6 +15,7 @@ import yang.gdata
 import yang.schema
 import yang.xml
 import schema_filter
+import netclics_config
 
 
 # Constant for the wildcard (all modules) default module-set
@@ -35,7 +36,7 @@ actor ContainerManager(proc_cap: process.ProcessCap, log_handler: logging.Handle
     logh.set_handler(log_handler)
     _log = logging.Logger(logh)
 
-    def start_container(platform: PlatformConfig, instance_id: str) -> str:
+    def start_container(platform: netclics_config.PlatformConfig, instance_id: str) -> str:
         """Start a Docker container for the given platform"""
         # Generate unique container name
         container_name = "netclics-%s-%s" % (platform.name.replace(" ", "-"), instance_id)
@@ -66,7 +67,7 @@ actor ContainerManager(proc_cap: process.ProcessCap, log_handler: logging.Handle
 
         return container_name
 
-    def _check_container_health(container_name: str, platform: PlatformConfig):
+    def _check_container_health(container_name: str, platform: netclics_config.PlatformConfig):
         """Check if container is healthy and get its network info"""
         # In reality, would run: docker inspect <container_name>
         # This would be done with:
@@ -241,7 +242,7 @@ actor SchemaRegistry(log_handler: logging.Handler):
 
 actor DeviceInstance(auth: WorldCap, log_handler: logging.Handler, platform_name: str, platform: str, schema_registry,
                      container_id: str, ip_address: str,
-                     netconf_port: int, ssh_port: int, instance_spec: ?InstanceSpec = None):
+                     netconf_port: int, ssh_port: int, instance_spec: ?netclics_config.InstanceSpec = None):
     """Actor representing a device instance that can process conversion requests"""
     var state = "starting"  # starting, ready, busy, stopping, error
     var started_at = 0  # Timestamp when started
@@ -283,6 +284,33 @@ actor DeviceInstance(auth: WorldCap, log_handler: logging.Handler, platform_name
 
     def set_state(new_state: str):
         state = new_state
+
+    def _cleanup_conversion_clients():
+        """Clean up persistent clients at end of conversion"""
+        _log.info("Cleaning up conversion clients")
+
+        cnc = conversion_netconf_client
+        if cnc is not None:
+            try:
+                cnc.close()
+            except Exception as e:
+                _log.warning("Error closing NETCONF client", {"error": str(e)})
+            conversion_netconf_client = None
+
+        ccc = conversion_cli_client
+        if ccc is not None:
+            try:
+                ccc.disconnect()
+            except Exception as e:
+                _log.warning("Error closing CLI client", {"error": str(e)})
+            conversion_cli_client = None
+
+    def stop(reason: str):
+        if state == "stopping":
+            return
+        _log.info("Stopping device instance", {"reason": reason, "state": state})
+        state = "stopping"
+        _cleanup_conversion_clients()
 
     def get_info() -> dict[str, ?value]:
         """Get device information for API responses"""
@@ -699,28 +727,6 @@ actor DeviceInstance(auth: WorldCap, log_handler: logging.Handler, platform_name
             _get_netconf_config_parsed(module_set, callback)
 
         _iosxe_sync_from(on_sync_from_done)
-
-
-
-    def _cleanup_conversion_clients():
-        """Clean up persistent clients at end of conversion"""
-        _log.info("Cleaning up conversion clients")
-
-        cnc = conversion_netconf_client
-        if cnc is not None:
-            try:
-                cnc.close()
-            except Exception as e:
-                _log.warning("Error closing NETCONF client", {"error": str(e)})
-            conversion_netconf_client = None
-
-        ccc = conversion_cli_client
-        if ccc is not None:
-            try:
-                ccc.disconnect()
-            except Exception as e:
-                _log.warning("Error closing CLI client", {"error": str(e)})
-            conversion_cli_client = None
 
     def convert(request: ConvertRequest, result_callback: action(?(base_config: str, steps: list[(input: str, config: str, diff: str)]), ?Exception) -> None):
         """Process a conversion request on this device"""
@@ -1680,8 +1686,9 @@ actor DeviceInstance(auth: WorldCap, log_handler: logging.Handler, platform_name
         create_netconf_client_with_retry(username, password, on_connect_success, on_connect_failure)
 
 
-actor DeviceManager(config: SystemConfig, container_mgr: ContainerManager, auth: WorldCap, log_handler: logging.Handler):
+actor DeviceManager(config: netclics_config.SystemConfig, container_mgr: ContainerManager, auth: WorldCap, log_handler: logging.Handler):
     """Manages device lifecycle and state transitions"""
+    var config_state = config
     var instances = []  # DeviceInstance actors
     var pending_requests = []  # Requests waiting for a device
     var next_instance_id = 1
@@ -1691,6 +1698,56 @@ actor DeviceManager(config: SystemConfig, container_mgr: ContainerManager, auth:
     logh = logging.Handler("DeviceManager")
     logh.set_handler(log_handler)
     _log = logging.Logger(logh)
+
+
+    def _find_instance(platform_name: str, instance_id: str) -> ?DeviceInstance:
+        for device in instances:
+            device_info = device.get_info()
+            info_platform = device_info.get("platform_name")
+            info_id = device_info.get("instance_id")
+            if isinstance(info_platform, str) and isinstance(info_id, str) and info_platform == platform_name and info_id == instance_id:
+                return device
+        return None
+
+    def _remove_instance(platform_name: str, instance_id: str) -> bool:
+        """Remove instance from manager bookkeeping"""
+        kept_instances = []
+        removed = False
+
+        for device in instances:
+            device_info = device.get_info()
+            info_platform = device_info.get("platform_name")
+            info_id = device_info.get("instance_id")
+            if isinstance(info_platform, str) and isinstance(info_id, str) and info_platform == platform_name and info_id == instance_id:
+                removed = True
+                continue
+            kept_instances.append(device)
+
+        instances = kept_instances
+
+        if removed:
+            _log.info("Removed instance from manager", {"platform": platform_name, "instance_id": instance_id})
+        else:
+            _log.warning("Instance not found for removal", {"platform": platform_name, "instance_id": instance_id})
+
+        return removed
+
+    def stop_instance(platform_name: str, instance_id: str, reason: str, cb: action(?Exception) -> None):
+        device = _find_instance(platform_name, instance_id)
+        if device is not None:
+            state = device.get_state()
+            if state == "stopping":
+                cb(None)
+                return
+            if state == "busy":
+                cb(Exception(f"Instance not idle: {platform_name}/{instance_id} state={state}"))
+                return
+
+            device.stop(reason)
+            _remove_instance(platform_name, instance_id)
+            cb(None)
+            return
+        cb(Exception(f"Instance not found: {platform_name}/{instance_id}"))
 
     def count_instances(platform_name: str, state: ?str = None) -> int:
         """Count instances for a platform, optionally filtered by state"""
@@ -1707,7 +1764,7 @@ actor DeviceManager(config: SystemConfig, container_mgr: ContainerManager, auth:
                         count += 1
         return count
 
-    def initialize_static_instances(platform: PlatformConfig):
+    def initialize_static_instances(platform: netclics_config.PlatformConfig):
         """Initialize static instances for a platform"""
         for spec in platform.instances:
             device = DeviceInstance(
@@ -1753,7 +1810,7 @@ actor DeviceManager(config: SystemConfig, container_mgr: ContainerManager, auth:
         _log.warning("No matching device found", {"platform": platform_name})
         return None
 
-    def start_device(platform: PlatformConfig) -> ?DeviceInstance:
+    def start_device(platform: netclics_config.PlatformConfig) -> ?DeviceInstance:
         """Start a new device instance (only for dynamically managed platforms)"""
         if platform.uses_static_instances():
             return None
@@ -1780,7 +1837,7 @@ actor DeviceManager(config: SystemConfig, container_mgr: ContainerManager, auth:
 
     def initialize_min_instances():
         """Initialize specified instances and start minimum number of container instances for each platform"""
-        for platform in config.platforms:
+        for platform in config_state.platforms:
             # First, initialize any static instances
             initialize_static_instances(platform)
 
@@ -1791,6 +1848,23 @@ actor DeviceManager(config: SystemConfig, container_mgr: ContainerManager, auth:
                 for i in range(to_start):
                     start_device(platform)
 
+    def apply_config(new_config: netclics_config.SystemConfig, cb: action(?Exception) -> None):
+        """Apply configuration changes for static-instance mode"""
+        for device in instances:
+            if device.get_state() == "busy":
+                cb(Exception("Cannot reload configuration while instances are busy"))
+                return
+
+        for device in instances:
+            state = device.get_state()
+            if state != "stopping":
+                device.stop("configuration reload")
+
+        instances = []
+        config_state = new_config
+        initialize_min_instances()
+        cb(None)
+
     def get_instance_info() -> list[dict[str, ?value]]:
         """Get instance info for API responses"""
         # Dynamically collect info from all device instances
@@ -1799,80 +1873,9 @@ actor DeviceManager(config: SystemConfig, container_mgr: ContainerManager, auth:
             current_info.append(device.get_info())
         return current_info
 
-    def get_config() -> SystemConfig:
+    def get_config() -> netclics_config.SystemConfig:
         """Get system configuration"""
-        return config
-
-
-class InstanceSpec(object):
-    """Specification for a static instance (physical device, VM, or pre-existing container)"""
-    def __init__(self, id: str, host: str, netconf_port: int = 830,
-                 ssh_port: int = 22, restconf_port: int = 443, username: ?str = None, password: ?str = None,
-                 private_key_path: ?str = None, description: ?str = None):
-        self.id = id
-        self.host = host  # IP address or hostname
-        self.netconf_port = netconf_port
-        self.ssh_port = ssh_port
-        self.restconf_port = restconf_port
-        self.username = username
-        self.password = password
-        self.private_key_path = private_key_path
-        self.description = description
-
-class PlatformConfig(object):
-    name: str
-    platform: str
-    container_image: ?str
-    min_instances: int
-    max_instances: int
-    startup_time_seconds: int
-    idle_timeout_seconds: int
-    netconf_port: int
-    ssh_port: int
-    restconf_port: int
-    module_sets: list[str]
-    instances: list[InstanceSpec]
-    active_instances: int
-    available_instances: int
-
-    def __init__(self, name: str, platform: str, container_image: ?str = None,
-                 min_instances: int = 0, max_instances: int = 10,
-                 startup_time_seconds: int = 60, idle_timeout_seconds: int = 300,
-                 netconf_port: int = 830, ssh_port: int = 22, restconf_port: int = 443,
-                 module_sets: list[str] = [],
-                 instances: ?list[InstanceSpec] = None):
-        self.name = name
-        self.platform = platform
-        self.container_image = container_image  # Optional for physical devices
-        self.min_instances = min_instances
-        self.max_instances = max_instances
-        self.startup_time_seconds = startup_time_seconds  # Expected container startup time
-        self.idle_timeout_seconds = idle_timeout_seconds  # When to shut down idle containers
-        self.netconf_port = netconf_port  # NETCONF port inside container
-        self.ssh_port = ssh_port  # SSH/CLI port inside container
-        self.restconf_port = restconf_port  # RESTCONF port inside container
-        self.module_sets = module_sets
-        if instances is not None and len(instances) > 0:
-            self.instances = instances
-        else:
-            self.instances = []
-        # Runtime state (managed by Director)
-        self.active_instances = 0
-        self.available_instances = 0
-
-    def uses_static_instances(self) -> bool:
-        """Returns True if this platform uses static instances rather than dynamic scaling"""
-        return len(self.instances) > 0
-
-class SystemConfig(object):
-    def __init__(self, platforms: list[PlatformConfig]):
-        self.platforms = platforms
-
-    def get_platform(self, name: str) -> ?PlatformConfig:
-        for p in self.platforms:
-            if p.name == name:
-                return p
-        return None
+        return config_state
 
 class ConvertRequest(object):
     def __init__(self, input: list[str], format: str, target_format: str, platform: str, module_set: str, cb: ?action(str) -> None = None):
@@ -1917,13 +1920,18 @@ actor Director(auth: WorldCap, proc_cap: process.ProcessCap, log_handler: loggin
     logh.set_handler(log_handler)
     _log = logging.Logger(logh)
 
-    def set_config(conf: SystemConfig):
+    def set_config(conf: netclics_config.SystemConfig):
         container_mgr = ContainerManager(proc_cap, log_handler)
         dm = DeviceManager(conf, container_mgr, auth, log_handler)
         dm.initialize_min_instances()
         device_manager = dm
         _log.info("Director initialized")
 
+    def reload_config(conf: netclics_config.SystemConfig, cb: action(?Exception) -> None):
+        if device_manager is not None:
+            device_manager.apply_config(conf, cb)
+            return
+        cb(Exception("Director not initialized"))
 
     def convert(request: ConvertRequest, callback: action(?(base_config: str, steps: list[(input: str, config: str, diff: str)]), ?Exception) -> None):
         """Process a conversion request"""
@@ -2412,6 +2420,7 @@ actor MCPServer(convert_fn: action(ConvertRequest, action(?(base_config: str, st
             _send_error_response(request_id, MCP_INTERNAL_ERROR, str(e), respond, "list_instances")
 
 actor WebServ(listen_cap: net.TCPListenCap, http_port: ?int, director, log_handler: logging.Handler,
+              config_path: str, read_cap: file.ReadFileCap,
               https_port: ?int = None, tls_cert_pem: ?bytes = None, tls_key_pem: ?bytes = None):
     logh = logging.Handler("WebServ")
     logh.set_handler(log_handler)
@@ -2473,6 +2482,26 @@ actor WebServ(listen_cap: net.TCPListenCap, http_port: ?int, director, log_handl
                 error_dict = {"success": False, "error": str(e)}
                 error_str = json.encode(error_dict)
                 respond(400, {"Content-Type": "application/json"}, error_str)
+        # POST /api/v1/config/reload - Reload configuration from disk
+        elif request.path == "/api/v1/config/reload" and request.method == "POST":
+            def on_reload_done(error: ?Exception):
+                if error is None:
+                    response = {"success": True}
+                    respond(200, {"Content-Type": "application/json"}, json.encode(response))
+                else:
+                    response = {"success": False, "error": str(error)}
+                    respond(500, {"Content-Type": "application/json"}, json.encode(response))
+
+            _log.info("Reloading configuration from disk", {"path": config_path})
+            try:
+                new_config = netclics_config.load_config_from_file(read_cap, config_path)
+            except Exception as e:
+                error_dict = {"success": False, "error": str(e)}
+                error_str = json.encode(error_dict)
+                respond(400, {"Content-Type": "application/json"}, error_str)
+                return
+            else:
+                director.reload_config(new_config, on_reload_done)
         # GET /api/v1/instances - List all running instances
         elif request.path == "/api/v1/instances" and request.method == "GET":
             # Get actual instances from director
@@ -2568,111 +2597,6 @@ actor WebServ(listen_cap: net.TCPListenCap, http_port: ?int, director, log_handl
         _log.warning("HTTPS endpoint disabled")
 
 
-def get_default_config() -> SystemConfig:
-    return SystemConfig([
-        # Juniper cRPD platform - dynamically managed containers
-#        PlatformConfig(
-#            name="crpd",
-#            version="24.4R1.9",
-#            container_image="ghcr.io/orchestron-orchestrator/respnet/crpd:24.4R1.9",
-#            min_instances=1,
-#            max_instances=3
-#        ),
-        # Local cRPD static instance
-        PlatformConfig(
-            name="crpd 24.4R1.9-local",
-            platform="junos",
-            instances=[
-                InstanceSpec(
-                    id="local-crpd",
-                    host="127.0.0.1",
-                    netconf_port=42830,
-                    ssh_port=42022,
-                    restconf_port=32774,
-                    username="clab",
-                    password="clab@123",
-                    description="Local cRPD instance"
-                )
-            ]
-        ),
-        # Local Cisco IOS XRd static instance
-        PlatformConfig(
-            name="iosxrd 24.1.1-local",
-            platform="cisco_iosxr",
-            module_sets=["cisco-xr-classic", "cisco-xr-unified-model"],
-            instances=[
-                InstanceSpec(
-                    id="local-iosxrd",
-                    host="127.0.0.1",
-                    netconf_port=43830,
-                    ssh_port=43022,
-                    restconf_port=32775,
-                    username="clab",
-                    password="clab@123",
-                    description="Local IOS XRd instance"
-                )
-            ]
-        ),
-        PlatformConfig(
-            name="iosxrd 25.3.1-local",
-            platform="cisco_iosxr",
-            module_sets=["cisco-xr-classic", "cisco-xr-unified-model"],
-            instances=[
-                InstanceSpec(
-                    id="local-iosxrd",
-                    host="127.0.0.1",
-                    netconf_port=45830,
-                    ssh_port=45022,
-                    restconf_port=32775,
-                    username="clab",
-                    password="clab@123",
-                    description="Local IOS XRd instance"
-                )
-            ]
-        ),
-        # Local Cisco IOS XE static instance
-        PlatformConfig(
-            name="iosxe 17.18.02-local",
-            platform="cisco_iosxe",
-            module_sets=["cisco-xe-native"],
-            instances=[
-                InstanceSpec(
-                    id="local-iosxe",
-                    host="127.0.0.1",
-                    netconf_port=44830,
-                    ssh_port=44022,
-                    restconf_port=32776,
-                    username="vrnetlab",
-                    password="VR-netlab9",
-                    description="Local IOS XE instance"
-                )
-            ]
-        ),
-        # Example platform with static instances (could be physical devices, VMs, etc.)
-#        PlatformConfig(
-#            name="junos",
-#            version="21.4R1",
-#            static_instances=[
-#                InstanceSpec(
-#                    instance_id="lab-router-1",
-#                    host="192.168.1.10",
-#                    netconf_port=830,
-#                    ssh_port=22,
-#                    username="admin",
-#                    description="Lab router #1"
-#                ),
-#                InstanceSpec(
-#                    instance_id="lab-router-2",
-#                    host="192.168.1.11",
-#                    netconf_port=830,
-#                    ssh_port=22,
-#                    username="admin",
-#                    description="Lab router #2"
-#                )
-#            ]
-#        )
-    ])
-
 actor main(env: Env):
     listen_cap = net.TCPListenCap(net.TCPCap(net.NetCap(env.cap)))
     proc_cap = process.ProcessCap(env.cap)
@@ -2681,6 +2605,7 @@ actor main(env: Env):
         p = argparse.Parser()
         p.add_option("http-port", "int", default=8080, help="HTTP listen port (set to 0 to disable)")
         p.add_option("https-port", "int", default=0, help="HTTPS listen port (set to 0 to disable)")
+        p.add_option("config", "str", default=netclics_config.DEFAULT_CONFIG_PATH, help="Path to config JSON file")
         p.add_option("tls-cert", "str", default="", help="Path to TLS certificate PEM file")
         p.add_option("tls-key", "str", default="", help="Path to TLS private key PEM file")
         return p.parse(env.argv)
@@ -2699,11 +2624,20 @@ actor main(env: Env):
 
     http_port = args.get_int("http-port")
     https_port = args.get_int("https-port")
+    config_path = args.get_str("config")
     tls_cert_path = args.get_str("tls-cert")
     tls_key_path = args.get_str("tls-key")
 
     # Load configuration
-    config = get_default_config()
+    file_cap = file.FileCap(env.cap)
+    read_cap = file.ReadFileCap(file_cap)
+    maybe_config: ?netclics_config.SystemConfig = None
+    try:
+        maybe_config = netclics_config.load_config_from_file(read_cap, config_path)
+    except Exception as e:
+        print(f"ERROR: Failed to load config file {config_path}: {str(e)}", err=True)
+        env.exit(1)
+    config = expect(maybe_config, "loaded config")
     # Create logging handler
     log_handler = logging.Handler(None)
     log_handler.add_sink(logging.StdoutSink())
@@ -2718,8 +2652,6 @@ actor main(env: Env):
     tls_key_pem: ?bytes = None
     if https_port != 0:
         if tls_cert_path != "" and tls_key_path != "":
-            file_cap = file.FileCap(env.cap)
-            read_cap = file.ReadFileCap(file_cap)
             try:
                 cert_reader = file.ReadFile(read_cap, tls_cert_path)
                 tls_cert_pem = cert_reader.read()
@@ -2735,11 +2667,11 @@ actor main(env: Env):
             print("ERROR: HTTPS port {https_port} configured but --tls-cert and --tls-key were not both provided", err=True)
             env.exit(1)
 
-    _log.info("Loaded platform configurations", {"platform_count": len(config.platforms)})
+    _log.info("Loaded platform configurations", {"platform_count": len(config.platforms), "config_path": config_path})
 
     director = Director(env.cap, proc_cap, log_handler)
     director.set_config(config)
-    webs = WebServ(listen_cap, http_port if http_port > 0 else None, director, log_handler, https_port if https_port > 0 else None, tls_cert_pem, tls_key_pem)
+    webs = WebServ(listen_cap, http_port if http_port > 0 else None, director, log_handler, config_path, read_cap, https_port if https_port > 0 else None, tls_cert_pem, tls_key_pem)
     if https_port is not None and tls_cert_pem is not None and tls_key_pem is not None:
         _log.info("NETCLICS started", {"http_port": http_port, "https_port": https_port})
     else:

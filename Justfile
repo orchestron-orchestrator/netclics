@@ -97,6 +97,10 @@ platforms:
 instances:
     curl {{NETCLICS_CURL_OPTS}} -s {{NETCLICS_BASE_URL}}/api/v1/instances | jq .
 
+# Reload config from disk without restarting NETCLICS
+reload-config:
+    curl {{NETCLICS_CURL_OPTS}} -s -X POST {{NETCLICS_BASE_URL}}/api/v1/config/reload | jq .
+
 # Convert NETCONF/XML to NETCONF/XML, roundtrip via crpd
 test-xml-to-xml-crpd:
     #!/usr/bin/env bash
