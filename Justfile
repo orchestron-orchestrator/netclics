@@ -7,13 +7,13 @@ default:
 
 # Start the NETCLICS server
 run:
-    out/bin/netclics
+    out/bin/netclics --config {{NETCLICS_CONFIG}}
 
 # Start NETCLICS with both HTTP and HTTPS endpoints
 # Example:
 #   just run-https TLS_CERT=./certs/server.crt TLS_KEY=./certs/server.key HTTPS_PORT=8443
 run-https TLS_CERT='certs/server.crt' TLS_KEY='certs/server.key' HTTPS_PORT='8443' HTTP_PORT='8080':
-    out/bin/netclics --port {{HTTP_PORT}} --https-port {{HTTPS_PORT}} --tls-cert {{TLS_CERT}} --tls-key {{TLS_KEY}}
+    out/bin/netclics --config {{NETCLICS_CONFIG}} --port {{HTTP_PORT}} --https-port {{HTTPS_PORT}} --tls-cert {{TLS_CERT}} --tls-key {{TLS_KEY}}
 
 # Build the project
 build:
@@ -23,6 +23,8 @@ build-ldep:
     acton build --dep yang=../acton-yang --dep netconf=../netconf --dep netcli=../netcli
 
 IMAGE_PATH := env_var_or_default("IMAGE_PATH", "ghcr.io/orchestron-orchestrator/")
+# Config file used by `run`/`run-https`.
+NETCLICS_CONFIG := env_var_or_default("NETCLICS_CONFIG", "config/netclics.json")
 # Base URL used by API/MCP test recipes.
 # Defaults to HTTP on 8080, override for HTTPS:
 #   NETCLICS_BASE_URL=https://localhost:8443 just test-cli-to-netconf
@@ -35,7 +37,9 @@ start-static-instances-crpd:
     docker run -td --name crpd1 --rm --privileged --publish 42830:830 --publish 42022:22 -v ./test/crpd-startup.conf:/juniper.conf -v ./router-licenses/juniper_crpd24.lic:/config/license/juniper_crpd24.lic {{IMAGE_PATH}}crpd:24.4R1.9
     docker exec crpd1 cli -c "configure private; load merge /juniper.conf; commit"
 
-start-static-instances-xrd:
+start-static-instances-xrd: start-static-instances-xrd-24-1-1 start-static-instances-xrd-25-3-1
+
+start-static-instances-xrd-24-1-1:
     #!/usr/bin/env bash
     set -e
     # Build XR_INTERFACES environment variable with GigabitEthernet interfaces
@@ -66,6 +70,19 @@ start-static-instances-xrd:
         docker exec xrd1 ip link add Gi0-0-0-${port} type dummy
     done
 
+start-static-instances-xrd-25-3-1:
+    #!/usr/bin/env bash
+    set -e
+    # Build XR_INTERFACES environment variable with GigabitEthernet interfaces
+    # Format: Gi0/0/0/port - XRd only supports 0/0/0/<port> format
+    XR_INTERFACES=""
+    for port in {0..23}; do
+        if [ -n "$XR_INTERFACES" ]; then
+            XR_INTERFACES="${XR_INTERFACES};"
+        fi
+        XR_INTERFACES="${XR_INTERFACES}linux:Gi0-0-0-${port},xr_name=Gi0/0/0/${port}"
+    done
+
     docker run -td --name xrd2 --rm --privileged \
         --publish 45830:830 --publish 45022:22 \
         -v ./test/xrd-startup.conf:/etc/xrd/first-boot.cfg \
@@ -86,6 +103,9 @@ start-static-instances-xe:
 # Start all static instances
 start-static-instances: start-static-instances-crpd start-static-instances-xrd start-static-instances-xe
 
+# Start static instances used by CI (single/latest IOS XRd only)
+start-static-instances-ci: start-static-instances-crpd start-static-instances-xrd-25-3-1 start-static-instances-xe
+
 stop-static-instances:
     docker stop crpd1 xrd1 xrd2 xe1 || true
 
@@ -96,6 +116,10 @@ platforms:
 # Show running instances
 instances:
     curl {{NETCLICS_CURL_OPTS}} -s {{NETCLICS_BASE_URL}}/api/v1/instances | jq .
+
+# Reload config from disk without restarting NETCLICS
+reload-config:
+    curl {{NETCLICS_CURL_OPTS}} -s -X POST {{NETCLICS_BASE_URL}}/api/v1/config/reload | jq .
 
 # Convert NETCONF/XML to NETCONF/XML, roundtrip via crpd
 test-xml-to-xml-crpd:
@@ -335,7 +359,7 @@ test-iosxrd-cli-to-acton-adata:
         "input": ["interface GigabitEthernet0/0/0/1\n description \"IOS XRd test interface\"\n ipv4 address 10.1.1.1 255.255.255.0\n no shutdown"],
         "format": "cli",
         "target_format": "acton-adata",
-        "platform": "iosxrd 24.1.1-local"
+        "platform": "iosxrd 25.3.1-local"
       }')
     echo "$RESULT" | jq .
 
@@ -352,7 +376,7 @@ test-iosxrd-cli-to-cli:
         "input": ["interface GigabitEthernet0/0/0/2\n description \"IOS XRd CLI roundtrip\"\n ipv4 address 10.2.2.1 255.255.255.0\n no shutdown"],
         "format": "cli",
         "target_format": "cli",
-        "platform": "iosxrd 24.1.1-local"
+        "platform": "iosxrd 25.3.1-local"
       }')
     echo "$RESULT" | jq .
 
@@ -369,7 +393,7 @@ test-iosxrd-netconf-to-cli:
         "input": ["<interfaces xmlns=\"http://cisco.com/ns/yang/Cisco-IOS-XR-um-interface-cfg\"><interface><interface-name>GigabitEthernet0/0/0/3</interface-name><description>IOS XRd NETCONF to CLI test</description><ipv4><addresses xmlns=\"http://cisco.com/ns/yang/Cisco-IOS-XR-um-if-ip-address-cfg\"><address><address>10.1.1.1</address><netmask>255.255.255.0</netmask></address></addresses></ipv4></interface></interfaces>"],
         "format": "netconf",
         "target_format": "cli",
-        "platform": "iosxrd 24.1.1-local"
+        "platform": "iosxrd 25.3.1-local"
       }')
     echo "$RESULT" | jq .
 
@@ -386,7 +410,7 @@ test-iosxrd-cli-to-netconf:
         "input": ["interface GigabitEthernet0/0/0/4\n description \"IOS XRd to NETCONF\"\n ipv4 address 10.4.4.1 255.255.255.0\n no shutdown"],
         "format": "cli",
         "target_format": "netconf",
-        "platform": "iosxrd 24.1.1-local"
+        "platform": "iosxrd 25.3.1-local"
       }')
     echo "$RESULT" | jq .
 
@@ -403,7 +427,7 @@ test-iosxrd-cli-to-json:
         "input": ["interface GigabitEthernet0/0/0/5\n description \"IOS XRd to JSON\"\n ipv4 address 10.5.5.1 255.255.255.0\n no shutdown"],
         "format": "cli",
         "target_format": "json",
-        "platform": "iosxrd 24.1.1-local"
+        "platform": "iosxrd 25.3.1-local"
       }')
     echo "$RESULT" | jq .
 
@@ -420,7 +444,7 @@ test-iosxrd-cli-to-acton-adata-unified-model:
         "input": ["interface GigabitEthernet0/0/0/6\n description \"IOS XRd unified-model test\"\n ipv4 address 10.6.6.1 255.255.255.0\n no shutdown"],
         "format": "cli",
         "target_format": "acton-adata",
-        "platform": "iosxrd 24.1.1-local",
+        "platform": "iosxrd 25.3.1-local",
         "module_set": "cisco-xr-unified-model"
       }')
     echo "$RESULT" | jq .
@@ -651,7 +675,7 @@ test-multi-step-iosxr:
         ],
         "format": "cli",
         "target_format": "netconf",
-        "platform": "iosxrd 24.1.1-local"
+        "platform": "iosxrd 25.3.1-local"
       }')
     echo "$RESULT" | jq .
 

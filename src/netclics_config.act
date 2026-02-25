@@ -1,0 +1,216 @@
+import file
+import json
+
+DEFAULT_CONFIG_PATH = "config/netclics.json"
+
+class InstanceSpec(object):
+    """Specification for a static instance (physical device, VM, or pre-existing container)"""
+    def __init__(self, id: str, host: str, netconf_port: int = 830,
+                 ssh_port: int = 22, restconf_port: int = 443, username: ?str = None, password: ?str = None,
+                 private_key_path: ?str = None, description: ?str = None):
+        self.id = id
+        self.host = host  # IP address or hostname
+        self.netconf_port = netconf_port
+        self.ssh_port = ssh_port
+        self.restconf_port = restconf_port
+        self.username = username
+        self.password = password
+        self.private_key_path = private_key_path
+        self.description = description
+
+class PlatformConfig(object):
+    name: str
+    platform: str
+    container_image: ?str
+    min_instances: int
+    max_instances: int
+    startup_time_seconds: int
+    idle_timeout_seconds: int
+    netconf_port: int
+    ssh_port: int
+    restconf_port: int
+    username: ?str
+    password: ?str
+    module_sets: list[str]
+    instances: list[InstanceSpec]
+    active_instances: int
+    available_instances: int
+
+    def __init__(self, name: str, platform: str, container_image: ?str = None,
+                 min_instances: int = 0, max_instances: int = 10,
+                 startup_time_seconds: int = 60, idle_timeout_seconds: int = 300,
+                 netconf_port: int = 830, ssh_port: int = 22, restconf_port: int = 443,
+                 username: ?str = None, password: ?str = None,
+                 module_sets: list[str] = [],
+                 instances: ?list[InstanceSpec] = None):
+        self.name = name
+        self.platform = platform
+        self.container_image = container_image  # Optional for physical devices
+        self.min_instances = min_instances
+        self.max_instances = max_instances
+        self.startup_time_seconds = startup_time_seconds  # Expected container startup time
+        self.idle_timeout_seconds = idle_timeout_seconds  # When to shut down idle containers
+        self.netconf_port = netconf_port  # NETCONF port inside container
+        self.ssh_port = ssh_port  # SSH/CLI port inside container
+        self.restconf_port = restconf_port  # RESTCONF port inside container
+        self.username = username
+        self.password = password
+        self.module_sets = module_sets
+        if instances is not None and len(instances) > 0:
+            self.instances = instances
+        else:
+            self.instances = []
+        # Runtime state (managed by Director)
+        self.active_instances = 0
+        self.available_instances = 0
+
+    def uses_static_instances(self) -> bool:
+        """Returns True if this platform uses static instances rather than dynamic scaling"""
+        return len(self.instances) > 0
+
+class SystemConfig(object):
+    def __init__(self, platforms: list[PlatformConfig]):
+        self.platforms = platforms
+
+    def get_platform(self, name: str) -> ?PlatformConfig:
+        for p in self.platforms:
+            if p.name == name:
+                return p
+        return None
+
+
+def _cfg_required_str(d: dict[str, ?value], k: str) -> str:
+    v = d.get(k)
+    if isinstance(v, str) and v != "":
+        return v
+    raise ValueError("Missing or invalid string field: " + k)
+
+
+def _cfg_optional_str(d: dict[str, ?value], k: str) -> ?str:
+    v = d.get(k)
+    if isinstance(v, str) and v != "":
+        return v
+    return None
+
+
+def _cfg_optional_int(d: dict[str, ?value], k: str, default: int) -> int:
+    v = d.get(k)
+    if v is None:
+        return default
+    if isinstance(v, int):
+        return v
+    raise ValueError("Field " + k + " must be an integer")
+
+
+def _cfg_str_list(d: dict[str, ?value], k: str) -> list[str]:
+    v = d.get(k)
+    if v is None:
+        return []
+    if isinstance(v, list):
+        result: list[str] = []
+        for item in v:
+            if isinstance(item, str):
+                result.append(item)
+            else:
+                raise ValueError("Field " + k + " must be a list of strings")
+        return result
+    raise ValueError("Field " + k + " must be a list of strings")
+
+
+def _parse_instance_spec(data: dict[str, ?value], platform_username: ?str, platform_password: ?str) -> InstanceSpec:
+    instance_id = _cfg_required_str(data, "id")
+    host = _cfg_required_str(data, "host")
+    netconf_port = _cfg_optional_int(data, "netconf_port", 830)
+    ssh_port = _cfg_optional_int(data, "ssh_port", 22)
+    restconf_port = _cfg_optional_int(data, "restconf_port", 443)
+
+    username = _cfg_optional_str(data, "username")
+    password = _cfg_optional_str(data, "password")
+    if username is None:
+        username = platform_username
+    if password is None:
+        password = platform_password
+    if username is None or password is None:
+        raise ValueError(f"Static instance {instance_id} missing username/password")
+
+    private_key_path = _cfg_optional_str(data, "private_key_path")
+    description = _cfg_optional_str(data, "description")
+
+    return InstanceSpec(
+        id=instance_id,
+        host=host,
+        netconf_port=netconf_port,
+        ssh_port=ssh_port,
+        restconf_port=restconf_port,
+        username=username,
+        password=password,
+        private_key_path=private_key_path,
+        description=description
+    )
+
+
+def _parse_platform_config(data: dict[str, ?value]) -> PlatformConfig:
+    name = _cfg_required_str(data, "name")
+    platform = _cfg_required_str(data, "platform")
+    container_image = _cfg_optional_str(data, "container_image")
+    min_instances = _cfg_optional_int(data, "min_instances", 0)
+    max_instances = _cfg_optional_int(data, "max_instances", 10)
+    startup_time_seconds = _cfg_optional_int(data, "startup_time_seconds", 60)
+    idle_timeout_seconds = _cfg_optional_int(data, "idle_timeout_seconds", 300)
+    netconf_port = _cfg_optional_int(data, "netconf_port", 830)
+    ssh_port = _cfg_optional_int(data, "ssh_port", 22)
+    restconf_port = _cfg_optional_int(data, "restconf_port", 443)
+    username = _cfg_optional_str(data, "username")
+    password = _cfg_optional_str(data, "password")
+    module_sets = _cfg_str_list(data, "module_sets")
+    instances_raw = data.get("instances")
+    instances: list[InstanceSpec] = []
+    if isinstance(instances_raw, list):
+        for inst in instances_raw:
+            if not isinstance(inst, dict):
+                raise ValueError("Field instances must be a list of objects")
+            spec = _parse_instance_spec(inst, username, password)
+            instances.append(spec)
+
+    return PlatformConfig(
+        name=name,
+        platform=platform,
+        container_image=container_image,
+        min_instances=min_instances,
+        max_instances=max_instances,
+        startup_time_seconds=startup_time_seconds,
+        idle_timeout_seconds=idle_timeout_seconds,
+        netconf_port=netconf_port,
+        ssh_port=ssh_port,
+        restconf_port=restconf_port,
+        username=username,
+        password=password,
+        module_sets=module_sets,
+        instances=instances
+    )
+
+
+def parse_system_config(data: dict[str, ?value]) -> SystemConfig:
+    platforms_val = data.get("platforms")
+    if isinstance(platforms_val, list):
+        platforms: list[PlatformConfig] = []
+        for item in platforms_val:
+            if not isinstance(item, dict):
+                raise ValueError("Platform entries must be objects")
+            platforms.append(_parse_platform_config(item))
+
+        if len(platforms) == 0:
+            raise ValueError("Config must define at least one platform")
+
+        return SystemConfig(platforms)
+    raise ValueError("Config must contain 'platforms' list")
+
+
+def load_config_from_file(read_cap: file.ReadFileCap, path: str) -> SystemConfig:
+    reader = file.ReadFile(read_cap, path)
+    raw = reader.read()
+    reader.close()
+    decoded = json.decode(raw.decode())
+    if isinstance(decoded, dict):
+        return parse_system_config(decoded)
+    raise ValueError("Config file must be a JSON object")
