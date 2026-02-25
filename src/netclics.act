@@ -97,33 +97,6 @@ actor ContainerManager(proc_cap: process.ProcessCap, log_handler: logging.Handle
         # Since we use --rm, container will be removed automatically
 
 
-actor SchemaRegistry(fc: file.FileCap):
-    var store: dict[u64, yang.schema.DRoot] = {}
-
-    def _list_hash(l: list[str]) -> u64:
-        h = hasher()
-        for le in l:
-            h.update(le.encode())
-        return h.finalize()
-
-    def add_schema(yang_src: list[str], cb: proc(time.Duration, ?u64, ?Exception) -> None):
-        sw = time.Stopwatch()
-        content_hash = _list_hash(yang_src)
-        if content_hash not in store:
-            try:
-                compiled_schema = yang.compile_with_cache(yang_src, strict_quoting=False, fc=fc)
-                store[content_hash] = compiled_schema
-            except Exception as e:
-                # Schema compilation failed, return error
-                cb(sw.elapsed(), None, e)
-                return
-        cb(sw.elapsed(), content_hash, None)
-
-    def get_schema(content_hash) -> ?yang.schema.DRoot:
-        if content_hash is not None:
-            return store.get(content_hash)
-
-
 class _SchemaId:
     def __init__(self, identifier: str, version: ?str, format: ?str):
         self.identifier = identifier
@@ -155,6 +128,117 @@ extension _SchemaId (Hashable):
             "".hash(h)
 
 
+def compute_capability_fingerprint(module_set: str, schemas: set[_SchemaId]) -> str:
+    """Compute a unique fingerprint for a module-set based on its capabilities"""
+    h = hasher()
+    # Sort schemas by identifier and version for consistent hashing
+    # TODO: we could just sort the set[_SchemaId], if it would be possible to
+    # implement the Hashable and Ord protocols at the same time!?
+    listed_schemas = ["{s.identifier}{s.version if s.version is not None else ''}" for s in schemas]
+    for schema in sorted(listed_schemas):
+        h.update(schema.encode())
+    return str(h.finalize())
+
+
+actor SchemaCompiler(log_handler: logging.Handler, fc: file.FileCap):
+    # TODO: abstract cache so that we don't have to thread through FileCap
+    var _log = logging.Logger(log_handler)
+
+    def compile(fingerprint: str, yang_src: list[str], cb: proc(str, ?yang.schema.DRoot, ?Exception) -> None):
+        """Compile YANG sources asynchronously and invoke callback when done"""
+        _log.debug("Starting async compilation", {"fingerprint": fingerprint, "source_count": len(yang_src)})
+        sw = time.Stopwatch()
+
+        try:
+            compiled_schema = yang.compile_with_cache(yang_src, strict_quoting=False, fc=fc)
+            _log.debug("Successfully compiled schemas", {"fingerprint": fingerprint, "duration": sw.elapsed().to_float()})
+            cb(fingerprint, compiled_schema, None)
+        except Exception as e:
+            _log.error("Schema compilation failed", {"fingerprint": fingerprint, "error": str(e), "duration": sw.elapsed().to_float()})
+            cb(fingerprint, None, e)
+
+
+actor SchemaRegistry(log_handler: logging.Handler):
+    """Coordinates schema fetching and storage across multiple devices"""
+    var _log = logging.Logger(log_handler)
+    var store: dict[str, yang.schema.DRoot] = {}  # fingerprint -> compiled schema
+    var callbacks: dict[str, list[action(?yang.schema.DRoot, ?str) -> None]] = {}  # pending callbacks
+    var fetching: set[str] = set()  # fingerprints currently being fetched
+
+    def get_schema(fingerprint: str, cb: action(?yang.schema.DRoot, ?str) -> None) -> bool:
+        """Request a schema by fingerprint.
+
+        Returns True if the caller should fetch the schema, False if another actor is already fetching.
+        The callback will be invoked when the schema is available.
+        """
+        _log.debug("Schema requested", {"fingerprint": fingerprint})
+
+        # Check if schema already exists
+        if fingerprint in store:
+            _log.debug("Schema found in store", {"fingerprint": fingerprint})
+            cb(store[fingerprint], None)
+            return False
+
+        # Check if another actor is already fetching this schema
+        if fingerprint in fetching:
+            _log.debug("Schema already being fetched by another actor", {"fingerprint": fingerprint})
+            # Add callback to be invoked when schema is ready
+            if fingerprint not in callbacks:
+                callbacks[fingerprint] = []
+            callbacks[fingerprint].append(cb)
+            return False
+
+        # This actor should fetch the schema
+        _log.debug("Assigning fetch responsibility", {"fingerprint": fingerprint})
+        fetching.add(fingerprint)
+        # Store the callback to be invoked after add_schema
+        if fingerprint not in callbacks:
+            callbacks[fingerprint] = []
+        callbacks[fingerprint].append(cb)
+        return True
+
+    def get_schema_sync(fingerprint: str) -> (?yang.schema.DRoot, ?str):
+        if fingerprint in store:
+            return store[fingerprint], None
+        elif fingerprint in callbacks:
+            return None, "Schema not compiled yet"
+        else:
+            return None, "Schema not fetched yet"
+
+    def add_schema(fingerprint: str, schema: yang.schema.DRoot):
+        """
+        Add a compiled schema to the registry and notify all waiting actors.
+        """
+        _log.debug("Adding schema to registry", {"fingerprint": fingerprint})
+
+        store[fingerprint] = schema
+        fetching.discard(fingerprint)
+
+        # Invoke all waiting callbacks
+        if fingerprint in callbacks:
+            waiting = callbacks[fingerprint]
+            _log.debug("Notifying waiting actors", {"fingerprint": fingerprint, "count": len(waiting)})
+            for cb in waiting:
+                cb(schema, None)
+            del callbacks[fingerprint]
+
+    def add_schema_error(fingerprint: str, error: Exception):
+        """
+        Report that schema fetching/compilation failed.
+        """
+        _log.error("Schema fetch/compilation failed", {"fingerprint": fingerprint, "error": str(error)})
+
+        fetching.discard(fingerprint)
+
+        # Invoke all waiting callbacks with None
+        if fingerprint in callbacks:
+            waiting = callbacks[fingerprint]
+            _log.debug("Notifying waiting actors of failure", {"fingerprint": fingerprint, "count": len(waiting)})
+            for cb in waiting:
+                cb(None, str(error))
+            del callbacks[fingerprint]
+
+
 actor DeviceInstance(auth: WorldCap, log_handler: logging.Handler, platform_name: str, platform: str, schema_registry,
                      container_id: str, ip_address: str,
                      netconf_port: int, ssh_port: int, instance_spec: ?InstanceSpec = None):
@@ -170,9 +254,9 @@ actor DeviceInstance(auth: WorldCap, log_handler: logging.Handler, platform_name
     var capabilities: list[str] = []
     # Map module-sets which are include and exclude patterns to expanded YANG module names
     var expanded_module_sets: dict[str, set[_SchemaId]] = {}
-    # Store compiled module-set schema hashes. The hash value is None for
+    # Store compiled module-set schema fingerprints. The fingerprint value is None for
     # schemas that have not yet compiled or have compilation errors.
-    var compiled_schemas: dict[str, ?u64] = {}
+    var compiled_schemas: dict[str, ?str] = {}
     # Track schema compilation errors for module-set
     var compiled_schemas_errors: dict[str, str] = {}
 
@@ -232,9 +316,9 @@ actor DeviceInstance(auth: WorldCap, log_handler: logging.Handler, platform_name
         return instance_data
 
     def get_compiled_schema(module_set_name) -> (?yang.schema.DRoot, ?str):
-        h = compiled_schemas.get(module_set_name)
-        if h is not None:
-            return (schema_registry.get_schema(h), None)
+        fingerprint = compiled_schemas.get(module_set_name)
+        if fingerprint is not None:
+            return schema_registry.get_schema_sync(fingerprint)
         elif module_set_name in compiled_schemas_errors:
             return (None, compiled_schemas_errors[module_set_name])
         else:
@@ -1425,6 +1509,8 @@ actor DeviceInstance(auth: WorldCap, log_handler: logging.Handler, platform_name
             _log.info("Connected to device for schema initialization")
             sw = time.Stopwatch()
             schema_getter: ?netconf.SchemaGetter = None
+            module_set_fingerprints: dict[str, str] = {}
+            fetch_module_sets: set[str] = set()
 
             def on_list_schemas(c: netconf.Client, schemas: list[(identifier: str, namespace: str, version: str, format: str)], error: ?netconf.NetconfError):
                 if error is not None:
@@ -1467,6 +1553,45 @@ actor DeviceInstance(auth: WorldCap, log_handler: logging.Handler, platform_name
                     state = "error"
                     return
 
+                deleted = set(compiled_schemas.keys()) - set(expanded_module_sets.keys())
+                for d in deleted:
+                    del compiled_schemas[d]
+
+                for name, modules in expanded_module_sets.items():
+                    # Compute capability fingerprint for this module-set
+                    fingerprint = compute_capability_fingerprint(name, modules)
+                    module_set_fingerprints[name] = fingerprint
+                    _log.debug("Processing schemas for module-set", {"module-set": name, "fingerprint": fingerprint})
+
+                    # Initialize as None (not yet compiled)
+                    compiled_schemas.setdefault(name, None)
+
+                    # Check if we should fetch/compile or another actor is handling it
+                    should_fetch = schema_registry.get_schema(
+                        fingerprint,
+                        lambda schema, error: on_schema_ready(name, fingerprint, schema, error)
+                    )
+
+                    if should_fetch:
+                        fetch_module_sets.add(name)
+                        _log.info("This device will fetch and compile schemas", {"module-set": name, "fingerprint": fingerprint})
+                    else:
+                        _log.info("Another device is handling schema compilation", {"module-set": name, "fingerprint": fingerprint})
+
+                if len(fetch_module_sets) == 0:
+                    # Close the NETCONF connection
+                    client.close()
+
+                    # Set state to ready immediately so device can handle requests (basic, ones that do not require schema)
+                    # Schema compilation will happen in background
+                    state = "ready"
+                    _log.info("Device ready for requests, schema initialization continuing in background", {"device": container_id})
+                    return
+
+                schemas_to_download = set()
+                for name in fetch_module_sets:
+                    schemas_to_download.update(expanded_module_sets[name])
+
                 print("Found {len(schemas_to_download)} schemas to download", {"duration": sw.elapsed().to_float()})
                 sw.reset()
                 schema_getter = netconf.SchemaGetter(c)
@@ -1496,20 +1621,22 @@ actor DeviceInstance(auth: WorldCap, log_handler: logging.Handler, platform_name
 
                 _log.info("All schemas downloaded", {"count": len(schema_dict), "duration": sw.elapsed().to_float()})
 
-                deleted = set(compiled_schemas.keys()) - set(expanded_module_sets.keys())
-                for d in deleted:
-                    del compiled_schemas[d]
-
-                # Compile the schemas
                 for name, modules in expanded_module_sets.items():
-                    _log.debug("Compiling YANG schemas", {"module-set": name})
-                    compiled_schemas.setdefault(name, None)
+                    if name not in fetch_module_sets:
+                        continue
+
+                    fingerprint = module_set_fingerprints[name]
+
+                    _log.debug("Processing schemas for module-set", {"module-set": name, "fingerprint": fingerprint})
+
                     yangs = []
                     for sid in modules:
                         y = schema_dict.get_def(sid, "")
                         if y != "":
                             yangs.append(y)
-                    schema_registry.add_schema(yangs, lambda d, h, e: on_compile(name, d, h, e))
+
+                    compiler = SchemaCompiler(log_handler, file.FileCap(auth))
+                    compiler.compile(fingerprint, yangs, on_compile_done)
 
                 # Close the NETCONF connection
                 client.close()
@@ -1519,15 +1646,27 @@ actor DeviceInstance(auth: WorldCap, log_handler: logging.Handler, platform_name
                 state = "ready"
                 _log.info("Device ready for requests, schema initialization continuing in background", {"device": container_id})
 
-            # Callback when a module-set schema is compiled by SchemaRegistry
-            def on_compile(name: str, duration: time.Duration, hash: ?u64, error: ?Exception):
-                if error is not None:
+            # Callback when schema is ready (either compiled by us or another actor)
+            def on_schema_ready(name: str, fingerprint: str, schema: ?yang.schema.DRoot, error: ?str):
+                if schema is not None:
+                    compiled_schemas[name] = fingerprint
+                    _log.info("Schema ready for module-set", {"module-set": name, "fingerprint": fingerprint})
+                elif error is not None:
                     compiled_schemas[name] = None
-                    compiled_schemas_errors[name] = str(error)
-                    _log.error("Failed to compile schemas", {"module-set": name, "error": str(error), "duration": duration.to_float()})
-                elif hash is not None:
-                    compiled_schemas[name] = hash
-                    _log.info("Successfully compiled YANG schemas", {"module-set": name, "duration": duration.to_float()})
+                    compiled_schemas_errors[name] = error
+                    _log.error("Schema not available for module-set", {"module-set": name, "fingerprint": fingerprint, "error": compiled_schemas_errors[name]})
+
+            # Callback when we complete compilation (we were the fetcher)
+            def on_compile_done(fingerprint: str, schema: ?yang.schema.DRoot, error: ?Exception):
+                if error is not None:
+                    _log.error("Failed to compile schemas", {"fingerprint": fingerprint, "error": str(error)})
+                    schema_registry.add_schema_error(fingerprint, error)
+                elif schema is not None:
+                    _log.info("Successfully compiled schemas, adding to registry", {"fingerprint": fingerprint})
+                    schema_registry.add_schema(fingerprint, schema)
+                else:
+                    _log.error("Compilation returned no schema and no error", {"fingerprint": fingerprint})
+                    schema_registry.add_schema_error(fingerprint, Exception("Compilation failed with no error"))
 
 
             client.list_schemas(on_list_schemas)
@@ -1546,7 +1685,7 @@ actor DeviceManager(config: SystemConfig, container_mgr: ContainerManager, auth:
     var instances = []  # DeviceInstance actors
     var pending_requests = []  # Requests waiting for a device
     var next_instance_id = 1
-    var schema_registry = SchemaRegistry(file.FileCap(auth))
+    var schema_registry = SchemaRegistry(log_handler)
 
     # Set up logging
     logh = logging.Handler("DeviceManager")
