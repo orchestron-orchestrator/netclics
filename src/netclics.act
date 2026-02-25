@@ -1743,23 +1743,6 @@ actor DeviceManager(config: netclics_config.SystemConfig, container_mgr: contain
     def _recover_static_instance(platform_name: str, instance_id: str, reason: str):
         _log.warning("Static instance entered error state; recovery hook is not implemented", {"platform": platform_name, "instance_id": instance_id, "reason": reason})
 
-    def stop_instance(platform_name: str, instance_id: str, reason: str, cb: action(?Exception) -> None):
-        device = _find_instance(platform_name, instance_id)
-        if device is not None:
-            state = device.get_state()
-            if state == "stopping":
-                cb(None)
-                return
-            if state == "busy":
-                cb(Exception(f"Instance not idle: {platform_name}/{instance_id} state={state}"))
-                return
-
-            device.stop(reason)
-            _remove_instance(platform_name, instance_id)
-            cb(None)
-            return
-        cb(Exception(f"Instance not found: {platform_name}/{instance_id}"))
-
     def count_instances(platform_name: str, state: ?str = None) -> int:
         """Count instances for a platform, optionally filtered by state"""
         count = 0
