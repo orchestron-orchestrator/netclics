@@ -568,12 +568,20 @@ wait-for-instances timeout="180":
 
     while [ $ELAPSED -lt $MAX_WAIT ]; do
         INSTANCES=$(curl {{NETCLICS_CURL_OPTS}} -s {{NETCLICS_BASE_URL}}/api/v1/instances)
+        INSTANCE_COUNT=$(echo "$INSTANCES" | jq '.instances | length')
+
+        if [ "$INSTANCE_COUNT" -eq 0 ]; then
+            echo "No instances reported yet ($ELAPSED/$MAX_WAIT seconds)"
+            sleep 2
+            ELAPSED=$((ELAPSED + 2))
+            continue
+        fi
 
         # Check if any instances are not ready
         NOT_READY=$(echo "$INSTANCES" | jq -r '.instances[] | select(.state != "ready") | "\(.instance_id): \(.state)"')
 
         if [ -z "$NOT_READY" ]; then
-            echo "All instances are ready!"
+            echo "All instances are ready! ($INSTANCE_COUNT total)"
             exit 0
         fi
 
@@ -602,13 +610,15 @@ wait-for-schemas timeout="360":
         # First check if there are any instances
         INSTANCE_COUNT=$(echo "$INSTANCES" | jq '.instances | length')
         if [ "$INSTANCE_COUNT" -eq 0 ]; then
-            echo "No instances found. Ensure NETCLICS server is running with instances."
-            exit 1
+            echo "No instances reported yet ($ELAPSED/$MAX_WAIT seconds)"
+            sleep 2
+            ELAPSED=$((ELAPSED + 2))
+            continue
         fi
 
         # Check if all module sets are compiled
         NOT_COMPILED=$(echo "$INSTANCES" | \
-            jq -r '.instances[] | .instance_id as $id | .module_sets | to_entries[] | select(.value.compiled == false) | "\($id)/\(.key): \(.value.error // "compiling...")"')
+            jq -r '.instances[] | .instance_id as $id | (.module_sets // {}) | to_entries[] | select(.value.compiled == false) | "\($id)/\(.key): \(.value.error // "compiling...")"')
 
         if [ -z "$NOT_COMPILED" ]; then
             echo "All schemas compiled successfully!"
