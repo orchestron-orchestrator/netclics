@@ -1,0 +1,133 @@
+import file
+import uri
+
+
+def _normalize_request_path(path: str) -> str:
+    parsed_path, _ = uri.parse_path(path)
+    path_without_query = parsed_path if parsed_path is not None else "/"
+    if "\\" in path_without_query:
+        raise ValueError("Backslash not allowed in URI path")
+
+    # Canonicalize empty segments
+    return "/".join([part for part in path_without_query.split("/") if part not in {"", "."}])
+
+
+def _is_under_root(root_dir: str, absolute_path: str) -> bool:
+    if root_dir == "/":
+        return absolute_path.startswith("/")
+    return absolute_path == root_dir or absolute_path.startswith(root_dir + "/")
+
+
+def _guess_content_type(path: str) -> str:
+    lower = path.lower()
+    if lower.endswith(".html") or lower.endswith(".htm"):
+        return "text/html; charset=utf-8"
+    if lower.endswith(".css"):
+        return "text/css; charset=utf-8"
+    if lower.endswith(".js") or lower.endswith(".mjs"):
+        return "application/javascript; charset=utf-8"
+    if lower.endswith(".json"):
+        return "application/json; charset=utf-8"
+    if lower.endswith(".txt"):
+        return "text/plain; charset=utf-8"
+    if lower.endswith(".xml"):
+        return "application/xml; charset=utf-8"
+    if lower.endswith(".svg"):
+        return "image/svg+xml"
+    if lower.endswith(".ico"):
+        return "image/x-icon"
+    return "application/octet-stream"
+
+
+def _text_response(status_code: int, body: str) -> (int, dict[str, str], str):
+    return (status_code, {"Content-Type": "text/plain; charset=utf-8"}, body)
+
+
+def _resolve_target_path(fs: file.FS, root_dir: str, candidate_path: str) -> (int, ?str):
+    if not _is_under_root(root_dir, candidate_path):
+        return 403, None
+
+    try:
+        st = fs.stat(candidate_path)
+        if st.is_dir():
+            index_path = file.resolve_relative_path(candidate_path, "index.html")
+            st = fs.stat(index_path)
+            if not st.is_file():
+                return 404, None
+            return 200, index_path
+
+        if not st.is_file():
+            return 404, None
+
+        return 200, candidate_path
+    except OSError:
+        return 404, None
+    except ValueError:
+        return 403, None
+
+
+def _resolve_configured_root(fs: file.FS, configured_root_dir: str) -> str:
+    resolved = configured_root_dir
+    if not resolved.startswith("/"):
+        resolved = file.resolve_relative_path(fs.cwd(), resolved)
+    resolved = resolved.rstrip("/")
+    if resolved == "":
+        resolved = "/"
+
+    try:
+        st = fs.stat(resolved)
+        if not st.is_dir():
+            raise ValueError("Static directory is not a directory: " + resolved)
+    except OSError:
+        raise ValueError("Static directory does not exist: " + resolved)
+
+    return resolved
+
+
+actor StaticFileServer(file_cap: file.FileCap, read_cap: file.ReadFileCap, configured_root_dir: str):
+    var fs = file.FS(file_cap)
+    var root_dir = _resolve_configured_root(fs, configured_root_dir)
+
+    def get_root_dir() -> str:
+        return root_dir
+
+    def maybe_serve(request_method: str, request_path: str) -> ?(int, dict[str, str], str):
+        if request_method != "GET":
+            return None
+
+        normalized = ""
+        try:
+            normalized = _normalize_request_path(request_path)
+        except ValueError:
+            return _text_response(400, "Bad request")
+        relative_path = normalized[1:] if normalized.startswith("/") else normalized
+        if relative_path == "":
+            relative_path = "index.html"
+
+        absolute_path = ""
+        try:
+            absolute_path = file.resolve_relative_path(root_dir, relative_path)
+        except ValueError:
+            return _text_response(403, "Forbidden")
+
+        target_status, target_path = _resolve_target_path(fs, root_dir, absolute_path)
+        if target_status == 403:
+            return _text_response(403, "Forbidden")
+        elif target_status == 404:
+            return _text_response(404, "Not found")
+        elif target_path is not None:
+            raw_data = b""
+            try:
+                reader = file.ReadFile(read_cap, target_path)
+                raw_data = reader.read()
+                reader.close()
+            except OSError:
+                return _text_response(404, "Not found")
+            except Exception:
+                return _text_response(500, "Internal server error")
+
+            try:
+                decoded_body = raw_data.decode()
+                return (200, {"Content-Type": _guess_content_type(target_path)}, decoded_body)
+            except Exception:
+                return _text_response(415, "Unsupported media type")
