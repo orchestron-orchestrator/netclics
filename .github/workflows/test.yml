@@ -58,6 +58,14 @@ jobs:
         run: |
           echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
 
+      - name: "Start background image prefetch"
+        run: |
+          set -euo pipefail
+          jq -r '.platforms[] | select(.container_image != null and .container_image != "") | .container_image' "${NETCLICS_CONFIG}" \
+            | while IFS= read -r image; do
+                docker pull "${image}" &
+              done
+
       - name: "Build NETCLICS"
         run: just build
 
