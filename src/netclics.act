@@ -14,6 +14,7 @@ import yang.data
 import yang.gdata
 import yang.schema
 import yang.xml
+import container_manager
 import schema_filter
 import netclics_config
 
@@ -241,8 +242,10 @@ actor SchemaRegistry(log_handler: logging.Handler):
 
 
 actor DeviceInstance(auth: WorldCap, log_handler: logging.Handler, platform_name: str, platform: str, schema_registry,
-                     container_id: str, ip_address: str,
-                     netconf_port: int, ssh_port: int, instance_spec: ?netclics_config.InstanceSpec = None):
+                     instance_id: str, ip_address: str,
+                     netconf_port: int, ssh_port: int, instance_spec: netclics_config.InstanceSpec,
+                     instance_type: str = "static",
+                     on_recovery_required: ?action(str, str, str) -> None = None):
     """Actor representing a device instance that can process conversion requests"""
     var state = "starting"  # starting, ready, busy, stopping, error
     var started_at = 0  # Timestamp when started
@@ -269,21 +272,30 @@ actor DeviceInstance(auth: WorldCap, log_handler: logging.Handler, platform_name
     var conversion_cli_client: ?router_client.Client = None
 
     # Set up logging
-    logh = logging.Handler("DeviceInstance [{container_id}]")
+    logh = logging.Handler("DeviceInstance [{instance_id}]")
     logh.set_handler(log_handler)
     _log = logging.Logger(logh)
 
     def is_static_instance() -> bool:
         """Check if this is a static instance (vs dynamically created container)"""
-        if instance_spec is not None:
-            return True
-        return False
+        return instance_type == "static"
 
     def get_state() -> str:
         return state
 
     def set_state(new_state: str):
         state = new_state
+
+    def _is_inactive() -> bool:
+        return state == "stopping" or state == "error"
+
+    def _mark_error(reason: str):
+        if state == "error":
+            return
+        state = "error"
+        _log.error("Device marked error", {"reason": reason})
+        if on_recovery_required is not None:
+            on_recovery_required(platform_name, instance_id, reason)
 
     def _cleanup_conversion_clients():
         """Clean up persistent clients at end of conversion"""
@@ -317,17 +329,16 @@ actor DeviceInstance(auth: WorldCap, log_handler: logging.Handler, platform_name
         instance_data = {
             "platform_name": platform_name,
             "platform": device_platform,
-            "instance_id": container_id,
+            "instance_id": instance_id,
             "ip_address": ip_address,
             "state": state,
             "netconf_port": netconf_port,
             "ssh_port": ssh_port,
-            "instance_type": "static" if is_static_instance() else "container"
+            "instance_type": instance_type
         }
-        if instance_spec is not None:
-            desc = instance_spec.description
-            if desc is not None:
-                instance_data["description"] = desc
+        desc = instance_spec.description
+        if desc is not None:
+            instance_data["description"] = desc
 
         msi = {}
         for name, schema_hash in compiled_schemas.items():
@@ -380,9 +391,19 @@ actor DeviceInstance(auth: WorldCap, log_handler: logging.Handler, platform_name
             max_retries: Maximum number of retries (None for unlimited)
         """
         def attempt_connection(retry_count=0):
+            if _is_inactive():
+                _log.debug("Skipping NETCONF connection attempt for inactive device", {"attempt": retry_count, "state": state})
+                return
+
             _log.info("Attempting NETCONF connection", {"attempt": retry_count, "host": ip_address, "port": netconf_port, "unlimited": True if max_retries is None else False})
 
             def on_connect(client: ?netconf.Client, error: ?Exception):
+                if _is_inactive():
+                    if client is not None:
+                        client.close()
+                    _log.debug("Ignoring NETCONF connect callback for inactive device", {"attempt": retry_count, "state": state})
+                    return
+
                 if error is not None:
                     _log.warning("NETCONF connection attempt failed", {"attempt": retry_count, "error": str(error)})
                     if max_retries is not None and retry_count >= max_retries:
@@ -390,8 +411,15 @@ actor DeviceInstance(auth: WorldCap, log_handler: logging.Handler, platform_name
                         if on_failure is not None:
                             on_failure(Exception(f"Failed to connect after {max_retries} attempts: {error}"))
                     else:
+                        if _is_inactive():
+                            _log.debug("Skipping NETCONF retry for inactive device", {"attempt": retry_count, "state": state})
+                            return
                         after float(retry_delay): attempt_connection(retry_count+1)
                 elif client is not None:
+                    if _is_inactive():
+                        client.close()
+                        _log.debug("Closing NETCONF client created for inactive device", {"attempt": retry_count, "state": state})
+                        return
                     _log.info("NETCONF connection successful", {"attempt": retry_count})
                     capabilities = client.get_capabilities()
                     on_success(client)
@@ -416,22 +444,16 @@ actor DeviceInstance(auth: WorldCap, log_handler: logging.Handler, platform_name
     def _get_credentials() -> ?(str, str):
         """Get device credentials, returns (username, password) tuple or None"""
         _log.debug("Checking device credentials")
-        if instance_spec is not None:
-            _log.debug("InstanceSpec found")
-            _username = instance_spec.username
-            _password = instance_spec.password
-            _log.debug("Checking username and password")
-            if _username is not None and _password is not None:
-                username = _username
-                password = _password
-                _log.info("Credentials found", {"username": username})
-                return (username, password)
-            else:
-                _log.error("Missing username or password for device", {"device": container_id, "username": str(_username), "password_set": str(True if _password is not None else False)})
-                return None
-        else:
-            _log.error("No InstanceSpec available for device", {"device": container_id})
-            return None
+        _username = instance_spec.username
+        _password = instance_spec.password
+        _log.debug("Checking username and password")
+        if _username is not None and _password is not None:
+            static_username = _username
+            static_password = _password
+            _log.info("Credentials found", {"username": static_username})
+            return (static_username, static_password)
+        _log.error("Missing username or password for device", {"device": instance_id, "username": str(_username), "password_set": str(True if _password is not None else False)})
+        return None
 
     def validate_module_set(module_set: str) -> ?str:
         """Validate if the requested module_set is available. Returns error message if invalid, None if valid."""
@@ -464,7 +486,7 @@ actor DeviceInstance(auth: WorldCap, log_handler: logging.Handler, platform_name
 
     def _rollback_to_config(base_xml, base_gdata, final_gdata, result_callback: action(?Exception) -> None):
         """Rollback device configuration to a previous state"""
-        _log.info("DeviceInstance.rollback called", {"device": container_id})
+        _log.info("DeviceInstance.rollback called", {"device": instance_id})
         if platform == "cisco_iosxe":
             backward_diff = yang.gdata.diff(final_gdata, base_gdata)
             if backward_diff is not None:
@@ -580,6 +602,7 @@ actor DeviceInstance(auth: WorldCap, log_handler: logging.Handler, platform_name
 
             def on_connect_failure(error: Exception):
                 _log.error("Failed to create NETCONF client", {"error": str(error)})
+                _mark_error("NETCONF connection failed after retries: " + str(error))
                 on_error(error)
 
             create_netconf_client_with_retry(username, password, on_connect_success, on_connect_failure, max_retries=5)
@@ -730,8 +753,8 @@ actor DeviceInstance(auth: WorldCap, log_handler: logging.Handler, platform_name
 
     def convert(request: ConvertRequest, result_callback: action(?(base_config: str, steps: list[(input: str, config: str, diff: str)]), ?Exception) -> None):
         """Process a conversion request on this device"""
-        _log.info("DeviceInstance.convert called", {"device": container_id, "input_format": request.format, "output_format": request.target_format, "module_set": request.module_set, "steps": len(request.input)})
-        _log.debug("Input steps", {"device": container_id, "input_steps": request.input})
+        _log.info("DeviceInstance.convert called", {"device": instance_id, "input_format": request.format, "output_format": request.target_format, "module_set": request.module_set, "steps": len(request.input)})
+        _log.debug("Input steps", {"device": instance_id, "input_steps": request.input})
 
         state = "busy"
 
@@ -1008,22 +1031,20 @@ actor DeviceInstance(auth: WorldCap, log_handler: logging.Handler, platform_name
         def on_rollback_complete(rollback_error: ?Exception):
             """Rollback complete, verify and finish the conversion"""
             if rollback_error is not None:
-                _log.error("Rollback failed after successful conversion", {"error": str(rollback_error)})
-                state = "error"
+                _mark_error("Rollback failed after successful conversion: " + str(rollback_error))
                 finish(Exception("Rollback failed after successful conversion: " + str(rollback_error)), None)
                 return
 
             if base_gdata_all is not None:
                 verify_restored_config(base_gdata_all, on_success_rollback_verified)
             else:
-                state = "error"
+                _mark_error("Missing base configuration for rollback verification")
                 finish(Exception("Missing base configuration for rollback verification"), None)
 
         def on_success_rollback_verified(verification_error: ?Exception):
             """Handle rollback verification for successful conversion"""
             if verification_error is not None:
-                _log.error("Rollback verification failed after successful conversion", {"error": str(verification_error)})
-                state = "error"
+                _mark_error("Rollback verification failed after successful conversion: " + str(verification_error))
                 finish(verification_error, None)
                 return
 
@@ -1061,22 +1082,20 @@ actor DeviceInstance(auth: WorldCap, log_handler: logging.Handler, platform_name
         def on_abort_rollback_complete(original_error: str, rollback_error: ?Exception):
             """Handle rollback completion after abort"""
             if rollback_error is not None:
-                _log.error("Failed to rollback after abort", {"rollback_error": str(rollback_error)})
-                state = "error"
+                _mark_error("Rollback failed after abort: " + str(rollback_error))
                 finish(Exception(original_error + "; rollback failed: " + str(rollback_error)), None)
                 return
 
             if base_gdata_all is not None:
                 verify_restored_config(base_gdata_all, lambda verification_error: on_abort_rollback_verified(original_error, verification_error))
             else:
-                state = "error"
+                _mark_error("Missing base configuration for rollback verification after abort")
                 finish(Exception(original_error + "; missing base configuration for rollback verification"), None)
 
         def on_abort_rollback_verified(original_error: str, verification_error: ?Exception):
             """Handle rollback verification after abort"""
             if verification_error is not None:
-                _log.error("Rollback verification failed after abort", {"error": str(verification_error)})
-                state = "error"
+                _mark_error("Rollback verification failed after abort: " + str(verification_error))
                 finish(Exception(original_error + "; " + str(verification_error)), None)
                 return
 
@@ -1408,7 +1427,7 @@ actor DeviceInstance(auth: WorldCap, log_handler: logging.Handler, platform_name
 
     def apply_netconf_config(config: str, config_name: str):
         """Generic method to apply NETCONF configuration to device"""
-        _log.info("Applying NETCONF configuration", {"device": container_id, "config": config_name})
+        _log.info("Applying NETCONF configuration", {"device": instance_id, "config": config_name})
 
         # Get credentials
         creds = _get_credentials()
@@ -1500,7 +1519,10 @@ actor DeviceInstance(auth: WorldCap, log_handler: logging.Handler, platform_name
 
     def initialize_schemas(module_sets):
         """Initialize schemas by downloading them from the device and compiling them"""
-        _log.info("Initializing YANG schemas for device", {"device": container_id})
+        _log.info("Initializing YANG schemas for device", {"device": instance_id})
+        if _is_inactive():
+            _log.debug("Skipping schema initialization for inactive device", {"device": instance_id, "state": state})
+            return
 
         # Get credentials
         creds = _get_credentials()
@@ -1508,10 +1530,14 @@ actor DeviceInstance(auth: WorldCap, log_handler: logging.Handler, platform_name
             username, password = creds
         else:
             _log.error("No credentials available for schema initialization")
-            state = "error"
+            _mark_error("Schema initialization failed: missing credentials")
             return
 
         def on_connect_success(client: netconf.Client):
+            if _is_inactive():
+                client.close()
+                _log.debug("Skipping schema initialization connect callback for inactive device", {"device": instance_id, "state": state})
+                return
             _log.info("Connected to device for schema initialization")
             sw = time.Stopwatch()
             schema_getter: ?netconf.SchemaGetter = None
@@ -1519,9 +1545,13 @@ actor DeviceInstance(auth: WorldCap, log_handler: logging.Handler, platform_name
             fetch_module_sets: set[str] = set()
 
             def on_list_schemas(c: netconf.Client, schemas: list[(identifier: str, namespace: str, version: str, format: str)], error: ?netconf.NetconfError):
+                if _is_inactive():
+                    c.close()
+                    _log.debug("Ignoring list_schemas callback for inactive device", {"device": instance_id, "state": state})
+                    return
                 if error is not None:
                     _log.error("Error: Failed to list schemas: {error}")
-                    state = "error"
+                    _mark_error("Schema initialization failed: list schemas error")
                     return
 
                 # Filter only YANG schemas because we only compile YANG
@@ -1556,7 +1586,7 @@ actor DeviceInstance(auth: WorldCap, log_handler: logging.Handler, platform_name
 
                 if len(schemas_to_download) == 0:
                     _log.error("No schemas available for download")
-                    state = "error"
+                    _mark_error("Schema initialization failed: no schemas available")
                     return
 
                 deleted = set(compiled_schemas.keys()) - set(expanded_module_sets.keys())
@@ -1587,11 +1617,14 @@ actor DeviceInstance(auth: WorldCap, log_handler: logging.Handler, platform_name
                 if len(fetch_module_sets) == 0:
                     # Close the NETCONF connection
                     client.close()
+                    if _is_inactive():
+                        _log.debug("Not setting ready state after schema initialization on inactive device", {"device": instance_id, "state": state})
+                        return
 
                     # Set state to ready immediately so device can handle requests (basic, ones that do not require schema)
                     # Schema compilation will happen in background
                     state = "ready"
-                    _log.info("Device ready for requests, schema initialization continuing in background", {"device": container_id})
+                    _log.info("Device ready for requests, schema initialization continuing in background", {"device": instance_id})
                     return
 
                 schemas_to_download = set()
@@ -1621,6 +1654,10 @@ actor DeviceInstance(auth: WorldCap, log_handler: logging.Handler, platform_name
                 if schema_getter is not None and sg is not schema_getter:
                     _log.debug("Ingoring callback from old SchemaGetter")
                     return
+                if _is_inactive():
+                    client.close()
+                    _log.debug("Ignoring schema completion callback for inactive device", {"device": instance_id, "state": state})
+                    return
                 if error is not None:
                     _log.error("Error during schema download", {"error": error.error_message})
                     # Continue anyway - device can work without schemas
@@ -1646,14 +1683,20 @@ actor DeviceInstance(auth: WorldCap, log_handler: logging.Handler, platform_name
 
                 # Close the NETCONF connection
                 client.close()
+                if _is_inactive():
+                    _log.debug("Not setting ready state after schema completion on inactive device", {"device": instance_id, "state": state})
+                    return
 
                 # Set state to ready immediately so device can handle requests (basic, ones that do not require schema)
                 # Schema compilation will happen in background
                 state = "ready"
-                _log.info("Device ready for requests, schema initialization continuing in background", {"device": container_id})
+                _log.info("Device ready for requests, schema initialization continuing in background", {"device": instance_id})
 
             # Callback when schema is ready (either compiled by us or another actor)
             def on_schema_ready(name: str, fingerprint: str, schema: ?yang.schema.DRoot, error: ?str):
+                if _is_inactive():
+                    _log.debug("Ignoring schema ready callback for inactive device", {"device": instance_id, "module-set": name, "state": state})
+                    return
                 if schema is not None:
                     compiled_schemas[name] = fingerprint
                     _log.info("Schema ready for module-set", {"module-set": name, "fingerprint": fingerprint})
@@ -1679,26 +1722,31 @@ actor DeviceInstance(auth: WorldCap, log_handler: logging.Handler, platform_name
 
         def on_connect_failure(error: Exception):
             _log.error("Failed to connect for schema initialization after retries", {"error": str(error)})
-            state = "error"
+            _mark_error("Schema initialization failed: netconf connect error: " + str(error))
 
         # Create NETCONF client for schema initialization
         _log.info("Creating NETCONF client for schema initialization", {"host": ip_address, "port": netconf_port})
         create_netconf_client_with_retry(username, password, on_connect_success, on_connect_failure)
 
 
-actor DeviceManager(config: netclics_config.SystemConfig, container_mgr: ContainerManager, auth: WorldCap, log_handler: logging.Handler):
+actor DeviceManager(config: netclics_config.SystemConfig, container_mgr: container_manager.ContainerManager, auth: WorldCap, log_handler: logging.Handler):
     """Manages device lifecycle and state transitions"""
     var config_state = config
     var instances = []  # DeviceInstance actors
     var pending_requests = []  # Requests waiting for a device
+    var starting_instances: dict[str, int] = {}
     var next_instance_id = 1
+    var recovery_attempts: dict[str, int] = {}
+    var recovery_in_progress: set[str] = set()
+    var max_recovery_attempts = 3
+    var recovery_base_delay_seconds = 5
+    var recovery_max_delay_seconds = 60
     var schema_registry = SchemaRegistry(log_handler)
 
     # Set up logging
     logh = logging.Handler("DeviceManager")
     logh.set_handler(log_handler)
     _log = logging.Logger(logh)
-
 
     def _find_instance(platform_name: str, instance_id: str) -> ?DeviceInstance:
         for device in instances:
@@ -1709,45 +1757,35 @@ actor DeviceManager(config: netclics_config.SystemConfig, container_mgr: Contain
                 return device
         return None
 
-    def _remove_instance(platform_name: str, instance_id: str) -> bool:
-        """Remove instance from manager bookkeeping"""
-        kept_instances = []
-        removed = False
+    def _restart_delay_seconds(attempt: int) -> int:
+        delay = recovery_base_delay_seconds
+        if attempt > 1:
+            for _ in range(attempt - 1):
+                delay = delay * 2
+                if delay >= recovery_max_delay_seconds:
+                    return recovery_max_delay_seconds
+        if delay > recovery_max_delay_seconds:
+            delay = recovery_max_delay_seconds
+        return delay
 
-        for device in instances:
+    def _make_instance_id(platform_name: str) -> str:
+        instance_id = "netclics-%s-%s" % (platform_name.replace(" ", "-"), str(next_instance_id))
+        next_instance_id += 1
+        return instance_id
+
+    def _remove_instance(platform_name: str, instance_id: str) -> ?DeviceInstance:
+        for i in range(len(instances)):
+            device = instances[i]
             device_info = device.get_info()
             info_platform = device_info.get("platform_name")
             info_id = device_info.get("instance_id")
-            if isinstance(info_platform, str) and isinstance(info_id, str) and info_platform == platform_name and info_id == instance_id:
-                removed = True
-                continue
-            kept_instances.append(device)
+            if isinstance(info_platform, str) and info_platform == platform_name and isinstance(info_id, str) and info_id == instance_id:
+                del instances[i]
+                return device
+        return None
 
-        instances = kept_instances
-
-        if removed:
-            _log.info("Removed instance from manager", {"platform": platform_name, "instance_id": instance_id})
-        else:
-            _log.warning("Instance not found for removal", {"platform": platform_name, "instance_id": instance_id})
-
-        return removed
-
-    def stop_instance(platform_name: str, instance_id: str, reason: str, cb: action(?Exception) -> None):
-        device = _find_instance(platform_name, instance_id)
-        if device is not None:
-            state = device.get_state()
-            if state == "stopping":
-                cb(None)
-                return
-            if state == "busy":
-                cb(Exception(f"Instance not idle: {platform_name}/{instance_id} state={state}"))
-                return
-
-            device.stop(reason)
-            _remove_instance(platform_name, instance_id)
-            cb(None)
-            return
-        cb(Exception(f"Instance not found: {platform_name}/{instance_id}"))
+    def _recover_static_instance(platform_name: str, instance_id: str, reason: str):
+        _log.warning("Static instance entered error state; recovery hook is not implemented", {"platform": platform_name, "instance_id": instance_id, "reason": reason})
 
     def count_instances(platform_name: str, state: ?str = None) -> int:
         """Count instances for a platform, optionally filtered by state"""
@@ -1764,20 +1802,43 @@ actor DeviceManager(config: netclics_config.SystemConfig, container_mgr: Contain
                         count += 1
         return count
 
+    def count_starting_instances(platform_name: str) -> int:
+        return starting_instances.get_def(platform_name, 0)
+
+    def get_platform_counts(platform_name: str) -> (total: int, available: int, starting: int):
+        total = count_instances(platform_name)
+        available = count_instances(platform_name, "ready")
+        starting = count_starting_instances(platform_name)
+        return (total=total, available=available, starting=starting)
+
+    def _inc_starting(platform_name: str):
+        starting_instances[platform_name] = count_starting_instances(platform_name) + 1
+
+    def _dec_starting(platform_name: str):
+        current = count_starting_instances(platform_name)
+        if current <= 1:
+            if platform_name in starting_instances:
+                del starting_instances[platform_name]
+        else:
+            starting_instances[platform_name] = current - 1
+
     def initialize_static_instances(platform: netclics_config.PlatformConfig):
         """Initialize static instances for a platform"""
+        # TODO: workaround for https://github.com/actonlang/acton/issues/2645
+        platform_name_value = platform.name
         for spec in platform.instances:
             device = DeviceInstance(
                 auth=auth,
                 log_handler=log_handler,
-                platform_name=platform.name,
+                platform_name=platform_name_value,
                 platform=platform.platform,
                 schema_registry=schema_registry,
-                container_id=spec.id,
+                instance_id=spec.id,
                 ip_address=spec.host,
                 netconf_port=spec.netconf_port,
                 ssh_port=spec.ssh_port,
-                instance_spec=spec
+                instance_spec=spec,
+                on_recovery_required=handle_recovery_request
             )
 
             # For Juniper platforms, configure RFC compliance first
@@ -1792,10 +1853,10 @@ actor DeviceManager(config: netclics_config.SystemConfig, container_mgr: Contain
             device.initialize_schemas(platform.module_sets)
             instances.append(device)
 
-    def get_device_for_request(platform_name: str) -> ?DeviceInstance:
+    def get_device_for_request(platform_name: str, allow_scaleup: bool = True) -> ?DeviceInstance:
         """Get or create a device for a request"""
         # Debug logging
-        _log.debug("Looking for device", {"requested_platform": platform_name, "total_instances": len(instances)})
+        _log.debug("Looking for device", {"requested_platform": platform_name, "total_instances": len(instances), "allow_scaleup": allow_scaleup})
 
         # Find a ready device for the specified platform
         for i in range(len(instances)):
@@ -1807,33 +1868,187 @@ actor DeviceManager(config: netclics_config.SystemConfig, container_mgr: Contain
             if isinstance(device_state, str) and device_state == "ready" and isinstance(info_platform, str) and info_platform == platform_name:
                 _log.info("Found matching device", {"platform": platform_name, "index": i})
                 return device
+
+        platform = config.get_platform(platform_name)
+        if allow_scaleup and platform is not None and not platform.uses_static_instances():
+            _log.info("No ready dynamic instance, requesting scale-up", {"platform": platform_name})
+            start_device(platform)
+
         _log.warning("No matching device found", {"platform": platform_name})
         return None
 
-    def start_device(platform: netclics_config.PlatformConfig) -> ?DeviceInstance:
+    def _start_dynamic_instance(platform: netclics_config.PlatformConfig, instance_id: str, on_ready: action(str) -> None, on_failed: action(str) -> None):
+        if platform.uses_static_instances():
+            on_failed("Platform uses static instances")
+            return
+
+        if platform.container_image is None or platform.container_image == "":
+            on_failed("Missing container_image for dynamic platform")
+            return
+        image = expect(platform.container_image, "container image")
+        if platform.username is None or platform.password is None:
+            on_failed("Missing platform username/password for dynamic instance")
+            return
+
+        current_total = count_instances(platform.name) + count_starting_instances(platform.name)
+        if current_total >= platform.max_instances:
+            on_failed("Dynamic platform at max_instances")
+            return
+
+        _inc_starting(platform.name)
+        _log.info("Starting dynamic device container", {"platform": platform.name, "instance_id": instance_id, "image": image})
+
+        def on_inspected(inspect_info: ?(ip: str, netconf_port: u64, ssh_port: u64, state: str, health: str), inspect_error: ?Exception, inspected_id: str):
+            if inspect_error is not None:
+                _log.error("Failed to inspect started container", {"platform": platform.name, "instance_id": inspected_id, "error": str(inspect_error)})
+                _dec_starting(platform.name)
+
+                def on_stop_error(stop_error: ?Exception):
+                    if stop_error is not None:
+                        _log.warning("Failed to cleanup container after inspect error", {"instance_id": inspected_id, "error": str(stop_error)})
+
+                container_mgr.stop_container(inspected_id, on_stop_error)
+                on_failed("Container inspect failed: " + str(inspect_error))
+                return
+
+            if inspect_info is not None:
+                # Dynamic instances use published host ports, so connect over loopback.
+                device_host = "127.0.0.1"
+                netconf_port = int(inspect_info.netconf_port)
+                ssh_port = int(inspect_info.ssh_port)
+                dynamic_spec = netclics_config.InstanceSpec(
+                    id=inspected_id,
+                    host=device_host,
+                    netconf_port=netconf_port,
+                    ssh_port=ssh_port,
+                    restconf_port=platform.restconf_port,
+                    username=platform.username,
+                    password=platform.password,
+                    description="Dynamically managed container instance"
+                )
+
+                device = DeviceInstance(
+                    auth=auth,
+                    log_handler=log_handler,
+                    platform_name=platform.name,
+                    platform=platform.platform,
+                    schema_registry=schema_registry,
+                    instance_id=inspected_id,
+                    ip_address=device_host,
+                    netconf_port=netconf_port,
+                    ssh_port=ssh_port,
+                    instance_spec=dynamic_spec,
+                    instance_type="container",
+                    on_recovery_required=handle_recovery_request
+                )
+
+                if platform.platform == "junos":
+                    device.configure_rfc_compliance()
+                if platform.platform == "cisco_iosxe":
+                    device.configure_iosxe_archive_ssh()
+
+                device.initialize_schemas(platform.module_sets)
+                instances.append(device)
+                _dec_starting(platform.name)
+                _log.info("Dynamic device instance initialized", {"platform": platform.name, "instance_id": inspected_id, "host": device_host, "netconf_port": netconf_port, "ssh_port": ssh_port})
+                on_ready(inspected_id)
+                return
+
+            _log.error("Container inspect returned no data", {"platform": platform.name, "instance_id": inspected_id})
+            _dec_starting(platform.name)
+            on_failed("Container inspect returned no data")
+
+        def on_started(started_id: ?str, start_error: ?Exception):
+            if start_error is not None:
+                _log.error("Failed to start dynamic container", {"platform": platform.name, "instance_id": instance_id, "error": str(start_error)})
+                _dec_starting(platform.name)
+                on_failed("Container start failed: " + str(start_error))
+                return
+            if started_id is not None:
+                container_mgr.inspect_container(started_id, on_inspected)
+                return
+            _log.error("Dynamic container start returned no instance id", {"platform": platform.name, "instance_id": instance_id})
+            _dec_starting(platform.name)
+            on_failed("Container start returned no instance id")
+
+        container_mgr.start_container(platform.name, instance_id, image, on_started)
+
+    def _schedule_recovery_attempt(platform: netclics_config.PlatformConfig, instance_id: str, reason: str, attempt: int):
+        delay = _restart_delay_seconds(attempt)
+        _log.warning("Scheduling recovery restart", {"platform": platform.name, "instance_id": instance_id, "attempt": attempt, "delay_seconds": delay, "reason": reason})
+        after float(delay): _attempt_recovery_start(platform, instance_id, reason, attempt)
+
+    def _attempt_recovery_start(platform: netclics_config.PlatformConfig, instance_id: str, reason: str, attempt: int):
+        def on_ready(new_instance_id: str):
+            _log.info("Recovery restart succeeded", {"platform": platform.name, "instance_id": new_instance_id, "attempt": attempt, "reason": reason})
+            if instance_id in recovery_attempts:
+                del recovery_attempts[instance_id]
+            recovery_in_progress.discard(instance_id)
+
+        def on_failed(error_msg: str):
+            _log.error("Recovery restart attempt failed", {"platform": platform.name, "instance_id": instance_id, "attempt": attempt, "error": error_msg, "reason": reason})
+            if attempt >= max_recovery_attempts:
+                _log.error("Max recovery attempts reached, giving up", {"platform": platform.name, "instance_id": instance_id, "attempts": attempt})
+                recovery_in_progress.discard(instance_id)
+                return
+            next_attempt = attempt + 1
+            recovery_attempts[instance_id] = next_attempt
+            _schedule_recovery_attempt(platform, instance_id, reason, next_attempt)
+
+        _start_dynamic_instance(platform, instance_id, on_ready, on_failed)
+
+    def handle_recovery_request(platform_name: str, instance_id: str, reason: str):
+        _log.warning("Recovery requested for device", {"platform": platform_name, "instance_id": instance_id, "reason": reason})
+
+        if instance_id in recovery_in_progress:
+            _log.debug("Recovery already in progress for device", {"platform": platform_name, "instance_id": instance_id})
+            return
+        recovery_in_progress.add(instance_id)
+
+        platform_opt = config.get_platform(platform_name)
+        if platform_opt is None:
+            _log.error("Recovery requested for unknown platform", {"platform": platform_name, "instance_id": instance_id})
+            recovery_in_progress.discard(instance_id)
+            return
+        platform = expect(platform_opt, "platform for recovery")
+
+        if platform.uses_static_instances():
+            _recover_static_instance(platform_name, instance_id, reason)
+            recovery_in_progress.discard(instance_id)
+            return
+
+        removed = _remove_instance(platform_name, instance_id)
+        if removed is not None:
+            _log.info("Removed unhealthy instance from pool", {"platform": platform_name, "instance_id": instance_id})
+
+        attempt = recovery_attempts.get_def(instance_id, 0) + 1
+        recovery_attempts[instance_id] = attempt
+        if attempt > max_recovery_attempts:
+            _log.error("Max recovery attempts reached, not restarting", {"platform": platform.name, "instance_id": instance_id, "attempts": attempt})
+            recovery_in_progress.discard(instance_id)
+            return
+
+        def on_stopped(stop_error: ?Exception):
+            if stop_error is not None:
+                _log.warning("Failed to stop container during recovery", {"platform": platform.name, "instance_id": instance_id, "error": str(stop_error)})
+            _schedule_recovery_attempt(platform, instance_id, reason, attempt)
+
+        container_mgr.stop_container(instance_id, on_stopped)
+
+    def start_device(platform: netclics_config.PlatformConfig):
         """Start a new device instance (only for dynamically managed platforms)"""
         if platform.uses_static_instances():
-            return None
+            return
 
-        instance_id = str(next_instance_id)
-        next_instance_id += 1
+        instance_id = _make_instance_id(platform.name)
 
-        # Create a placeholder device in starting state
-        device = DeviceInstance(
-            auth=auth,
-            log_handler=log_handler,
-            platform_name="dynamic-platform",  # Hardcoded for now
-            platform="dynamic",  # Hardcoded for now
-            schema_registry=schema_registry,
-            container_id=f"starting-{instance_id}",
-            ip_address="pending",
-            netconf_port=830,  # Use default for now
-            ssh_port=22  # Use default for now
-        )
-        device.set_state("starting")
-        instances.append(device)
+        def on_ready(instance_id: str):
+            _log.info("Dynamic device instance initialized", {"platform": platform.name, "instance_id": instance_id})
 
-        return device
+        def on_failed(error_msg: str):
+            _log.error("Failed to start dynamic container", {"platform": platform.name, "instance_id": instance_id, "error": error_msg})
+
+        _start_dynamic_instance(platform, instance_id, on_ready, on_failed)
 
     def initialize_min_instances():
         """Initialize specified instances and start minimum number of container instances for each platform"""
@@ -1843,13 +2058,35 @@ actor DeviceManager(config: netclics_config.SystemConfig, container_mgr: Contain
 
             # Then start minimum container instances if needed
             if not platform.uses_static_instances() and platform.min_instances > 0:
-                current_count = count_instances(platform.name)
+                current_count = count_instances(platform.name) + count_starting_instances(platform.name)
                 to_start = platform.min_instances - current_count
-                for i in range(to_start):
-                    start_device(platform)
+                if to_start > 0:
+                    for i in range(to_start):
+                        start_device(platform)
+
+    def _validate_dynamic_max_not_decreased(new_config: netclics_config.SystemConfig) -> ?str:
+        """Reject config updates that would require dynamic scale-down of max instances."""
+        for current_platform in config_state.platforms:
+            if current_platform.uses_static_instances():
+                continue
+
+            next_platform = new_config.get_platform(current_platform.name)
+            if next_platform is not None and not next_platform.uses_static_instances():
+                old_max = current_platform.max_instances
+                new_max = next_platform.max_instances
+                if new_max < old_max:
+                    _log.warning("Config reload rejected: dynamic max_instances decrease is not supported", {"platform": current_platform.name, "old_max_instances": old_max, "new_max_instances": new_max})
+                    return "Reducing max_instances for dynamic platform %s is not supported yet (current: %s, requested: %s)" % (current_platform.name, str(old_max), str(new_max))
+
+        return None
 
     def apply_config(new_config: netclics_config.SystemConfig, cb: action(?Exception) -> None):
         """Apply configuration changes for static-instance mode"""
+        guard_error = _validate_dynamic_max_not_decreased(new_config)
+        if guard_error is not None:
+            cb(Exception(guard_error))
+            return
+
         for device in instances:
             if device.get_state() == "busy":
                 cb(Exception("Cannot reload configuration while instances are busy"))
@@ -1921,7 +2158,7 @@ actor Director(auth: WorldCap, proc_cap: process.ProcessCap, log_handler: loggin
     _log = logging.Logger(logh)
 
     def set_config(conf: netclics_config.SystemConfig):
-        container_mgr = ContainerManager(proc_cap, log_handler)
+        container_mgr = container_manager.ContainerManager(proc_cap, log_handler)
         dm = DeviceManager(conf, container_mgr, auth, log_handler)
         dm.initialize_min_instances()
         device_manager = dm
@@ -1940,8 +2177,17 @@ actor Director(auth: WorldCap, proc_cap: process.ProcessCap, log_handler: loggin
         dm = device_manager
         if dm is not None:
             _log.info("DeviceManager found, requesting device")
-            device = dm.get_device_for_request(request.platform)
-            if device is not None:
+            platform = dm.get_config().get_platform(request.platform)
+            if platform is not None and not platform.uses_static_instances():
+                is_dynamic_platform = True
+                dynamic_wait_seconds = platform.startup_time_seconds
+                if dynamic_wait_seconds < 0:
+                    dynamic_wait_seconds = 0
+            else:
+                is_dynamic_platform = False
+                dynamic_wait_seconds = 0
+
+            def dispatch_to_device(device: DeviceInstance):
                 _log.info("Device acquired successfully")
 
                 # Validate module_set if specified
@@ -1955,9 +2201,24 @@ actor Director(auth: WorldCap, proc_cap: process.ProcessCap, log_handler: loggin
                 # Dispatch conversion request to the device
                 _log.info("Dispatching conversion request to device")
                 device.convert(request, callback)
-            else:
+
+            def try_get_device(remaining_wait_seconds: int):
+                allow_scaleup = is_dynamic_platform and remaining_wait_seconds == dynamic_wait_seconds
+                device = dm.get_device_for_request(request.platform, allow_scaleup)
+                if device is not None:
+                    dispatch_to_device(device)
+                    return
+
+                if remaining_wait_seconds > 0:
+                    _log.info("No ready device yet, waiting for availability", {"platform": request.platform, "remaining_wait_seconds": remaining_wait_seconds})
+                    after 1.0: try_get_device(remaining_wait_seconds - 1)
+                    return
+
                 _log.error("No device available for platform", {"platform": request.platform})
-                callback(None, Exception("No device available for %s" % request.platform))
+                callback(None, Exception("No ready device available for %s" % request.platform))
+
+            try_get_device(dynamic_wait_seconds)
+            return
         else:
             _log.error("Director not initialized - no DeviceManager")
             callback(None, Exception("Director not initialized"))
@@ -1983,11 +2244,10 @@ actor Director(auth: WorldCap, proc_cap: process.ProcessCap, log_handler: loggin
         dm = device_manager
         if dm is not None:
             config = dm.get_config()
-            instance_info = dm.get_instance_info()
             for platform in config.platforms:
-                # Count current instances - simplified for now
-                total_instances = len(platform.instances) if platform.uses_static_instances() else 0
-                available_instances = total_instances  # Simplified - assume all static instances are ready
+                counts = dm.get_platform_counts(platform.name)
+                total_instances = counts.total + counts.starting
+                available_instances = counts.available
 
                 platform_data = {
                     "name": platform.name,
@@ -2017,6 +2277,7 @@ actor Director(auth: WorldCap, proc_cap: process.ProcessCap, log_handler: loggin
                     # For dynamic platforms, show scaling configuration
                     platform_data["min_instances"] = platform.min_instances
                     platform_data["max_instances"] = platform.max_instances
+                    platform_data["starting_instances"] = counts.starting
 
                 platforms_data.append(platform_data)
         return platforms_data

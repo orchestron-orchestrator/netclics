@@ -5,16 +5,29 @@
       "platform": "junos",
       "container_image": "ghcr.io/orchestron-orchestrator/crpd:24.4R1.9",
       "min_instances": 1,
-      "max_instances": 1,
+      "max_instances": 3,
       "username": "clab",
       "password": "clab@123"
+    },
+    {
+      "name": "iosxrd 24.1.1-dynamic",
+      "platform": "cisco_iosxr",
+      "container_image": "ghcr.io/orchestron-orchestrator/ios-xr/xrd-control-plane:24.1.1",
+      "min_instances": 1,
+      "max_instances": 3,
+      "username": "clab",
+      "password": "clab@123",
+      "module_sets": [
+        "cisco-xr-classic",
+        "cisco-xr-unified-model"
+      ]
     },
     {
       "name": "iosxrd 25.3.1-dynamic",
       "platform": "cisco_iosxr",
       "container_image": "ghcr.io/orchestron-orchestrator/ios-xr/xrd-control-plane:25.3.1",
       "min_instances": 1,
-      "max_instances": 1,
+      "max_instances": 3,
       "username": "clab",
       "password": "clab@123",
       "module_sets": [
@@ -27,7 +40,7 @@
       "platform": "cisco_iosxe",
       "container_image": "ghcr.io/orchestron-orchestrator/vrnetlab/vr-c8000v:17.18.02",
       "min_instances": 1,
-      "max_instances": 1,
+      "max_instances": 3,
       "username": "vrnetlab",
       "password": "VR-netlab9",
       "module_sets": [

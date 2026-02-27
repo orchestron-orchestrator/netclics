@@ -1,0 +1,53 @@
+import container_manager
+import testing
+
+
+actor _test_parse_docker_inspect(t: testing.EnvT):
+    inspect_output = r"""[
+  {
+    "Id": "aabbccddeeff",
+    "Name": "/netclics-iosxrd-1",
+    "State": {
+      "Status": "running",
+      "Running": true,
+      "Health": {
+        "Status": "healthy"
+      }
+    },
+    "NetworkSettings": {
+      "IPAddress": "",
+      "Ports": {
+        "830/tcp": [
+          {
+            "HostIp": "0.0.0.0",
+            "HostPort": "43830"
+          }
+        ],
+        "22/tcp": [
+          {
+            "HostIp": "0.0.0.0",
+            "HostPort": "43022"
+          }
+        ]
+      },
+      "Networks": {
+        "bridge": {
+          "IPAddress": "172.17.0.12"
+        }
+      }
+    }
+  }
+]"""
+
+    try:
+        parsed = container_manager.parse_docker_inspect(inspect_output)
+
+        testing.assertEqual(parsed.state, "running", None)
+        testing.assertEqual(parsed.health, "healthy", None)
+        testing.assertEqual(parsed.ip, "172.17.0.12", None)
+        testing.assertEqual(parsed.netconf_port, u64(43830), None)
+        testing.assertEqual(parsed.ssh_port, u64(43022), None)
+
+        t.success()
+    except Exception as e:
+        t.failure(e)

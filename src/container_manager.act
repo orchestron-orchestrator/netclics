@@ -1,0 +1,358 @@
+import json
+import logging
+import process
+
+
+def _extract_port(ports: dict[str, ?value], port_key: str) -> u64:
+    mapped = ports.get(port_key)
+    if isinstance(mapped, list) and len(mapped) > 0:
+        first = mapped[0]
+        if isinstance(first, dict):
+            host_port = first.get("HostPort")
+            if isinstance(host_port, int):
+                return u64(host_port)
+            if isinstance(host_port, str):
+                if host_port != "":
+                    return u64(host_port)
+    raise ValueError("Missing or invalid docker port mapping for " + port_key)
+
+
+def _extract_primary_ip(network_settings: dict[str, ?value]) -> str:
+    direct_ip = network_settings.get("IPAddress")
+    if isinstance(direct_ip, str) and direct_ip != "":
+        return direct_ip
+
+    networks = network_settings.get("Networks")
+    if isinstance(networks, dict):
+        for _, network_data in networks.items():
+            if isinstance(network_data, dict):
+                ip = network_data.get("IPAddress")
+                if isinstance(ip, str) and ip != "":
+                    return ip
+    return ""
+
+
+def _parse_docker_inspect_entry(first: dict[str, ?value]) -> (ip: str, netconf_port: u64, ssh_port: u64, state: str, health: str):
+    ip = ""
+    state = "unknown"
+    health = "unknown"
+
+    state_data = first.get("State")
+    if isinstance(state_data, dict):
+        status = state_data.get("Status")
+        if isinstance(status, str) and status != "":
+            state = status
+
+        health_data = state_data.get("Health")
+        if isinstance(health_data, dict):
+            health_status = health_data.get("Status")
+            if isinstance(health_status, str) and health_status != "":
+                health = health_status
+
+    network_settings = first.get("NetworkSettings")
+    if isinstance(network_settings, dict):
+        ip = _extract_primary_ip(network_settings)
+
+        ports = network_settings.get("Ports")
+        if isinstance(ports, dict):
+            netconf_port = _extract_port(ports, "830/tcp")
+            ssh_port = _extract_port(ports, "22/tcp")
+            return (ip=ip, netconf_port=netconf_port, ssh_port=ssh_port, state=state, health=health)
+
+        raise ValueError("docker inspect output missing NetworkSettings.Ports")
+
+    raise ValueError("docker inspect output missing NetworkSettings")
+
+
+def parse_docker_inspect(inspect_output: str) -> (ip: str, netconf_port: u64, ssh_port: u64, state: str, health: str):
+    decoded = json.decode_list(inspect_output)
+    if len(decoded) == 0:
+        raise ValueError("docker inspect output must be a non-empty JSON list")
+
+    first = decoded[0]
+    if isinstance(first, dict):
+        return _parse_docker_inspect_entry(first)
+
+    raise ValueError("docker inspect output list must contain objects")
+
+actor ContainerManager(proc_cap: process.ProcessCap, log_handler: logging.Handler):
+    """Manages Docker container lifecycle and metadata"""
+
+    logh = logging.Handler("ContainerManager")
+    logh.set_handler(log_handler)
+    _log = logging.Logger(logh)
+
+    def _remove_container(instance_id: str, cb: action(?Exception) -> None):
+        cmd = ["docker", "rm", "-f", instance_id]
+        _log.info("Removing container", {"instance_id": instance_id})
+
+        def on_exit(p: process.Process, exit_code: int, signal: int, out: bytes, err: bytes):
+            if exit_code == 0:
+                cb(None)
+                return
+
+            stderr = err.decode()
+            if "No such container" in stderr:
+                cb(None)
+                return
+
+            cb(Exception("docker rm failed for {instance_id}: {stderr}"))
+
+        def on_error(p: process.Process, error: str):
+            cb(Exception("Failed to run docker rm for {instance_id}: {error}"))
+
+        process.RunProcess(proc_cap, cmd, on_exit, on_error, None, None)
+
+    def _run_container(run_cmd: list[str], on_started: action() -> None, on_run_failed: action(str) -> None, on_run_error: action(process.Process, str) -> None):
+        def on_exit(p: process.Process, exit_code: int, signal: int, out: bytes, err: bytes):
+            if exit_code == 0:
+                on_started()
+                return
+
+            stderr = err.decode()
+            on_run_failed(stderr)
+
+        def on_error(p: process.Process, error: str):
+            on_run_error(p, error)
+
+        process.RunProcess(proc_cap, run_cmd, on_exit, on_error, None, None)
+
+    def start_container(platform_name: str, instance_id: str, container_image: str, cb: action(?str, ?Exception) -> None):
+        if container_image == "":
+            cb(None, ValueError("container_image must be set"))
+            return
+
+        def start_new_container():
+            lower_platform = platform_name.lower()
+
+            if "crpd" in lower_platform:
+                run_cmd = [
+                    "docker", "run", "-td",
+                    "--name", instance_id,
+                    "--rm",
+                    "--privileged",
+                    "--publish", "830",
+                    "--publish", "22",
+                    "-v", "./test/crpd-startup.conf:/juniper.conf",
+                    "-v", "./router-licenses/juniper_crpd24.lic:/config/license/juniper_crpd24.lic",
+                    container_image
+                ]
+                init_cmd = [
+                    "docker", "exec", instance_id,
+                    "cli", "-c", "configure private; load merge /juniper.conf; commit"
+                ]
+                ready_message = "Server listening on unix:/var/run/japi_na-grpcd"
+                ready_poll_interval = 1.0
+                ready_max_attempts = 60
+
+                _log.info("Starting CRPD container", {"instance_id": instance_id, "platform": platform_name})
+                _log.debug("Running command", {"command": " ".join(run_cmd)})
+
+                def on_init_exit(p: process.Process, exit_code: int, signal: int, out: bytes, err: bytes):
+                    if exit_code == 0:
+                        cb(instance_id, None)
+                    else:
+                        stderr = err.decode()
+                        cb(None, Exception("docker exec startup command failed for {instance_id}: {stderr}"))
+
+                def on_init_error(p: process.Process, error: str):
+                    cb(None, Exception("Failed to initialize CRPD startup config for {instance_id}: {error}"))
+
+                def on_run_error(p: process.Process, error: str):
+                    cb(None, Exception("Failed to run docker container for {instance_id}: {error}"))
+
+                def wait_for_crpd_ready(attempt: int):
+                    if attempt >= ready_max_attempts:
+                        cb(None, Exception("Timed out waiting for cRPD mgmt daemon readiness for {instance_id}"))
+                        return
+
+                    log_cmd = ["docker", "logs", "--tail", "200", instance_id]
+
+                    def on_logs_exit(p: process.Process, exit_code: int, signal: int, out: bytes, err: bytes):
+                        if exit_code != 0:
+                            stderr = err.decode()
+                            _log.debug("docker logs failed while waiting for cRPD readiness", {"instance_id": instance_id, "attempt": attempt, "stderr": stderr})
+                            after ready_poll_interval: wait_for_crpd_ready(attempt + 1)
+                            return
+
+                        output = out.decode()
+                        if ready_message in output:
+                            _log.info("cRPD mgmt daemon ready", {"instance_id": instance_id, "attempt": attempt})
+                            process.RunProcess(proc_cap, init_cmd, on_init_exit, on_init_error, None, None)
+                            return
+
+                        _log.debug("cRPD mgmt daemon not ready yet", {"instance_id": instance_id, "attempt": attempt})
+                        after ready_poll_interval: wait_for_crpd_ready(attempt + 1)
+
+                    def on_logs_error(p: process.Process, error: str):
+                        _log.debug("Failed to read cRPD logs while waiting for readiness", {"instance_id": instance_id, "attempt": attempt, "error": error})
+                        after ready_poll_interval: wait_for_crpd_ready(attempt + 1)
+
+                    process.RunProcess(proc_cap, log_cmd, on_logs_exit, on_logs_error, None, None)
+
+                def on_started():
+                    _log.debug("Container started; waiting for cRPD mgmt daemon readiness", {"instance_id": instance_id, "message": ready_message})
+                    wait_for_crpd_ready(0)
+
+                def on_run_failed(stderr: str):
+                    cb(None, Exception("docker run failed for {instance_id}: {stderr}"))
+
+                _run_container(run_cmd, on_started, on_run_failed, on_run_error)
+                return
+
+            if "xrd" in lower_platform or "iosxr" in lower_platform:
+                xr_interfaces = []
+                for port in range(24):
+                    xr_interfaces.append(f"linux:Gi0-0-0-{port},xr_name=Gi0/0/0/{port}")
+
+                run_cmd = [
+                    "docker", "run", "-td",
+                    "--name", instance_id,
+                    "--rm",
+                    "--privileged",
+                    "--publish", "830",
+                    "--publish", "22",
+                    "-v", "./test/xrd-startup.conf:/etc/xrd/first-boot.cfg",
+                    "--env", "XR_FIRST_BOOT_CONFIG=/etc/xrd/first-boot.cfg",
+                    "--env", "XR_MGMT_INTERFACES=linux:eth0,xr_name=Mg0/RP0/CPU0/0,chksum,snoop_v4,snoop_v4_default_route,snoop_v6,snoop_v6_default_route",
+                    "--env", "XR_INTERFACES=" + ";".join(xr_interfaces),
+                    container_image
+                ]
+
+                _log.info("Starting IOS XRd container", {"instance_id": instance_id, "platform": platform_name})
+                _log.debug("Running command", {"command": " ".join(run_cmd)})
+
+                def add_dummy_interface(port: int):
+                    if port >= 24:
+                        cb(instance_id, None)
+                        return
+
+                    iface_name = f"Gi0-0-0-{port}"
+                    add_cmd = [
+                        "docker", "exec", instance_id,
+                        "ip", "link", "add", iface_name, "type", "dummy"
+                    ]
+
+                    def on_add_exit(p: process.Process, exit_code: int, signal: int, out: bytes, err: bytes):
+                        if exit_code == 0:
+                            add_dummy_interface(port + 1)
+                        else:
+                            stderr = err.decode()
+                            cb(None, Exception("docker exec failed while adding {iface_name} on {instance_id}: {stderr}"))
+
+                    def on_add_error(p: process.Process, error: str):
+                        cb(None, Exception("Failed to add {iface_name} interface on {instance_id}: {error}"))
+
+                    process.RunProcess(proc_cap, add_cmd, on_add_exit, on_add_error, None, None)
+
+                def on_run_error(p: process.Process, error: str):
+                    cb(None, Exception("Failed to run IOS XRd container for {instance_id}: {error}"))
+
+                def on_started():
+                    _log.debug("IOS XRd container started, creating dummy interfaces", {"instance_id": instance_id})
+                    after 1.0: add_dummy_interface(0)
+
+                def on_run_failed(stderr: str):
+                    cb(None, Exception("docker run failed for {instance_id}: {stderr}"))
+
+                _run_container(run_cmd, on_started, on_run_failed, on_run_error)
+                return
+
+            if "iosxe" in lower_platform or "ios xe" in lower_platform:
+                run_cmd = [
+                    "docker", "run", "-td",
+                    "--name", instance_id,
+                    "--rm",
+                    "--privileged",
+                    "--publish", "830",
+                    "--publish", "22",
+                    container_image,
+                    "--trace"
+                ]
+
+                _log.info("Starting IOS XE container", {"instance_id": instance_id, "platform": platform_name})
+                _log.debug("Running command", {"command": " ".join(run_cmd)})
+
+                def on_run_error(p: process.Process, error: str):
+                    cb(None, Exception("Failed to run IOS XE container for {instance_id}: {error}"))
+
+                def on_started():
+                    cb(instance_id, None)
+
+                def on_run_failed(stderr: str):
+                    cb(None, Exception("docker run failed for {instance_id}: {stderr}"))
+
+                _run_container(run_cmd, on_started, on_run_failed, on_run_error)
+                return
+
+            cb(None, ValueError("Unsupported platform startup flow: " + platform_name))
+
+        _log.debug("Checking for existing container", {"instance_id": instance_id})
+
+        def on_inspected(inspect_info: ?(ip: str, netconf_port: u64, ssh_port: u64, state: str, health: str), inspect_error: ?Exception, inspected_id: str):
+            if inspect_error is not None:
+                error_text = str(inspect_error).lower()
+                if ("no such" in error_text) or ("not found" in error_text):
+                    start_new_container()
+                    return
+
+                cb(None, inspect_error)
+                return
+
+            elif inspect_info is not None:
+                state = inspect_info.state
+                if state == "running":
+                    _log.info("Reusing existing container", {"instance_id": instance_id, "platform": platform_name, "state": state})
+                    cb(instance_id, None)
+                    return
+
+                _log.warning("Existing container not running; removing", {"instance_id": instance_id, "platform": platform_name, "state": state})
+
+                def on_removed(remove_error: ?Exception):
+                    if remove_error is None:
+                        start_new_container()
+                    else:
+                        cb(None, remove_error)
+
+                _remove_container(instance_id, on_removed)
+                return
+            cb(None, Exception("docker inspect returned no data for {instance_id}"))
+
+        inspect_container(instance_id, on_inspected)
+
+    def inspect_container(instance_id: str, cb: action(?(ip: str, netconf_port: u64, ssh_port: u64, state: str, health: str), ?Exception, str) -> None):
+        cmd = ["docker", "inspect", instance_id]
+        _log.debug("Inspecting container", {"instance_id": instance_id, "command": " ".join(cmd)})
+
+        def on_exit(p: process.Process, exit_code: int, signal: int, out: bytes, err: bytes):
+            if exit_code != 0:
+                stderr = err.decode()
+                cb(None, Exception("docker inspect failed for {instance_id}: {stderr}"), instance_id)
+                return
+
+            try:
+                inspect_data = parse_docker_inspect(out.decode())
+                cb(inspect_data, None, instance_id)
+            except Exception as e:
+                cb(None, e, instance_id)
+
+        def on_error(p: process.Process, error: str):
+            cb(None, Exception("Failed to run docker inspect for {instance_id}: {error}"), instance_id)
+
+        process.RunProcess(proc_cap, cmd, on_exit, on_error, None, None)
+
+    def stop_container(instance_id: str, cb: action(?Exception) -> None):
+        cmd = ["docker", "stop", instance_id]
+        _log.info("Stopping container", {"instance_id": instance_id})
+
+        def on_exit(p: process.Process, exit_code: int, signal: int, out: bytes, err: bytes):
+            if exit_code == 0:
+                cb(None)
+            else:
+                stderr = err.decode()
+                cb(Exception("docker stop failed for {instance_id}: {stderr}"))
+
+        def on_error(p: process.Process, error: str):
+            cb(Exception("Failed to run docker stop for {instance_id}: {error}"))
+
+        process.RunProcess(proc_cap, cmd, on_exit, on_error, None, None)
