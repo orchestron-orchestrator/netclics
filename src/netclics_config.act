@@ -1,7 +1,9 @@
 import file
 import json
+import logging
 
 DEFAULT_CONFIG_PATH = "config/netclics.json"
+DEFAULT_CONFIG_RELOAD_POLL_SECONDS = 2.0
 
 class InstanceSpec(object):
     """Specification for a static instance (physical device, VM, or pre-existing container)"""
@@ -206,11 +208,52 @@ def parse_system_config(data: dict[str, ?value]) -> SystemConfig:
     raise ValueError("Config must contain 'platforms' list")
 
 
-def load_config_from_file(read_cap: file.ReadFileCap, path: str) -> SystemConfig:
-    reader = file.ReadFile(read_cap, path)
-    raw = reader.read()
-    reader.close()
-    decoded = json.decode(raw.decode())
-    if isinstance(decoded, dict):
-        return parse_system_config(decoded)
-    raise ValueError("Config file must be a JSON object")
+actor ConfigChangeWatcher(read_cap: file.ReadFileCap,
+                          config_path: str,
+                          reload_config_fn: action(SystemConfig, action(?Exception) -> None) -> None,
+                          log_handler: logging.Handler,
+                          poll_interval_seconds: float = DEFAULT_CONFIG_RELOAD_POLL_SECONDS):
+    """
+    Poll config file for changes and trigger reloads.
+    TODO: switch to inotify when Acton supports it.
+    """
+    logh = logging.Handler("ConfigChangeWatcher")
+    logh.set_handler(log_handler)
+    _log = logging.Logger(logh)
+
+    var last_snapshot: ?str = None
+
+    def _poll():
+        current_text = ""
+        try:
+            reader = file.ReadFile(read_cap, config_path)
+            raw = reader.read()
+            reader.close()
+            current_text = raw.decode()
+        except Exception as e:
+            _log.warning("Failed to read config file while polling", {"path": config_path, "error": str(e)})
+            after poll_interval_seconds: _poll()
+            return
+
+        if last_snapshot != current_text:
+            _log.info("Detected config file change", {"path": config_path})
+            last_snapshot = current_text
+
+            try:
+                decoded = json.decode(current_text)
+                new_config = parse_system_config(decoded)
+            except Exception as e:
+                _log.error("Config file changed but decode failed", {"path": config_path, "error": str(e)})
+            else:
+                def on_reload_done(error: ?Exception):
+                    if error is None:
+                        _log.info("Reloaded configuration after file change", {"path": config_path})
+                    else:
+                        _log.error("Failed to reload configuration after file change", {"path": config_path, "error": str(error)})
+
+                reload_config_fn(new_config, on_reload_done)
+
+        after poll_interval_seconds: _poll()
+
+    _log.info("Starting config change watcher", {"path": config_path, "poll_interval_seconds": poll_interval_seconds})
+    _poll()

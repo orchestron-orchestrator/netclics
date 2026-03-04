@@ -2157,18 +2157,13 @@ actor Director(auth: WorldCap, proc_cap: process.ProcessCap, log_handler: loggin
     logh.set_handler(log_handler)
     _log = logging.Logger(logh)
 
-    def set_config(conf: netclics_config.SystemConfig):
-        container_mgr = container_manager.ContainerManager(proc_cap, log_handler)
-        dm = DeviceManager(conf, container_mgr, auth, log_handler)
-        dm.initialize_min_instances()
-        device_manager = dm
-        _log.info("Director initialized")
-
-    def reload_config(conf: netclics_config.SystemConfig, cb: action(?Exception) -> None):
+    def set_config(conf: netclics_config.SystemConfig, cb: action(?Exception) -> None):
+        if device_manager is None:
+            container_mgr = container_manager.ContainerManager(proc_cap, log_handler)
+            device_manager = DeviceManager(conf, container_mgr, auth, log_handler)
+            _log.info("Director initialized")
         if device_manager is not None:
             device_manager.apply_config(conf, cb)
-            return
-        cb(Exception("Director not initialized"))
 
     def convert(request: ConvertRequest, callback: action(?(base_config: str, steps: list[(input: str, config: str, diff: str)]), ?Exception) -> None):
         """Process a conversion request"""
@@ -2743,26 +2738,6 @@ actor WebServ(listen_cap: net.TCPListenCap, http_port: ?int, director, log_handl
                 error_dict = {"success": False, "error": str(e)}
                 error_str = json.encode(error_dict)
                 respond(400, {"Content-Type": "application/json"}, error_str)
-        # POST /api/v1/config/reload - Reload configuration from disk
-        elif request.path == "/api/v1/config/reload" and request.method == "POST":
-            def on_reload_done(error: ?Exception):
-                if error is None:
-                    response = {"success": True}
-                    respond(200, {"Content-Type": "application/json"}, json.encode(response))
-                else:
-                    response = {"success": False, "error": str(error)}
-                    respond(500, {"Content-Type": "application/json"}, json.encode(response))
-
-            _log.info("Reloading configuration from disk", {"path": config_path})
-            try:
-                new_config = netclics_config.load_config_from_file(read_cap, config_path)
-            except Exception as e:
-                error_dict = {"success": False, "error": str(e)}
-                error_str = json.encode(error_dict)
-                respond(400, {"Content-Type": "application/json"}, error_str)
-                return
-            else:
-                director.reload_config(new_config, on_reload_done)
         # GET /api/v1/instances - List all running instances
         elif request.path == "/api/v1/instances" and request.method == "GET":
             # Get actual instances from director
@@ -2889,16 +2864,9 @@ actor main(env: Env):
     tls_cert_path = args.get_str("tls-cert")
     tls_key_path = args.get_str("tls-key")
 
-    # Load configuration
     file_cap = file.FileCap(env.cap)
     read_cap = file.ReadFileCap(file_cap)
-    maybe_config: ?netclics_config.SystemConfig = None
-    try:
-        maybe_config = netclics_config.load_config_from_file(read_cap, config_path)
-    except Exception as e:
-        print(f"ERROR: Failed to load config file {config_path}: {str(e)}", err=True)
-        env.exit(1)
-    config = expect(maybe_config, "loaded config")
+
     # Create logging handler
     log_handler = logging.Handler(None)
     log_handler.add_sink(logging.StdoutSink())
@@ -2928,10 +2896,10 @@ actor main(env: Env):
             print("ERROR: HTTPS port {https_port} configured but --tls-cert and --tls-key were not both provided", err=True)
             env.exit(1)
 
-    _log.info("Loaded platform configurations", {"platform_count": len(config.platforms), "config_path": config_path})
+    _log.info("Configuration file watcher will bootstrap and reload config", {"config_path": config_path})
 
     director = Director(env.cap, proc_cap, log_handler)
-    director.set_config(config)
+    config_change_watcher = netclics_config.ConfigChangeWatcher(read_cap, config_path, director.set_config, log_handler)
     webs = WebServ(listen_cap, http_port if http_port > 0 else None, director, log_handler, config_path, read_cap, https_port if https_port > 0 else None, tls_cert_pem, tls_key_pem)
     if https_port is not None and tls_cert_pem is not None and tls_key_pem is not None:
         _log.info("NETCLICS started", {"http_port": http_port, "https_port": https_port})
