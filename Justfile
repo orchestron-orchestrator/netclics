@@ -34,7 +34,7 @@ NETCLICS_BASE_URL := env_var_or_default("NETCLICS_BASE_URL", "http://localhost:8
 NETCLICS_CURL_OPTS := env_var_or_default("NETCLICS_CURL_OPTS", "-k")
 # Default platform names for tests (override with env vars if needed).
 CRPD_PLATFORM := env_var_or_default("CRPD_PLATFORM", "crpd 24.4R1.9-dynamic")
-IOSXRD_PLATFORM := env_var_or_default("IOSXRD_PLATFORM", "iosxrd 24.3.1-dynamic")
+IOSXRD_PLATFORM := env_var_or_default("IOSXRD_PLATFORM", "iosxrd 25.3.1-dynamic")
 IOSXE_PLATFORM := env_var_or_default("IOSXE_PLATFORM", "iosxe 17.18.02-dynamic")
 
 start-static-instances-crpd:
