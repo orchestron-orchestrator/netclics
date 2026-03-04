@@ -27,14 +27,4 @@ Use a different file with:
 out/bin/netclics --config /path/to/netclics.json
 ```
 
-After editing the config file, reload it without restarting:
-
-```bash
-curl -s -X POST http://localhost:8080/api/v1/config/reload | jq .
-```
-
-Or with Just:
-
-```bash
-just reload-config
-```
+After editing the config file, save it and it will be automatically reloaded.
