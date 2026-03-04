@@ -17,6 +17,7 @@ import yang.xml
 import container_manager
 import schema_filter
 import netclics_config
+import static_files
 
 
 # Constant for the wildcard (all modules) default module-set
@@ -2676,7 +2677,7 @@ actor MCPServer(convert_fn: action(ConvertRequest, action(?(base_config: str, st
             _send_error_response(request_id, MCP_INTERNAL_ERROR, str(e), respond, "list_instances")
 
 actor WebServ(listen_cap: net.TCPListenCap, http_port: ?int, director, log_handler: logging.Handler,
-              config_path: str, read_cap: file.ReadFileCap,
+              config_path: str, read_cap: file.ReadFileCap, static_file_server: ?static_files.StaticFileServer = None,
               https_port: ?int = None, tls_cert_pem: ?bytes = None, tls_key_pem: ?bytes = None):
     logh = logging.Handler("WebServ")
     logh.set_handler(log_handler)
@@ -2792,6 +2793,13 @@ actor WebServ(listen_cap: net.TCPListenCap, http_port: ?int, director, log_handl
                 respond(200, {"Content-Type": "application/json"}, response_json)
 
         else:
+            _static_file_server = static_file_server
+            if _static_file_server is not None:
+                static_response = _static_file_server.maybe_serve(request.method, request.path)
+                if static_response is not None:
+                    status_code, headers, body = static_response
+                    respond(status_code, headers, body)
+                    return
             respond(404, {"Content-Type": "application/json"}, json.encode({"error": "Not found"}))
 
     def _on_http_server_request(server, request, respond):
@@ -2842,6 +2850,7 @@ actor main(env: Env):
         p.add_option("http-port", "int", default=8080, help="HTTP listen port (set to 0 to disable)")
         p.add_option("https-port", "int", default=0, help="HTTPS listen port (set to 0 to disable)")
         p.add_option("config", "str", default=netclics_config.DEFAULT_CONFIG_PATH, help="Path to config JSON file")
+        p.add_option("static-dir", "str", default="", help="Directory to serve static files from (disabled when empty)")
         p.add_option("tls-cert", "str", default="", help="Path to TLS certificate PEM file")
         p.add_option("tls-key", "str", default="", help="Path to TLS private key PEM file")
         return p.parse(env.argv)
@@ -2861,6 +2870,7 @@ actor main(env: Env):
     http_port = args.get_int("http-port")
     https_port = args.get_int("https-port")
     config_path = args.get_str("config")
+    static_dir = args.get_str("static-dir")
     tls_cert_path = args.get_str("tls-cert")
     tls_key_path = args.get_str("tls-key")
 
@@ -2896,11 +2906,21 @@ actor main(env: Env):
             print("ERROR: HTTPS port {https_port} configured but --tls-cert and --tls-key were not both provided", err=True)
             env.exit(1)
 
+    static_file_server: ?static_files.StaticFileServer = None
+    if static_dir != "":
+        try:
+            initialized_static_server = static_files.StaticFileServer(file_cap, read_cap, static_dir)
+            static_file_server = initialized_static_server
+            _log.info("Enabled static file serving", {"directory": initialized_static_server.get_root_dir()})
+        except Exception as e:
+            print("ERROR: Failed to initialize static directory {static_dir}: {str(e)}", err=True)
+            env.exit(1)
+
     _log.info("Configuration file watcher will bootstrap and reload config", {"config_path": config_path})
 
     director = Director(env.cap, proc_cap, log_handler)
     config_change_watcher = netclics_config.ConfigChangeWatcher(read_cap, config_path, director.set_config, log_handler)
-    webs = WebServ(listen_cap, http_port if http_port > 0 else None, director, log_handler, config_path, read_cap, https_port if https_port > 0 else None, tls_cert_pem, tls_key_pem)
+    webs = WebServ(listen_cap, http_port if http_port > 0 else None, director, log_handler, config_path, read_cap, static_file_server, https_port if https_port > 0 else None, tls_cert_pem, tls_key_pem)
     if https_port is not None and tls_cert_pem is not None and tls_key_pem is not None:
         _log.info("NETCLICS started", {"http_port": http_port, "https_port": https_port})
     else:
