@@ -782,12 +782,7 @@ actor DeviceInstance(auth: WorldCap, log_handler: logging.Handler, platform_name
             elif target_format == "acton-gdata":
                 return gdata.prsrc()
             elif target_format == "acton-adata":
-                compiled_schema, error = get_compiled_schema(request.module_set)
-                if compiled_schema is not None:
-                    return yang.data.pradata(compiled_schema, gdata, loose=True, self_name="dev")
-                else:
-                    _log.warning("No compiled schema for adata conversion, using gdata", {"error": compiled_schema})
-                    return gdata.prsrc()
+                return _format_adata_with_paths(gdata, request.module_set, "adata conversion")
             elif target_format in ["netconf", "xml"]:
                 return gdata.to_xmlstr(pretty=True)
             else:
@@ -1391,6 +1386,22 @@ actor DeviceInstance(auth: WorldCap, log_handler: logging.Handler, platform_name
 
         _get_or_create_cli_client(on_client_success, on_client_error)
 
+    def _format_adata_with_paths(gdata: yang.gdata.Node, module_set: str, context: str) -> str:
+        """Format gdata as adata and append touched schema paths as comments."""
+        compiled_schema, error = get_compiled_schema(module_set)
+        if compiled_schema is not None:
+            adata_output = yang.data.pradata(compiled_schema, gdata, loose=True, self_name="dev")
+            touched_paths = yang.data.prpaths(compiled_schema, gdata)
+            if len(touched_paths) == 0:
+                return adata_output
+
+            path_lines = "\n".join(["#     {repr(p)}," for p in touched_paths])
+            touched_paths_repr = "\n\n# touched schema paths:\n# [\n{path_lines}\n# ]"
+            return adata_output + touched_paths_repr
+        else:
+            _log.warning("No compiled schema for {context}, using gdata", {"module_set": module_set, "error": error})
+            return gdata.prsrc()
+
     def _compute_gdata_diff(base_gdata: yang.gdata.Node, final_gdata: yang.gdata.Node, target_format: str, module_set: str) -> str:
         """Compute diff between base and final gdata configs"""
         try:
@@ -1404,13 +1415,7 @@ actor DeviceInstance(auth: WorldCap, log_handler: logging.Handler, platform_name
                 elif target_format == "acton-gdata":
                     return diff_result.prsrc()
                 elif target_format == "acton-adata":
-                    # Convert diff to adata format if schema is available
-                    compiled_schema, error = get_compiled_schema(module_set)
-                    if compiled_schema is not None:
-                        return yang.data.pradata(compiled_schema, diff_result, loose=True, self_name="dev")
-                    else:
-                        _log.warning("No compiled schema for adata diff conversion, using prsrc", {"error": error})
-                        return diff_result.prsrc()
+                    return _format_adata_with_paths(diff_result, module_set, "adata diff conversion")
                 elif target_format in ["netconf", "xml"]:
                     # For XML formats, return the diff as XML string
                     return diff_result.to_xmlstr()

@@ -13,8 +13,8 @@ dependencies = {
     ),
     "yang": (
         repo_url="https://github.com/orchestron-orchestrator/acton-yang.git",
-        url="https://github.com/orchestron-orchestrator/acton-yang/archive/f0ee31fcf61754d9fa6d0872149b3433137d00a1.zip",
-        hash="N-V-__8AAJ4_IQDRHd4-0vQoIL4cYmBTNi7_mkF69Y3ICfbR"
+        url="https://github.com/orchestron-orchestrator/acton-yang/archive/b444b487bea788d19856013513535ce6ccb31489.zip",
+        hash="N-V-__8AAGmQIQCkqJ3Lyo8FM3DAiVsZYJAQTcZnSmLGP-aP"
     )
 }
 zig_dependencies = {}
