@@ -1,6 +1,11 @@
 name = "netclics"
 fingerprint = 0x86c6ec1ee3cbaa48
 dependencies = {
+    "http_router": (
+        repo_url="https://github.com/stratoweave/http-router.git",
+        url="https://github.com/stratoweave/http-router/archive/45dc24a88b0849289b1653abacbd066982548372.zip",
+        hash="N-V-__8AAI2FAAA27_BvAysIDu88hX9mPSgZkbdwcIqDWJje"
+    ),
     "netcli": (
         repo_url="https://github.com/orchestron-orchestrator/netcli.git",
         url="https://github.com/orchestron-orchestrator/netcli/archive/075a18a9b13519b42eb2465d45f0fc07589805bf.zip",

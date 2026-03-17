@@ -19,13 +19,26 @@ Notes:
 
 ## Static file server, ACME HTTP-01 challenge
 
-To serve static files for non-API GET paths:
+To serve static files under an explicit URL prefix:
 
 ```bash
 out/bin/netclics --static-dir /path/to/public_html
 ```
 
-This is also useful for integrating NETCLICS with [certbot](https://certbot.eff.org). If you configure certbot to use the same web root using the option `--webroot /path/to/public_html`, then it will automatically create the `/.well-known/token/...` response for the HTTP-01 challenge.
+By default, NETCLICS serves that directory under `/static/...`. Use `--static-prefix` to change the mount point:
+
+```bash
+out/bin/netclics --static-dir /path/to/public_html --static-prefix /assets
+```
+
+This is also useful for integrating NETCLICS with [certbot](https://certbot.eff.org). Configure NETCLICS and certbot to use the same web root:
+
+```bash
+out/bin/netclics --static-dir /path/to/public_html --static-prefix /.well-known
+certbot certonly --webroot -w /path/to/public_html ...
+```
+
+Certbot will then create files under `/path/to/public_html/.well-known/...`, and NETCLICS will serve them at `/.well-known/...`.
 
 ## Configuration File
 

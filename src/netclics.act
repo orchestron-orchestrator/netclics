@@ -1,6 +1,7 @@
 import argparse
 import file
 import http
+import http_router
 import json
 import logging
 import net
@@ -2388,14 +2389,14 @@ actor MCPServer(convert_fn: action(ConvertRequest, action(?(base_config: str, st
 
     # Helper Functions for Response Handling
 
-    def _send_success_response(request_id: ?value, result: ?value, respond: action(int, dict[str, str], str) -> None, context: str):
+    def _send_success_response(request_id: ?value, result: ?value, respond: proc(int, dict[str, str], str) -> None, context: str):
         """Send a successful MCP response with logging"""
         response = MCPResponse(request_id, result, None)
         response_json = json.encode(response.to_dict())
         _log.debug("MCP {context} response", {"context": context, "response": response_json})
         respond(200, {"Content-Type": "application/json"}, response_json)
 
-    def _send_error_response(request_id: ?value, error_code: int, error_msg: str, respond: action(int, dict[str, str], str) -> None, context: str):
+    def _send_error_response(request_id: ?value, error_code: int, error_msg: str, respond: proc(int, dict[str, str], str) -> None, context: str):
         """Send an error MCP response with logging"""
         error = MCPError(error_code, error_msg)
         response = MCPResponse(request_id, None, error)
@@ -2421,7 +2422,7 @@ actor MCPServer(convert_fn: action(ConvertRequest, action(?(base_config: str, st
             return val
         return None
 
-    def handle_initialize(request, respond: action(int, dict[str, str], str) -> None):
+    def handle_initialize(request, respond: proc(int, dict[str, str], str) -> None):
         """Handle MCP initialize request"""
         try:
             body_str = request.body.decode()
@@ -2458,7 +2459,7 @@ actor MCPServer(convert_fn: action(ConvertRequest, action(?(base_config: str, st
             _log.error("MCP initialize error", {"error": str(e)})
             _send_error_response(None, MCP_INTERNAL_ERROR, str(e), respond, "initialize")
 
-    def handle_tools_list(request, respond: action(int, dict[str, str], str) -> None):
+    def handle_tools_list(request, respond: proc(int, dict[str, str], str) -> None):
         """Handle MCP tools/list request"""
         try:
             body_str = request.body.decode()
@@ -2505,7 +2506,7 @@ actor MCPServer(convert_fn: action(ConvertRequest, action(?(base_config: str, st
             _log.error("MCP tools/list error", {"error": str(e)})
             _send_error_response(None, MCP_INTERNAL_ERROR, str(e), respond, "tools/list")
 
-    def handle_tools_call(request, respond: action(int, dict[str, str], str) -> None):
+    def handle_tools_call(request, respond: proc(int, dict[str, str], str) -> None):
         """Handle MCP tools/call request"""
         try:
             body_str = request.body.decode()
@@ -2534,7 +2535,7 @@ actor MCPServer(convert_fn: action(ConvertRequest, action(?(base_config: str, st
             _log.error("MCP tools/call error", {"error": str(e)})
             _send_error_response(None, MCP_INTERNAL_ERROR, str(e), respond, "tools/call")
 
-    def _handle_convert_config(request_id: ?value, args: dict[str, ?value], respond: action(int, dict[str, str], str) -> None):
+    def _handle_convert_config(request_id: ?value, args: dict[str, ?value], respond: proc(int, dict[str, str], str) -> None):
         """Handle MCP convert_config tool call"""
 
         try:
@@ -2603,7 +2604,7 @@ actor MCPServer(convert_fn: action(ConvertRequest, action(?(base_config: str, st
         except Exception as e:
             _send_error_response(request_id, MCP_INTERNAL_ERROR, str(e), respond, "convert_config")
 
-    def _handle_list_platforms(request_id: ?value, respond: action(int, dict[str, str], str) -> None):
+    def _handle_list_platforms(request_id: ?value, respond: proc(int, dict[str, str], str) -> None):
         """Handle MCP list_platforms tool call"""
         _log.debug("MCP list_platforms called")
         try:
@@ -2632,7 +2633,7 @@ actor MCPServer(convert_fn: action(ConvertRequest, action(?(base_config: str, st
         except Exception as e:
             _send_error_response(request_id, MCP_INTERNAL_ERROR, str(e), respond, "list_platforms")
 
-    def _handle_list_instances(request_id: ?value, respond: action(int, dict[str, str], str) -> None):
+    def _handle_list_instances(request_id: ?value, respond: proc(int, dict[str, str], str) -> None):
         """Handle MCP list_instances tool call"""
         _log.debug("MCP list_instances called")
         try:
@@ -2683,7 +2684,8 @@ actor MCPServer(convert_fn: action(ConvertRequest, action(?(base_config: str, st
 
 actor WebServ(listen_cap: net.TCPListenCap, http_port: ?int, director, log_handler: logging.Handler,
               config_path: str, read_cap: file.ReadFileCap, static_file_server: ?static_files.StaticFileServer = None,
-              https_port: ?int = None, tls_cert_pem: ?bytes = None, tls_key_pem: ?bytes = None):
+              static_mount_prefix: str = "/static", https_port: ?int = None,
+              tls_cert_pem: ?bytes = None, tls_key_pem: ?bytes = None):
     logh = logging.Handler("WebServ")
     logh.set_handler(log_handler)
     _log = logging.Logger(logh)
@@ -2691,127 +2693,142 @@ actor WebServ(listen_cap: net.TCPListenCap, http_port: ?int, director, log_handl
     # Create MCP server instance
     mcp = MCPServer(director.convert, director.get_platforms, director.get_instances, log_handler)
 
+    def _handle_convert(ctx: http_router.Context, respond: proc(int, dict[str, str], str) -> None):
+        _log.info("Processing conversion request")
+        try:
+            body_str = ctx.request.body.decode()
+            _log.debug("Request body", {"body": body_str})
+            body_dict = json.decode(body_str)
+            _log.debug("Parsed JSON", {"body_dict": str(body_dict)})
+
+            convert_req = ConvertRequest.from_json(body_dict)
+            _log.info("ConvertRequest created", {"input_format": convert_req.format, "output_format": convert_req.target_format, "platform": convert_req.platform})
+
+            def on_conversion_done(result: ?(base_config: str, steps: list[(input: str, config: str, diff: str)]), error: ?Exception):
+                _log.debug("Conversion completed, preparing HTTP response")
+                if error is None and result is not None:
+                    _log.info("Conversion successful")
+                    steps = [{"input": step.input, "config": step.config, "diff": step.diff} for step in result.steps]
+                    response = {
+                        "success": True,
+                        "base_config": result.base_config,
+                        "steps": steps,
+                        "platform": convert_req.platform,
+                        "platform_version": "1.0"
+                    }
+                else:
+                    error_msg = str(error) if error is not None else "Conversion failed"
+                    _log.error("Conversion failed", {"error": error_msg})
+                    response = {
+                        "success": False,
+                        "error": error_msg,
+                        "platform": convert_req.platform
+                    }
+                response_str = json.encode(response)
+                _log.debug("Sending HTTP response", {"response_length": len(response_str)})
+                respond(200, {"Content-Type": "application/json"}, response_str)
+
+            director.convert(convert_req, on_conversion_done)
+        except Exception as e:
+            error_dict = {"success": False, "error": str(e)}
+            error_str = json.encode(error_dict)
+            respond(400, {"Content-Type": "application/json"}, error_str)
+
+    def _handle_instances(ctx: http_router.Context, respond: proc(int, dict[str, str], str) -> None):
+        instances_data = director.get_instances()
+        response = {
+            "instances": instances_data,
+            "total": len(instances_data)
+        }
+        respond(200, {"Content-Type": "application/json"}, json.encode(response))
+
+    def _handle_platforms(ctx: http_router.Context, respond: proc(int, dict[str, str], str) -> None):
+        platforms_data = director.get_platforms()
+        response = {
+            "platforms": platforms_data,
+            "total": len(platforms_data)
+        }
+        respond(200, {"Content-Type": "application/json"}, json.encode(response))
+
+    def _handle_mcp(ctx: http_router.Context, respond: proc(int, dict[str, str], str) -> None):
+        try:
+            body_str = ctx.request.body.decode()
+            _log.debug("MCP request received", {"body": body_str})
+            body_dict = json.decode(body_str)
+            method = _get_str(body_dict, "method")
+            _log.debug("MCP method", {"method": method})
+
+            if method == "initialize":
+                mcp.handle_initialize(ctx.request, respond)
+            elif method == "tools/list":
+                mcp.handle_tools_list(ctx.request, respond)
+            elif method == "tools/call":
+                mcp.handle_tools_call(ctx.request, respond)
+            else:
+                _log.warning("Unknown MCP method", {"method": method})
+                error = MCPError(MCP_METHOD_NOT_FOUND, "Unknown method: " + str(method))
+                response = MCPResponse(body_dict.get("id"), None, error)
+                response_json = json.encode(response.to_dict())
+                _log.debug("MCP unknown method response", {"response": response_json})
+                respond(200, {"Content-Type": "application/json"}, response_json)
+        except Exception as e:
+            _log.error("MCP routing error", {"error": str(e)})
+            error = MCPError(MCP_INTERNAL_ERROR, str(e))
+            response = MCPResponse(None, None, error)
+            response_json = json.encode(response.to_dict())
+            _log.debug("MCP routing error response", {"response": response_json})
+            respond(200, {"Content-Type": "application/json"}, response_json)
+
+    def _handle_static(ctx: http_router.Context, respond: proc(int, dict[str, str], str) -> None):
+        try:
+            _static_file_server = expect(static_file_server, "WebServ.static_file_server")
+            static_response = _static_file_server.maybe_serve(ctx.request.method, ctx.path)
+            if static_response is not None:
+                status_code, headers, body = static_response
+                respond(status_code, headers, body)
+                return
+            respond(404, {"Content-Type": "application/json"}, json.encode({"error": "Not found"}))
+            return
+        except ValueError:
+            respond(404, {"Content-Type": "application/json"}, json.encode({"error": "Not found"}))
+            return
+
+    def _install_api_routes(g: http_router.RouteGroup):
+        g.post("/convert", _handle_convert)
+        g.get("/instances", _handle_instances)
+        g.get("/platforms", _handle_platforms)
+
+    def _install_static_routes(g: http_router.RouteGroup):
+        g.get("/*path", _handle_static)
+
+    def _handle_not_found(ctx: http_router.Context, respond: proc(int, dict[str, str], str) -> None):
+        respond(404, {"Content-Type": "application/json"}, json.encode({"error": "Not found"}))
+
+    router = http_router.Router()
+    router.use(http_router.recoverer_middleware(log=_log))
+    router.use(http_router.access_log_middleware(_log))
+    router.not_found(_handle_not_found)
+    router.route("/api/v1", _install_api_routes)
+    router.post("/mcp", _handle_mcp)
+
+    # Static files stay under an explicit prefix; there is no catch-all fallback.
+    if static_file_server is not None:
+        router.route(static_mount_prefix, _install_static_routes)
+
+    def _serve_with_router(request, respond):
+        router.serve(request, respond)
+
+    def _on_http_server_request(server, request, respond):
+        _serve_with_router(request, respond)
+
+    def _on_https_server_request(server, request, respond):
+        _serve_with_router(request, respond)
+
     def _on_http_accept(server):
         server.cb_install(_on_http_server_request, _on_http_server_error)
 
     def _on_https_accept(server):
         server.cb_install(_on_https_server_request, _on_https_server_error)
-
-    def _handle_request(request, respond):
-        _log.info("HTTP request received", {"method": request.method, "path": request.path})
-        if request.path == "/api/v1/convert" and request.method == "POST":
-            _log.info("Processing conversion request")
-            try:
-                body_str = request.body.decode()
-                _log.debug("Request body", {"body": body_str})
-                body_dict = json.decode(body_str)
-                _log.debug("Parsed JSON", {"body_dict": str(body_dict)})
-
-                # Parse the request using the from_json method
-                convert_req = ConvertRequest.from_json(body_dict)
-                _log.info("ConvertRequest created", {"input_format": convert_req.format, "output_format": convert_req.target_format, "platform": convert_req.platform})
-
-                # Define callback for when conversion completes
-                def on_conversion_done(result: ?(base_config: str, steps: list[(input: str, config: str, diff: str)]), error: ?Exception):
-                    _log.debug("Conversion completed, preparing HTTP response")
-                    if error is None and result is not None:
-                        _log.info("Conversion successful")
-
-                        steps = [{"input": step.input, "config": step.config, "diff": step.diff} for step in result.steps]
-                        response = {
-                            "success": True,
-                            "base_config": result.base_config,
-                            "steps": steps,
-                            "platform": convert_req.platform,
-                            "platform_version": "1.0"
-                        }
-                    else:
-                        error_msg = str(error) if error is not None else "Conversion failed"
-                        _log.error("Conversion failed", {"error": error_msg})
-                        response = {
-                            "success": False,
-                            "error": error_msg,
-                            "platform": convert_req.platform
-                        }
-                    response_str = json.encode(response)
-                    _log.debug("Sending HTTP response", {"response_length": len(response_str)})
-                    respond(200, {"Content-Type": "application/json"}, response_str)
-
-                # Use Director's conversion logic with callback
-                _log.debug("Calling Director.convert")
-                director.convert(convert_req, on_conversion_done)
-            except Exception as e:
-                error_dict = {"success": False, "error": str(e)}
-                error_str = json.encode(error_dict)
-                respond(400, {"Content-Type": "application/json"}, error_str)
-        # GET /api/v1/instances - List all running instances
-        elif request.path == "/api/v1/instances" and request.method == "GET":
-            # Get actual instances from director
-            instances_data = director.get_instances()
-
-            response = {
-                "instances": instances_data,
-                "total": len(instances_data)
-            }
-            respond(200, {"Content-Type": "application/json"}, json.encode(response))
-
-        # GET /api/v1/platforms - List configured platforms
-        elif request.path == "/api/v1/platforms" and request.method == "GET":
-            # Get actual platforms from director
-            platforms_data = director.get_platforms()
-
-            response = {
-                "platforms": platforms_data,
-                "total": len(platforms_data)
-            }
-            respond(200, {"Content-Type": "application/json"}, json.encode(response))
-
-        # MCP endpoint - single endpoint with JSON-RPC routing
-        elif request.path == "/mcp" and request.method == "POST":
-            try:
-                body_str = request.body.decode()
-                _log.debug("MCP request received", {"body": body_str})
-                body_dict = json.decode(body_str)
-                method = _get_str(body_dict, "method")
-                _log.debug("MCP method", {"method": method})
-
-                if method == "initialize":
-                    mcp.handle_initialize(request, respond)
-                elif method == "tools/list":
-                    mcp.handle_tools_list(request, respond)
-                elif method == "tools/call":
-                    mcp.handle_tools_call(request, respond)
-                else:
-                    # Unknown method
-                    _log.warning("Unknown MCP method", {"method": method})
-                    error = MCPError(MCP_METHOD_NOT_FOUND, "Unknown method: " + str(method))
-                    response = MCPResponse(body_dict.get("id"), None, error)
-                    response_json = json.encode(response.to_dict())
-                    _log.debug("MCP unknown method response", {"response": response_json})
-                    respond(200, {"Content-Type": "application/json"}, response_json)
-            except Exception as e:
-                _log.error("MCP routing error", {"error": str(e)})
-                error = MCPError(MCP_INTERNAL_ERROR, str(e))
-                response = MCPResponse(None, None, error)
-                response_json = json.encode(response.to_dict())
-                _log.debug("MCP routing error response", {"response": response_json})
-                respond(200, {"Content-Type": "application/json"}, response_json)
-
-        else:
-            _static_file_server = static_file_server
-            if _static_file_server is not None:
-                static_response = _static_file_server.maybe_serve(request.method, request.path)
-                if static_response is not None:
-                    status_code, headers, body = static_response
-                    respond(status_code, headers, body)
-                    return
-            respond(404, {"Content-Type": "application/json"}, json.encode({"error": "Not found"}))
-
-    def _on_http_server_request(server, request, respond):
-        _handle_request(request, respond)
-
-    def _on_https_server_request(server, request, respond):
-        _handle_request(request, respond)
 
     def _on_http_server_error(server, error):
         _log.error("HTTP server error", {"error": error})
@@ -2856,6 +2873,7 @@ actor main(env: Env):
         p.add_option("https-port", "int", default=0, help="HTTPS listen port (set to 0 to disable)")
         p.add_option("config", "str", default=netclics_config.DEFAULT_CONFIG_PATH, help="Path to config JSON file")
         p.add_option("static-dir", "str", default="", help="Directory to serve static files from (disabled when empty)")
+        p.add_option("static-prefix", "str", default="/static", help="URL path prefix to mount the static file server under")
         p.add_option("tls-cert", "str", default="", help="Path to TLS certificate PEM file")
         p.add_option("tls-key", "str", default="", help="Path to TLS private key PEM file")
         return p.parse(env.argv)
@@ -2876,6 +2894,7 @@ actor main(env: Env):
     https_port = args.get_int("https-port")
     config_path = args.get_str("config")
     static_dir = args.get_str("static-dir")
+    static_prefix = args.get_str("static-prefix")
     tls_cert_path = args.get_str("tls-cert")
     tls_key_path = args.get_str("tls-key")
 
@@ -2916,16 +2935,16 @@ actor main(env: Env):
         try:
             initialized_static_server = static_files.StaticFileServer(file_cap, read_cap, static_dir)
             static_file_server = initialized_static_server
-            _log.info("Enabled static file serving", {"directory": initialized_static_server.get_root_dir()})
+            _log.info("Enabled static file serving", {"directory": initialized_static_server.get_root_dir(), "prefix": static_prefix})
         except Exception as e:
-            print("ERROR: Failed to initialize static directory {static_dir}: {str(e)}", err=True)
+            print("ERROR: Failed to initialize static file serving (dir: {static_dir}, prefix: {static_prefix}): {str(e)}", err=True)
             env.exit(1)
 
     _log.info("Configuration file watcher will bootstrap and reload config", {"config_path": config_path})
 
     director = Director(env.cap, proc_cap, log_handler)
     config_change_watcher = netclics_config.ConfigChangeWatcher(read_cap, config_path, director.set_config, log_handler)
-    webs = WebServ(listen_cap, http_port if http_port > 0 else None, director, log_handler, config_path, read_cap, static_file_server, https_port if https_port > 0 else None, tls_cert_pem, tls_key_pem)
+    webs = WebServ(listen_cap, http_port if http_port > 0 else None, director, log_handler, config_path, read_cap, static_file_server, static_prefix, https_port if https_port > 0 else None, tls_cert_pem, tls_key_pem)
     if https_port is not None and tls_cert_pem is not None and tls_key_pem is not None:
         _log.info("NETCLICS started", {"http_port": http_port, "https_port": https_port})
     else:
