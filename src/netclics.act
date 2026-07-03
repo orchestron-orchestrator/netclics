@@ -5,7 +5,7 @@ import http_router
 import json
 import logging
 import net
-import netconf
+import stratoweave.netconf as netconf
 import netcli.router_client as router_client
 import time
 import process
