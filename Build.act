@@ -11,15 +11,15 @@ dependencies = {
         url="https://github.com/stratoweave/netcli/archive/137f9a10bc4a06ca41efca9aa25832d6b132852d.zip",
         hash="N-V-__8AAPkAAgAnqF7k0GUHObNcnrpKruVsEBbmVjmcSpa5"
     ),
-    "netconf": (
-        repo_url="https://github.com/stratoweave/netconf.git",
-        url="https://github.com/stratoweave/netconf/archive/9e85d65058c1878d6cb087fcbb0546de4471611a.zip",
-        hash="N-V-__8AAPi2AgArt-CWWixPF_5ZdY2x8MaIdBM9kBiD9KSc"
+    "stratoweave": (
+        repo_url="https://github.com/stratoweave/stratoweave",
+        url="https://github.com/stratoweave/stratoweave/archive/28381e1abe3c8c5e9bfa426441e6da83f052a421.zip",
+        hash="N-V-__8AAJznPQBSaKLQFBsGLA4Y5khZRW8nEqkcHBOIZLPz"
     ),
     "yang": (
         repo_url="https://github.com/stratoweave/acton-yang.git",
-        url="https://github.com/stratoweave/acton-yang/archive/bc1a78d1eded8a85f768d4978968af15c9ffd3d3.zip",
-        hash="N-V-__8AAHUaJgASeZZmluxNPVOFrLew8HT-yRKgt33Am99v"
+        url="https://github.com/stratoweave/acton-yang/archive/bc42140daef2c39ef2e23c66434d2f0b9be115a0.zip",
+        hash="N-V-__8AAGgAJwARuHswzsn3eQ47N9_a8GCgiRlsT5pUcJiQ"
     )
 }
 zig_dependencies = {}
